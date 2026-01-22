@@ -1,0 +1,128 @@
+:root {
+  /* 品牌色 - Facebook Brand Colors */
+  --primary-color: #1877F2;       /* FB Blue - 核心主色 */
+  --primary-hover: #166FE5;       /* 悬停时的深蓝色 */
+  --secondary-color: #42B72A;     /* Green - 用于成功/启用状态 */
+  --danger-color: #FA383E;        /* Red - 用于错误/删除/停止 */
+  --warning-color: #FFBA00;       /* Yellow - 用于警告 */
+
+  /* 中性色 - Neutrals (用于背景、边框、文字) */
+  --bg-body: #F0F2F5;             /* 页面整体背景灰 - 保护视力 */
+  --bg-card: #FFFFFF;             /* 卡片背景白 - 突出内容 */
+  --text-primary: #050505;        /* 主要文字 - 接近纯黑 */
+  --text-secondary: #65676B;      /* 次要文字 - 灰色说明 */
+  --border-color: #DADDE1;        /* 边框颜色 - 淡淡的分割线 */
+  --divider-color: #CED0D4;       /* 较深的分割线 */
+
+  /* 侧边栏配置 */
+  --sidebar-width: 240px;         /* 侧边栏固定宽度 */
+  --sidebar-bg: #FFFFFF;          /* 侧边栏背景 */
+  --sidebar-text: #050505;        /* 侧边栏文字 */
+  --sidebar-active-bg: #EAF3FF;   /* 选中菜单时的浅蓝背景 */
+  --sidebar-active-text: #1877F2; /* 选中菜单时的蓝色文字 */
+
+  /* 布局与间距 (统一使用，拒绝硬编码 px) */
+  --header-height: 60px;
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 16px;             /* 标准间距 */
+  --spacing-lg: 24px;
+  --radius-sm: 6px;
+  --radius-md: 8px;               /* 标准圆角 */
+  --radius-lg: 12px;              /* 卡片圆角 */
+
+  /* 阴影效果 */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.1);      /* 卡片轻微阴影 */
+  --shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.15);   /* 悬停浮起效果 */
+  
+  /* 字体栈 - 优先使用系统默认字体，保证加载快 */
+  --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* 全局基础样式 */
+body {
+  background-color: var(--bg-body); /* 应用背景灰 */
+  color: var(--text-primary);       /* 应用主要文字色 */
+  font-family: var(--font-family);
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased; /* 字体抗锯齿，让文字更清晰 */
+}
+
+/* 盒模型重置：让 padding 不会撑大元素的宽高 */
+* {
+  box-sizing: border-box;
+}
+
+/* 通用按钮样式 - 以后所有按钮都加 .btn 类 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s; /* 0.2秒平滑过渡 */
+  border: none;
+  outline: none;
+  background-color: var(--primary-color);
+  color: #fff;
+}
+
+.btn:hover {
+  background-color: var(--primary-hover);
+}
+
+/* 次要按钮（灰色背景） */
+.btn.secondary {
+  background-color: #E4E6EB;
+  color: var(--text-primary);
+}
+
+.btn.secondary:hover {
+  background-color: #D8DADF;
+}
+
+/* 危险按钮（红色） */
+.btn.danger {
+  background-color: #ffeeee; /* 浅红背景，不那么刺眼 */
+  color: var(--danger-color);
+}
+.btn.danger:hover {
+  background-color: #ffdce0;
+}
+
+/* 小按钮 */
+.btn.small {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* 通用卡片样式 - 所有白色区块都用这个 */
+.card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: var(--spacing-lg);
+  margin-bottom: var(--spacing-md);
+}
+
+/* 滚动条美化 (Chrome/Safari) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #BCC0C4;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A0A4A8;
+}
+
+

@@ -1,0 +1,105 @@
+1) 页面结构图（Sitemap）
+公共
+登录 /login
+注册 /register
+等待审核 /pending
+主工作台（需登录）
+数据监控 Dashboard /dashboard
+规则管理 Rule Center /rules
+-（规划）规则调试/数据预览（可挂在 /rules 内的子视图或抽屉）
+管理员（需 admin）
+账户归属管理 /admin/account-mapping
+用户审核 /admin/review
+任务控制（Cron）/admin/cron
+系统健康看板 /admin/system-health
+系统诊断 /admin/diagnostics（含代理/Token 检测）
+> 导航层级保持 ≤ 3：侧边栏一级 → 页面模块二级 → 模态/抽屉三级。
+2) 关键页面布局描述（文字版）
+A. 数据监控 Dashboard
+顶部：账户选择 + 自动刷新开关 + 立即刷新按钮
+中部筛选栏：层级（Campaign/Adset/Ad）+ 时间范围
+主体：宽表格（左侧名称/ID，右侧指标列），表头固定；ROI 异步加载时显示轻量 loading
+空状态：未选择账户/无数据提示
+B. 规则管理 Rule Center（按“前端更改方案”落地）
+顶部：标题 + 新建规则 + 运行所有规则（手动）
+顶部提示条（Banner）：免责提示（必须显眼）
+主体：规则卡片 Grid（含启用状态、条件、动作）
+规则编辑模态框（加宽）：四大区块
+1) 基本信息：规则名、启用、Dry Run
+2) 作用对象 Where：目标层级 + 账户 + 级联选择目标 IDs
+3) 触发条件 When：AND/OR + 时间窗口 + 多条件 + 模板按钮
+4) 执行动作 Then：动作类型 + 参数（预算/上限）
+C. 账户归属管理（管理员）
+顶部：负责人筛选 + 刷新
+主体：表格（账号ID / 账号名 / 当前负责人 / 更换负责人下拉）
+底部：批量导入区（多行输入 + 导入按钮）
+D. 用户审核（管理员）
+顶部：状态筛选 + 刷新
+主体：卡片列表（用户名、角色、负责人、状态）+ 通过/拒绝按钮
+只对 pending 展示操作按钮
+E. 任务控制（管理员）
+顶部：Cron 状态卡片（是否运行/上次执行/上次统计）
+主体：手动触发规则执行按钮（带确认）
+辅助：执行日志提示（引导去审计页）
+F. 系统健康看板（管理员，规划）
+3 张统计卡：上次同步时间、规则扫描耗时、动作队列积压
+Token 状态 + 熔断状态提示
+列表：最近异常/告警（若后端提供）
+G. 系统诊断（管理员）
+代理连通性测试
+Token/调试信息（脱敏）
+健康检查（服务状态）
+3) 组件映射表（功能 → UI组件 → 接口）
+认证与账号
+登录表单 → Form + Input + Button → POST /api/auth/login
+注册表单 + 负责人下拉 → Form + Select → GET /api/owners + POST /api/auth/register
+待审核状态页 → Info Card + Button → GET /api/me + POST /api/auth/logout
+退出登录 → Confirm + Button → POST /api/auth/logout
+基础监控
+账户选择器 → Select → GET /api/accounts
+广告/广告组/广告系列状态 → Badge + Table → GET /api/ads
+基础指标表格 → DataTable → GET /api/insights
+ROI 深度指标 → Async Badge + Spinner → GET /api/roi + GET /api/roi/result
+“立即刷新 / 自动刷新” → Button + Switch → 复用上面接口
+规则管理
+规则列表 → Card Grid → GET /api/rules
+新建规则 → Modal Form → POST /api/rules
+编辑规则 → Modal Form → PUT /api/rules/:id
+启用/禁用 → Switch → PATCH /api/rules/:id/toggle
+删除 → Confirm → DELETE /api/rules/:id
+立即执行（本地） → Button → POST /api/execute-rules
+规则数据预览 → Drawer + Table → GET /api/rule-data
+管理员
+用户列表/筛选 → Filter + List → GET /api/admin/users
+审核通过/拒绝 → Button → POST /api/admin/users/:id/approve / reject
+负责人列表 → Select → GET /api/admin/owners
+账户归属列表 → Table → GET /api/admin/account-mappings
+分配归属 → Inline Select → POST /api/admin/account-mappings/assign
+批量导入 → Textarea + Button → POST /api/admin/account-mappings/batch-import
+Cron 状态 → Status Card → GET /api/admin/cron/status
+手动触发规则 → Button + Confirm → POST /api/admin/cron/execute
+系统健康/诊断
+服务健康 → Status Card → GET /api/health
+代理检测 → Diagnostic Card → GET /api/test-proxy
+调试信息 → Diagnostic Panel → GET /api/debug
+系统健康（规划） → Dashboard Cards → GET /api/system/health（尚未实现）
+4) 交互逻辑简述（复杂流程）
+1) 登录 → 角色路由
+登录成功后：/api/me 判断状态
+pending → 跳转 /pending；active → /dashboard
+2) Dashboard ROI 异步
+首次拉基础指标 /api/insights
+同时请求 /api/roi，若返回 202 则轮询 /api/roi/result
+切换账户/层级/时间范围时，清理旧轮询
+3) 规则创建（四区块）
+基本信息 → 作用对象 → 条件 → 动作
+触发条件支持 AND/OR 与时间窗口
+模板按钮一键填充（止损/扩量）
+4) 规则数据预览
+根据当前规则条件生成 GET /api/rule-data 预览结果
+用于校验时间窗口/指标口径
+5) 管理员批量导入
+文本解析为 [{ fb_account_id, owner_key }]
+一次性提交并展示成功/失败统计
+6) Cron 手动触发
+点击执行 → 二次确认 → 展示执行结果提示（查看日志）

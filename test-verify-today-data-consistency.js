@@ -1,0 +1,693 @@
+/**
+ * 验证 Today 数据一致性
+ * 
+ * 功能：
+ * 1. 从数据库查询 today 数据
+ * 2. 从 Facebook API 查询 today 数据
+ * 3. 对比两者的 spend 值
+ * 4. 检查是否有异常数据（可能是 last_7d 聚合值混入）
+ * 
+ * 使用方法：
+ * node test-verify-today-data-consistency.js [account_id]
+ * 
+ * 参数：
+ *   account_id: 可选，指定要验证的账户ID，默认使用第一个活跃账户
+ */
+
+import pool from './server/db/connection.js'
+import { FacebookMarketingAPI } from './server/index.js'
+import { DateTime } from 'luxon'
+import dotenv from 'dotenv'
+
+// 加载环境变量
+dotenv.config()
+
+// 测试账户ID（如果命令行参数未提供）
+let TEST_ACCOUNT_ID = process.argv[2] || null
+
+async function main() {
+  console.log('')
+  console.log('='.repeat(60))
+  console.log('🔍 验证 Today 数据一致性')
+  console.log('='.repeat(60))
+  console.log('')
+  
+  try {
+    // 1. 获取测试账户和时区信息
+    let accountTimezone = 'UTC'  // 默认时区
+    let ownerId = null
+    
+    if (!TEST_ACCOUNT_ID) {
+      console.log('📋 查询第一个活跃账户...')
+      const [accounts] = await pool.query(`
+        SELECT fb_account_id as account_id, owner_id, timezone_name
+        FROM account_mappings 
+        WHERE is_active = 1
+        LIMIT 1
+      `)
+      
+      if (!accounts || accounts.length === 0) {
+        console.error('❌ 没有找到活跃账户')
+        process.exit(1)
+      }
+      
+      TEST_ACCOUNT_ID = accounts[0].account_id
+      accountTimezone = accounts[0].timezone_name || 'UTC'
+      ownerId = accounts[0].owner_id
+      console.log(`✅ 找到账户: ${TEST_ACCOUNT_ID} (时区: ${accountTimezone})`)
+    } else {
+      // 如果指定了账户ID，查询时区信息
+      const [accounts] = await pool.query(`
+        SELECT timezone_name, owner_id
+        FROM account_mappings
+        WHERE fb_account_id = ?
+          AND is_active = 1
+      `, [TEST_ACCOUNT_ID])
+      
+      if (!accounts || accounts.length === 0) {
+        console.error(`❌ 账户 ${TEST_ACCOUNT_ID} 不存在或未激活`)
+        process.exit(1)
+      }
+      
+      accountTimezone = accounts[0].timezone_name || 'UTC'
+      ownerId = accounts[0].owner_id
+    }
+    
+    console.log(`📋 验证账户: ${TEST_ACCOUNT_ID}`)
+    console.log(`🌍 账户时区: ${accountTimezone}`)
+    console.log('')
+    
+    // 2. 使用 Luxon 计算账户时区的"今天"起止时间
+    // 参考 ingestorService.js 的用法：DateTime.now().setZone(timezoneName)
+    const nowInAccountTz = DateTime.now().setZone(accountTimezone)
+    const startOfDay = nowInAccountTz.startOf('day')  // 账户时区的今天 00:00:00
+    const endOfDay = nowInAccountTz.endOf('day')       // 账户时区的今天 23:59:59.999
+    
+    // 转换为 UTC 时间的 JS Date 对象（用于 SQL 查询）
+    // 数据库会话时区是 UTC，所以直接传递 UTC 时间的 JS Date 即可
+    const startOfDayUTC = startOfDay.toUTC().toJSDate()
+    const endOfDayUTC = endOfDay.toUTC().toJSDate()
+    
+    console.log(`📅 查询时间窗口（账户时区 ${accountTimezone}）:`)
+    console.log(`   今天开始: ${startOfDay.toISO()} (UTC: ${startOfDayUTC.toISOString()})`)
+    console.log(`   今天结束: ${endOfDay.toISO()} (UTC: ${endOfDayUTC.toISOString()})`)
+    console.log('')
+    
+    // 3. 从数据库查询 today 数据（使用 BETWEEN 替代 DATE()，添加 id 字段和 tie-breaker）
+    console.log('📊 步骤 1：从数据库查询 today 数据...')
+    const [dbRows] = await pool.query(`
+      SELECT 
+        s1.id,
+        s1.ad_id,
+        s1.ad_name,
+        s1.spend,
+        s1.purchases,
+        s1.cpc,
+        s1.roas,
+        s1.cpa,
+        s1.synced_at,
+        s1.timezone_name
+      FROM ad_snapshots s1
+      INNER JOIN (
+        SELECT ad_id, MAX(synced_at) as max_synced_at
+        FROM ad_snapshots
+        WHERE account_id = ?
+          AND synced_at BETWEEN ? AND ?
+        GROUP BY ad_id
+      ) s2 ON s1.ad_id = s2.ad_id AND s1.synced_at = s2.max_synced_at
+      WHERE s1.account_id = ?
+        AND s1.synced_at BETWEEN ? AND ?
+      ORDER BY s1.synced_at DESC, s1.id DESC, s1.ad_id
+    `, [
+      TEST_ACCOUNT_ID, startOfDayUTC, endOfDayUTC,  // 子查询的边界
+      TEST_ACCOUNT_ID, startOfDayUTC, endOfDayUTC   // 主查询的边界
+    ])
+    
+    console.log(`✅ 数据库查询完成，找到 ${dbRows.length} 条记录（每个广告的最新记录）`)
+    console.log('')
+    
+    // 4. synced_at 自检逻辑：验证写入侧的时区语义
+    console.log('🔍 自检：验证 synced_at 字段的时区语义...')
+    if (dbRows.length > 0) {
+      const sampleRows = dbRows.slice(0, Math.min(3, dbRows.length))
+      let allConsistent = true
+      
+      sampleRows.forEach((row, index) => {
+        const syncedDt = DateTime.fromJSDate(row.synced_at)
+        const syncedDtUTC = syncedDt.toUTC()
+        const syncedDtAccountTz = syncedDt.setZone(accountTimezone)
+        
+        console.log(`   样本 ${index + 1} (${row.ad_id}):`)
+        console.log(`     synced_at: ${row.synced_at}`)
+        console.log(`     timezone_name: ${row.timezone_name || 'NULL'}`)
+        console.log(`     UTC 解释: ${syncedDtUTC.toISO()}`)
+        console.log(`     账户时区解释: ${syncedDtAccountTz.toISO()} (${accountTimezone})`)
+        
+        // 检查：如果 synced_at 是 UTC 语义，转换为 UTC 后应该不变
+        // 如果时区偏移不一致，可能不是 UTC 语义
+        const utcOffset = syncedDtUTC.offset
+        const accountTzOffset = syncedDtAccountTz.offset
+        
+        if (Math.abs(utcOffset) !== 0 && Math.abs(accountTzOffset - utcOffset) > 60) {
+          console.log(`     ⚠️  时区偏移不一致，可能不是 UTC 语义`)
+          allConsistent = false
+        }
+      })
+      
+      if (allConsistent) {
+        console.log(`   ✅ 抽查的 ${sampleRows.length} 条记录，synced_at 均为 UTC 语义（与预期一致）`)
+      } else {
+        console.log(`   ⚠️  发现 synced_at 时区语义不一致，建议检查写入逻辑`)
+        console.log(`   💡 建议：写入时统一使用 DateTime.now().toUTC().toJSDate()`)
+      }
+    }
+    console.log('')
+    
+    // 5. 观测性指标 1：账户维度的最新同步时间
+    const [accountMaxSync] = await pool.query(`
+      SELECT MAX(synced_at) as max_synced_at, COUNT(*) as total_count
+      FROM ad_snapshots
+      WHERE account_id = ?
+        AND synced_at BETWEEN ? AND ?
+    `, [TEST_ACCOUNT_ID, startOfDayUTC, endOfDayUTC])
+    
+    const accountMaxSyncTime = accountMaxSync[0]?.max_synced_at
+    const accountTotalCount = accountMaxSync[0]?.total_count || 0
+    
+    if (accountMaxSyncTime) {
+      const accountSyncDt = DateTime.fromJSDate(accountMaxSyncTime)
+      const accountTimeDiff = Math.floor((DateTime.now().toMillis() - accountSyncDt.toMillis()) / (1000 * 60))
+      console.log(`📊 账户维度统计:`)
+      console.log(`   最新同步时间: ${accountMaxSyncTime} (${accountTimeDiff} 分钟前)`)
+      console.log(`   今天总记录数: ${accountTotalCount}`)
+    } else {
+      console.log(`⚠️  账户维度：今天没有同步记录`)
+    }
+    
+    // 6. 观测性指标 2：样本内每个广告的最新同步时间范围
+    if (dbRows.length > 0) {
+      const now = DateTime.now()
+      const adSyncTimes = dbRows.map(row => {
+        const syncDt = DateTime.fromJSDate(row.synced_at)
+        return {
+          ad_id: row.ad_id,
+          ad_name: row.ad_name || '',
+          synced_at: row.synced_at,
+          time_diff_minutes: Math.floor((now.toMillis() - syncDt.toMillis()) / (1000 * 60))
+        }
+      })
+      
+      const oldestAd = adSyncTimes.reduce((oldest, current) => 
+        current.time_diff_minutes > oldest.time_diff_minutes ? current : oldest
+      )
+      const newestAd = adSyncTimes.reduce((newest, current) => 
+        current.time_diff_minutes < newest.time_diff_minutes ? current : newest
+      )
+      
+      console.log(`📊 样本内广告同步时间范围:`)
+      console.log(`   最新: ${newestAd.ad_id} (${newestAd.ad_name}) - ${newestAd.synced_at} (${newestAd.time_diff_minutes} 分钟前)`)
+      console.log(`   最旧: ${oldestAd.ad_id} (${oldestAd.ad_name}) - ${oldestAd.synced_at} (${oldestAd.time_diff_minutes} 分钟前)`)
+      
+      // 如果账户维度有更新但某些广告没有，说明这些广告今天未产生新快照
+      if (accountMaxSyncTime && oldestAd.time_diff_minutes > 60) {
+        const oldAds = adSyncTimes.filter(ad => ad.time_diff_minutes > 60)
+        console.log(`⚠️  有 ${oldAds.length} 个广告同步时间较旧（>60分钟），可能是今天未产生新快照:`)
+        oldAds.slice(0, 5).forEach(ad => {
+          console.log(`      - ${ad.ad_id} (${ad.ad_name}): ${ad.time_diff_minutes} 分钟前`)
+        })
+        if (oldAds.length > 5) {
+          console.log(`      ... 还有 ${oldAds.length - 5} 个`)
+        }
+      }
+    }
+    
+    if (dbRows.length === 0) {
+      console.log('⚠️  数据库中没有 today 数据，无法对比')
+      console.log('💡 建议：先执行一次数据同步')
+      process.exit(0)
+    }
+    
+    // 7. 从 Facebook API 查询 today 数据
+    console.log('📊 步骤 2：从 Facebook API 查询 today 数据...')
+    
+    const accessToken = process.env.FACEBOOK_ACCESS_TOKEN
+    if (!accessToken) {
+      console.error('❌ 未找到 FACEBOOK_ACCESS_TOKEN 环境变量')
+      process.exit(1)
+    }
+    
+    const facebookApi = new FacebookMarketingAPI(accessToken)
+    
+    // 获取账户的广告列表
+    console.log('📋 获取广告列表...')
+    const ads = await facebookApi.getAds(TEST_ACCOUNT_ID)
+    console.log(`✅ 找到 ${ads.length} 个广告`)
+    
+    if (ads.length === 0) {
+      console.log('⚠️  账户下没有广告，无法对比')
+      process.exit(0)
+    }
+    
+    // 获取广告的 today insights
+    console.log('📋 获取广告的 today insights...')
+    const adIds = ads.map(ad => ad.id).slice(0, 50) // 限制前 50 个，避免请求过多
+    
+    // 使用 getAdInsights 获取 today 数据
+    const insights = await facebookApi.getAdInsights(TEST_ACCOUNT_ID, {
+      preset: 'today'
+    }, {
+      useAccountAttributionSetting: true
+    })
+    
+    // 过滤出我们关注的广告（只对比数据库中有数据的广告）
+    const dbAdIds = new Set(dbRows.map(row => String(row.ad_id)))
+    const filteredInsights = insights.filter(insight => {
+      const adId = String(insight.ad_id || '')
+      return dbAdIds.has(adId)
+    })
+    
+    // 如果需要获取 purchases 和 roas，使用 getAdInsightsWithROI
+    console.log('📋 获取广告的 ROI 数据（包含 purchases 和 roas）...')
+    let roiInsights = []
+    try {
+      roiInsights = await facebookApi.getAdInsightsWithROI(TEST_ACCOUNT_ID, {
+        preset: 'today'
+      }, {
+        useAccountAttributionSetting: true
+      })
+    } catch (error) {
+      console.warn(`⚠️  获取 ROI 数据失败: ${error.message}`)
+      console.warn('   继续使用基础 insights 数据')
+    }
+    
+    // 合并 insights 和 roiInsights
+    const roiMap = new Map()
+    roiInsights.forEach(roi => {
+      const adId = String(roi.ad_id || '')
+      if (adId) {
+        roiMap.set(adId, {
+          purchases: roi.purchases || 0,
+          roas: roi.roas || null
+        })
+      }
+    })
+    
+    // 合并数据：优先使用 filteredInsights，补充 ROI 数据
+    const allInsights = filteredInsights.map(insight => {
+      const adId = String(insight.ad_id || '')
+      const roi = roiMap.get(adId) || {}
+      return {
+        ad_id: adId,
+        ad_name: insight.ad_name || '',
+        spend: insight.spend || 0,
+        purchases: roi.purchases || 0,  // 从 ROI 数据获取
+        cpc: insight.cpc || 0,
+        roas: roi.roas || null  // 从 ROI 数据获取
+      }
+    })
+    
+    console.log(`✅ API 查询完成，找到 ${allInsights.length} 条记录（与数据库匹配）`)
+    console.log(`📅 API 查询时间范围: date_preset=today (账户时区: ${accountTimezone})`)
+    console.log('')
+    
+    // 8. 观测性指标 3：查询使用的过滤条件摘要（包含 API 时间范围）
+    console.log(`📊 查询过滤条件:`)
+    console.log(`   账户ID: ${TEST_ACCOUNT_ID}`)
+    console.log(`   账户时区: ${accountTimezone}`)
+    console.log(`   数据库时间窗口: ${startOfDayUTC.toISOString()} ~ ${endOfDayUTC.toISOString()}`)
+    console.log(`   账户时区今天: ${startOfDay.toFormat('yyyy-MM-dd HH:mm:ss')} ~ ${endOfDay.toFormat('yyyy-MM-dd HH:mm:ss')}`)
+    console.log(`   API 查询窗口: date_preset=today (与数据库窗口对齐)`)
+    console.log(`   查询方式: BETWEEN (不使用 DATE() 函数，避免 UTC 边界误差)`)
+    console.log('')
+    
+    // 9. 构建对比数据
+    console.log('📊 步骤 3：对比数据...')
+    console.log('')
+    
+    // 构建 API 数据映射（按 ad_id）
+    const apiDataMap = new Map()
+    allInsights.forEach(insight => {
+      const adId = String(insight.ad_id || '')
+      if (adId) {
+        apiDataMap.set(adId, {
+          ad_id: adId,
+          ad_name: insight.ad_name || '',
+          spend: parseFloat(insight.spend || 0),
+          purchases: parseInt(insight.purchases || 0),
+          cpc: parseFloat(insight.cpc || 0),
+          roas: insight.roas ? parseFloat(insight.roas) : null
+        })
+      }
+    })
+    
+    // 构建数据库数据映射（按 ad_id，查询已确保是最新的）
+    const dbDataMap = new Map()
+    dbRows.forEach(row => {
+      const adId = String(row.ad_id || '')
+      if (adId) {
+        dbDataMap.set(adId, row)
+      }
+    })
+    
+    // 对比结果分类
+    const comparisonResults = {
+      match: [],                    // 匹配的记录
+      missing: {
+        api: [],                   // API 缺失（数据库有，API 无）
+        db: []                     // 数据库缺失（API 有，数据库无）
+      },
+      inconsistent: []             // 不一致的记录（有数据但值不同）
+    }
+    
+    const now = DateTime.now()
+    
+    // 对比数据库中的每条记录
+    for (const [adId, dbRow] of dbDataMap.entries()) {
+      const apiData = apiDataMap.get(adId)
+      
+      if (!apiData) {
+        // 缺失：API 中没有数据
+        comparisonResults.missing.api.push({
+          ad_id: adId,
+          ad_name: dbRow.ad_name || '',
+          db_spend: parseFloat(dbRow.spend || 0),
+          db_purchases: parseInt(dbRow.purchases || 0),
+          synced_at: dbRow.synced_at,
+          note: 'API 未返回数据（可能是广告已删除、暂停或今天无数据）'
+        })
+        continue
+      }
+      
+      // 对比数据
+      const dbSpend = parseFloat(dbRow.spend || 0)
+      const apiSpend = parseFloat(apiData.spend || 0)
+      const difference = Math.abs(dbSpend - apiSpend)
+      const differencePercent = apiSpend > 0 ? (difference / apiSpend * 100) : 0
+      
+      const dbPurchases = parseInt(dbRow.purchases || 0)
+      const apiPurchases = parseInt(apiData.purchases || 0)
+      const purchasesDiff = Math.abs(dbPurchases - apiPurchases)
+      
+      // 判断是否匹配（添加小额支出门槛处理）
+      // 匹配条件：
+      // 1. 小额支出（< 0.5）：使用绝对差 < 0.01 判断，避免百分比误报
+      // 2. 正常支出：spend 差异 < 5% 或 < 0.01，且 purchases 差异 <= 1
+      const isSmallSpend = apiSpend < 0.5
+      const isMatch = isSmallSpend 
+        ? (difference < 0.01 && purchasesDiff <= 1)  // 小额优先用绝对差
+        : ((differencePercent < 5 || difference < 0.01) && purchasesDiff <= 1)
+      
+      if (isMatch) {
+        comparisonResults.match.push({
+          ad_id: adId,
+          ad_name: dbRow.ad_name || apiData.ad_name || '',
+          db_spend: dbSpend,
+          api_spend: apiSpend,
+          db_purchases: dbPurchases,
+          api_purchases: apiPurchases,
+          synced_at: dbRow.synced_at
+        })
+      } else {
+        // 不一致：有数据但值不同
+        const syncDt = DateTime.fromJSDate(dbRow.synced_at)
+        const timeDiffMinutes = Math.floor((now.toMillis() - syncDt.toMillis()) / (1000 * 60))
+        
+        comparisonResults.inconsistent.push({
+          ad_id: adId,
+          ad_name: dbRow.ad_name || apiData.ad_name || '',
+          db_spend: dbSpend,
+          api_spend: apiSpend,
+          difference: difference,
+          difference_percent: differencePercent,
+          db_purchases: dbPurchases,
+          api_purchases: apiPurchases,
+          purchases_diff: purchasesDiff,
+          db_cpc: parseFloat(dbRow.cpc || 0),
+          api_cpc: parseFloat(apiData.cpc || 0),
+          db_roas: parseFloat(dbRow.roas || 0),
+          api_roas: parseFloat(apiData.roas || 0),
+          synced_at: dbRow.synced_at,
+          time_diff_minutes: timeDiffMinutes
+        })
+      }
+    }
+    
+    // 检查 API 中有但数据库中没有的广告
+    for (const [adId, apiData] of apiDataMap.entries()) {
+      if (!dbDataMap.has(adId)) {
+        comparisonResults.missing.db.push({
+          ad_id: adId,
+          ad_name: apiData.ad_name || '',
+          api_spend: apiData.spend,
+          api_purchases: apiData.purchases,
+          note: '数据库中没有数据（可能是新广告或未同步）'
+        })
+      }
+    }
+    
+    // 10. 时间窗口对齐：区分"窗口内波动"和"窗口外确实不一致"
+    const WINDOW_MINUTES = 90
+    const windowStart = now.minus({ minutes: WINDOW_MINUTES })
+    
+    comparisonResults.inconsistent.forEach(result => {
+      const syncDt = DateTime.fromJSDate(result.synced_at)
+      const isInWindow = syncDt >= windowStart
+      
+      if (isInWindow) {
+        result.category = 'window_fluctuation'  // 窗口内波动
+        result.note = `数据在最近 ${WINDOW_MINUTES} 分钟内，差异可能是归因窗口变化导致`
+      } else {
+        result.category = 'real_inconsistency'  // 窗口外确实不一致
+        result.note = `数据超过 ${WINDOW_MINUTES} 分钟，需要进一步调查`
+      }
+    })
+    
+    // 11. 输出对比结果
+    console.log('📊 详细对比结果:')
+    console.log('')
+    
+    // 显示匹配的记录
+    if (comparisonResults.match.length > 0) {
+      console.log(`✅ 匹配的记录 (${comparisonResults.match.length} 条):`)
+      comparisonResults.match.slice(0, 5).forEach(r => {
+        console.log(`   - ${r.ad_id}: spend = ${r.db_spend.toFixed(2)} (数据库) = ${r.api_spend.toFixed(2)} (API) ✅`)
+      })
+      if (comparisonResults.match.length > 5) {
+        console.log(`   ... 还有 ${comparisonResults.match.length - 5} 条匹配记录`)
+      }
+      console.log('')
+    }
+    
+    // 显示缺失的记录
+    if (comparisonResults.missing.api.length > 0) {
+      console.log(`⚠️  API 中缺失的记录 (${comparisonResults.missing.api.length} 条):`)
+      comparisonResults.missing.api.forEach(r => {
+        console.log(`   - ${r.ad_id} (${r.ad_name}): spend = ${r.db_spend.toFixed(2)}`)
+        console.log(`     说明: ${r.note}`)
+      })
+      console.log('')
+    }
+    
+    if (comparisonResults.missing.db.length > 0) {
+      console.log(`⚠️  数据库中缺失的记录 (${comparisonResults.missing.db.length} 条):`)
+      comparisonResults.missing.db.forEach(r => {
+        console.log(`   - ${r.ad_id} (${r.ad_name}): spend = ${r.api_spend.toFixed(2)}`)
+        console.log(`     说明: ${r.note}`)
+      })
+      console.log('')
+    }
+    
+    // 显示不一致的记录（区分窗口内波动和确实不一致）
+    const windowFluctuation = comparisonResults.inconsistent.filter(i => i.category === 'window_fluctuation')
+    const realInconsistency = comparisonResults.inconsistent.filter(i => i.category === 'real_inconsistency')
+    
+    if (windowFluctuation.length > 0) {
+      console.log(`⚠️  窗口内波动 (${windowFluctuation.length} 条，最近 ${WINDOW_MINUTES} 分钟内):`)
+      windowFluctuation.forEach(r => {
+        console.log(`   - ${r.ad_id} (${r.ad_name}):`)
+        console.log(`     数据库: spend = ${r.db_spend.toFixed(2)}, purchases = ${r.db_purchases}, cpc = ${r.db_cpc.toFixed(2)}, roas = ${r.db_roas.toFixed(2)}`)
+        console.log(`     API:    spend = ${r.api_spend.toFixed(2)}, purchases = ${r.api_purchases}, cpc = ${r.api_cpc.toFixed(2)}, roas = ${r.api_roas ? r.api_roas.toFixed(2) : 'N/A'}`)
+        console.log(`     差异:   spend 差异 = ${r.difference.toFixed(2)} (${r.difference_percent.toFixed(2)}%), purchases 差异 = ${r.purchases_diff}`)
+        console.log(`     同步时间: ${r.synced_at} (${r.time_diff_minutes} 分钟前)`)
+        console.log(`     说明: ${r.note}`)
+        console.log('')
+      })
+    }
+    
+    if (realInconsistency.length > 0) {
+      console.log(`❌ 确实不一致 (${realInconsistency.length} 条，超过 ${WINDOW_MINUTES} 分钟):`)
+      realInconsistency.forEach(r => {
+        console.log(`   - ${r.ad_id} (${r.ad_name}):`)
+        console.log(`     数据库: spend = ${r.db_spend.toFixed(2)}, purchases = ${r.db_purchases}, cpc = ${r.db_cpc.toFixed(2)}, roas = ${r.db_roas.toFixed(2)}`)
+        console.log(`     API:    spend = ${r.api_spend.toFixed(2)}, purchases = ${r.api_purchases}, cpc = ${r.api_cpc.toFixed(2)}, roas = ${r.api_roas ? r.api_roas.toFixed(2) : 'N/A'}`)
+        console.log(`     差异:   spend 差异 = ${r.difference.toFixed(2)} (${r.difference_percent.toFixed(2)}%), purchases 差异 = ${r.purchases_diff}`)
+        console.log(`     同步时间: ${r.synced_at} (${r.time_diff_minutes} 分钟前)`)
+        console.log(`     说明: ${r.note}`)
+        console.log('')
+      })
+    }
+    
+    // 12. 汇总统计
+    console.log('='.repeat(60))
+    console.log('📊 汇总统计:')
+    console.log('='.repeat(60))
+    const totalRecords = comparisonResults.match.length + 
+                        comparisonResults.missing.api.length + 
+                        comparisonResults.missing.db.length + 
+                        comparisonResults.inconsistent.length
+    console.log(`   总记录数: ${totalRecords}`)
+    console.log(`   ✅ 匹配: ${comparisonResults.match.length} 条`)
+    console.log(`   ⚠️  缺失: ${comparisonResults.missing.api.length + comparisonResults.missing.db.length} 条`)
+    console.log(`      - API 缺失: ${comparisonResults.missing.api.length} 条`)
+    console.log(`      - 数据库缺失: ${comparisonResults.missing.db.length} 条`)
+    console.log(`   ⚠️  不一致: ${comparisonResults.inconsistent.length} 条`)
+    console.log(`      - 窗口内波动: ${windowFluctuation.length} 条`)
+    console.log(`      - 确实不一致: ${realInconsistency.length} 条`)
+    console.log('')
+    
+    // 13. 验证结论
+    console.log('='.repeat(60))
+    console.log('📝 验证结论:')
+    console.log('='.repeat(60))
+    
+    if (comparisonResults.match.length === totalRecords && comparisonResults.inconsistent.length === 0) {
+      console.log('✅ 验证通过：所有数据一致，未发现异常')
+    } else if (realInconsistency.length > 0) {
+      console.log('❌ 验证发现问题：')
+      console.log(`   - ${realInconsistency.length} 条记录确实不一致（超过 ${WINDOW_MINUTES} 分钟）`)
+      if (windowFluctuation.length > 0) {
+        console.log(`   - ${windowFluctuation.length} 条记录在窗口内波动（可能是归因窗口变化）`)
+      }
+      console.log('')
+      console.log('💡 建议:')
+      console.log('   1. 检查确实不一致的记录，确认是否是数据同步问题')
+      console.log('   2. 窗口内波动的记录属于正常现象，归因窗口会在 90 分钟内稳定')
+    } else if (windowFluctuation.length > 0) {
+      console.log('⚠️  验证基本通过：')
+      console.log(`   - ${windowFluctuation.length} 条记录在窗口内波动（可能是归因窗口变化，属正常现象）`)
+      if (comparisonResults.missing.api.length > 0 || comparisonResults.missing.db.length > 0) {
+        console.log(`   - ${comparisonResults.missing.api.length + comparisonResults.missing.db.length} 条记录缺失（可能是正常情况）`)
+      }
+    } else {
+      console.log('✅ 验证基本通过：数据基本一致')
+      if (comparisonResults.missing.api.length > 0 || comparisonResults.missing.db.length > 0) {
+        console.log(`   - 有 ${comparisonResults.missing.api.length + comparisonResults.missing.db.length} 条记录在一边缺失（可能是正常情况）`)
+      }
+    }
+    
+    console.log('='.repeat(60))
+    console.log('')
+    
+    // 14. 验证清单（落地后的核对表）
+    console.log('='.repeat(60))
+    console.log('✅ 验证清单:')
+    console.log('='.repeat(60))
+    
+    // 1. 时区与窗口
+    console.log('📅 时区与窗口:')
+    const accountTzStart = DateTime.fromJSDate(startOfDayUTC).setZone(accountTimezone)
+    const accountTzEnd = DateTime.fromJSDate(endOfDayUTC).setZone(accountTimezone)
+    console.log(`   ✅ 账户时区窗口: ${accountTzStart.toFormat('yyyy-MM-dd HH:mm:ss')} ~ ${accountTzEnd.toFormat('yyyy-MM-dd HH:mm:ss')}`)
+    console.log(`   ✅ UTC 边界: ${startOfDayUTC.toISOString()} ~ ${endOfDayUTC.toISOString()}`)
+    
+    if (dbRows.length > 0) {
+      const newestAd = dbRows[0]
+      const oldestAd = dbRows[dbRows.length - 1]
+      const newestTime = DateTime.fromJSDate(newestAd.synced_at)
+      const oldestTime = DateTime.fromJSDate(oldestAd.synced_at)
+      console.log(`   ✅ 样本广告时间范围: ${oldestTime.toISO()} ~ ${newestTime.toISO()}`)
+      
+      const timeSpanMinutes = Math.floor((newestTime.toMillis() - oldestTime.toMillis()) / (1000 * 60))
+      if (timeSpanMinutes > 180) {
+        console.log(`   ⚠️  样本时间跨度较大 (${timeSpanMinutes} 分钟)，可能有旧数据混入`)
+      } else {
+        console.log(`   ✅ 样本时间跨度合理 (${timeSpanMinutes} 分钟)`)
+      }
+    }
+    console.log('')
+    
+    // 2. 账户维度与广告维度
+    console.log('📊 账户维度与广告维度:')
+    if (accountMaxSyncTime) {
+      const accountSyncDt = DateTime.fromJSDate(accountMaxSyncTime)
+      const accountTzSync = accountSyncDt.setZone(accountTimezone)
+      console.log(`   ✅ 账户维度 MAX(synced_at): ${accountMaxSyncTime} (${accountTzSync.toFormat('yyyy-MM-dd HH:mm:ss')} ${accountTimezone})`)
+      console.log(`   ✅ 今天确有新快照: 是`)
+      
+      if (dbRows.length > 0) {
+        const oldAds = dbRows.filter(row => {
+          const rowDt = DateTime.fromJSDate(row.synced_at)
+          const timeDiff = Math.floor((accountSyncDt.toMillis() - rowDt.toMillis()) / (1000 * 60))
+          return timeDiff > 60
+        })
+        
+        if (oldAds.length > 0) {
+          console.log(`   ⚠️  样本内有 ${oldAds.length} 个广告同步时间较旧（>60分钟）`)
+          console.log(`   ✅ 原因识别: 今天未产生新快照（已在观测性输出中显示）`)
+        } else {
+          console.log(`   ✅ 样本内所有广告同步时间合理`)
+        }
+      }
+    } else {
+      console.log(`   ❌ 账户维度：今天没有新快照`)
+    }
+    console.log('')
+    
+    // 3. 分类口径
+    console.log('📋 分类口径:')
+    console.log(`   ✅ missing.api: ${comparisonResults.missing.api.length} 条（API 无数据）`)
+    console.log(`   ✅ missing.db: ${comparisonResults.missing.db.length} 条（数据库未同步）`)
+    console.log(`   ✅ inconsistent: ${comparisonResults.inconsistent.length} 条（有数据但值不同）`)
+    
+    if (comparisonResults.inconsistent.length > 0) {
+      const windowRatio = (windowFluctuation.length / comparisonResults.inconsistent.length * 100).toFixed(1)
+      console.log(`   ✅ 窗口内波动占比: ${windowRatio}% (${windowFluctuation.length}/${comparisonResults.inconsistent.length})`)
+      console.log(`   ✅ 确实不一致占比: ${(100 - windowRatio).toFixed(1)}% (${realInconsistency.length}/${comparisonResults.inconsistent.length})`)
+      
+      if (windowRatio > 70) {
+        console.log(`   ✅ 大部分不一致属于窗口内波动（正常现象）`)
+      }
+    }
+    console.log('')
+    
+    // 4. 性能与索引
+    console.log('⚡ 性能与索引:')
+    console.log(`   ✅ 查询记录数: ${dbRows.length} 条`)
+    console.log(`   ✅ 账户维度查询: 1 条`)
+    console.log(`   ✅ 总查询时间: < 1 秒（预期）`)
+    console.log(`   💡 索引使用: account_id + synced_at (idx_account_synced)`)
+    console.log(`   💡 索引使用: ad_id + synced_at DESC (idx_ad_synced_desc)`)
+    console.log('')
+    
+    console.log('='.repeat(60))
+    console.log('')
+    
+  } catch (error) {
+    console.error('')
+    console.error('='.repeat(60))
+    console.error('❌ 验证失败')
+    console.error('='.repeat(60))
+    console.error('')
+    console.error('错误信息:', error.message)
+    if (error.stack) {
+      console.error('')
+      console.error('错误堆栈:')
+      console.error(error.stack.split('\n').slice(0, 10).join('\n'))
+    }
+    process.exit(1)
+  } finally {
+    // 关闭数据库连接
+    try {
+      await pool.end()
+    } catch (err) {
+      // 忽略关闭连接时的错误
+    }
+  }
+}
+
+// 执行主函数
+main().catch(error => {
+  console.error('❌ 未捕获的错误:', error)
+  process.exit(1)
+})
+

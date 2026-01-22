@@ -1,0 +1,110 @@
+FB Ad-Intelligence Server (Ultra Max V5.0) 全栈执行全案
+第一部分：方案概括版 (Summary)
+数据架构层（弹性感知）
+智能搬运工 (Smart Ingestor)：不仅仅是每 10-15 分钟运行，而是实时感知 Facebook API 的健康度（Header 监测），动态调整抓取速度。
+读写分离与新鲜度：本地 MySQL 镜像保障毫秒级查询，30 分钟数据过旧自动熔断，确保决策基于最新鲜的快照。
+规则配置层（动态逻辑）
+动态阈值 (Relative Logic)：支持 Spend > 1.5 * Target_CPA 等相对比较，让规则具备“智商”，自动适配不同产品。
+多层级级联：支持“广告表现差，直接关掉组”的跨层级操作，实现更果断的资产保护。
+动作执行层（精准隔离）
+多规则隔离指纹 (Rule-based Fingerprint)：指纹公式升级，允许针对同一广告的多个止损策略并行不冲突。
+用户自定义冷却与间隔：运营自主决定 15m/30m/1h 的检查频率以及 24h 的操作冷却期。
+Dry Run 与预算护栏：先模拟后实操，最高预算强行封顶。
+反馈监控层（闭环审计）
+北京时间看盘：逻辑以账户时区为准，展示以北京时间为准，IM 机器人实时 @ 负责人。
+第二部分：详细拆解版 (Detailed Implementation)
+1. 数据架构层：从“死等”到“弹性感知”
+1.1 动态配额管理 (Dynamic Rate Limiting)
+做法：在 Axios 请求拦截器中提取 FB 返回的 Header x-business-use-case-usage。
+逻辑：
+解析该 Header 获取 ads_read 或 ads_management 的当前负载百分比。
+低负载 (<50%)：同步脚本进入“冲刺模式”，sleep 缩短至 500ms。
+中负载 (50%-80%)：维持常规模式，sleep 2000ms。
+高负载 (>80%)：进入“保护模式”，sleep 延长至 5s，优先保障正在执行的修改动作。
+意义：极大提升同步效率，在额度充足时让运营看到几乎实时的报表。
+1.2 数据镜像与熔断
+做法：Node-cron 触发，批量抓取并更新 ad_snapshots 表。
+熔断：规则引擎判定前检测 MAX(last_sync_time)，超过 30 分钟不决策，防止因代理掉线导致的资产误杀。
+2. 规则配置层：动态阈值与精细指派
+2.1 动态阈值判定 (Dynamic Thresholds)
+逻辑：支持“相对值”比较，而不仅仅是硬编码的数字。
+做法：在 conditions JSON 中支持 type: 'relative'。
+例如：{ metric: 'spend', operator: '>', target: 'target_cpa', multiplier: 1.5 }。
+判定时：if (current_spend > ad.target_cpa * 1.5)。
+意义：一个规则适配 100 个产品，无需为每个产品单独写 Spend 限制。
+2.2 精细级联指派
+逻辑：解决“谁投谁管”，且支持多种时间窗口（今天、昨天、过去 3 天）。
+做法：级联选择器绑定 ad_id 或 campaign_id。判定引擎使用 Luxon 根据账户时区提取对应窗口的聚合数据。
+3. 动作执行层：安全、隔离与级联操作
+3.1 进阶指纹：区分“手动”与“自动”与“多规则”
+逻辑：防止不同规则相互“顶掉”任务。
+做法：
+指纹公式升级：MD5(ad_id + action_type + account_local_date + rule_id)。
+意义：即使“晚间止损”规则已经关了一次广告，“ROI 崩盘”规则触发时依然能产生独立的记录和执行流。
+3.2 颗粒度补充：组级操作，广告判定
+场景：组内主广告崩了，整个组都废了。
+做法：在 action_type 中增加 PAUSE_PARENT_ADSET。
+执行逻辑：规则判定目标是“广告”，但执行动作时，Worker 根据广告的 adset_id 调用 FB API 暂停整个组。
+3.3 冷却期与预算护栏
+冷却：execution_logs 标记，24 小时内不重复操作同一动作。
+护栏：扩量上限强行截断，防止误操作烧空账户。
+4. 反馈监控层：透明与闭环
+4.1 执行日志与 IM 通知
+做法：审计日志记录所有瞬间快照（触发时的 spend, roas, cpa）。
+通知：飞书/钉钉 Webhook 格式化输出。
+[自动化成功] 负责人:@张三 账户:A 规则:晚间止损。动作:关闭组。详情:广告X spend $20 > 1.5*CPA($10)。
+第三部分：数据库 Schema 升级 (Ultra Max 版)
+code
+SQL
+-- 自动化规则表（增强版）
+CREATE TABLE automation_rules (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  rule_name VARCHAR(100),
+  owner_id INT,
+  check_interval INT DEFAULT 15, -- 用户可选 15/30/60/120
+  target_scope ENUM('AD', 'ADSET', 'CAMPAIGN'),
+  target_ids JSON,
+  conditions JSON, -- 支持 {"type": "relative", "base": "target_cpa", "ratio": 1.5}
+  action_type VARCHAR(50), -- 支持 'pause_ad', 'pause_parent_adset', 'increase_budget'
+  max_daily_budget DECIMAL(10,2), -- 预算护栏
+  cool_down_hours INT DEFAULT 24,
+  is_simulation BOOLEAN DEFAULT FALSE,
+  last_check_time TIMESTAMP NULL
+);
+
+-- 幂等任务队列（指纹增强版）
+CREATE TABLE api_tasks (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  fingerprint VARCHAR(64) UNIQUE, -- MD5(ad_id + action + date + rule_id)
+  rule_id INT,
+  ad_id VARCHAR(50),
+  action_type VARCHAR(50),
+  payload JSON,
+  status ENUM('pending', 'success', 'failed', 'simulated') DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+第四部分：给 Cursor 的核心开发指令 (Updated)
+1. Ingestor：带 Header 监控的动态搬运工
+“请重构 server/services/ingestor.js：
+实现 Batch 抓取逻辑（15个一组）。
+Header 监控：每次请求 FB 后，解析 x-business-use-case-usage 中的 ads_read 负载百分比。
+动态延迟：负载 < 50% 时 sleep 500ms，负载 > 80% 时 sleep 5000ms。
+计算指标时增加除零检查，将同步结果保存至 ad_snapshots。”
+2. Rule Engine：带动态阈值与隔离指纹的引擎
+“编写 server/services/ruleEngine.js，引入 luxon：
+时区适配：按账户时区判定 Today 日期。
+动态阈值：支持条件中引用 target_cpa 等变量进行倍数比较。
+指纹指派：判定成功后，生成包含 rule_id 的指纹：md5(ad_id + action + account_date + rule_id)。
+级联操作：如果 action_type 为 pause_parent_adset，任务 payload 中应包含 adset_id。”
+3. Task Worker：安全护栏与通知
+“编写 server/services/taskWorker.js：
+顺序处理 api_tasks。
+预算护栏：对于修改预算操作，强制对比 max_daily_budget 封顶。
+冷却检查：查询 execution_logs 确保在规则设定的冷却时间内不重复操作。
+北京时间通知：执行成功后向飞书 Webhook 发送消息，时间转为 Asia/Shanghai。”
+五、 为什么这个方案无懈可击？
+极速与安全并存：动态配额管理让你在点数充裕时抓取数据飞快，点数紧张时自动低速航行，永不爆表。
+真正智能的规则：不再是死板的“消耗大于 20 关掉”，而是“消耗超过客单价 1.5 倍关掉”，这才是运营需要的规则。
+多策略隔离：加入 rule_id 的指纹确保了你即使对一个广告设了 5 个不同的自动化方案，它们也能各司其职，互不干扰。
+果断的级联保护：支持从广告层级直接下达“封杀组”的指令，符合跨境电商快速止损的实战逻辑。
+这套方案已经达到了市面上主流 SaaS 投放工具的底层水平，你可以放心以此为标准进行开发。

@@ -1,0 +1,249 @@
+能理解，而且这是一个非常标准、也最稳的“双时区”需求：
+
+- 运营看数 ：永远按你的本地时区（北京时间，Asia/Shanghai）展示时间与日期，让人读起来直观。
+- 规则判断 ：永远按 广告账户时区 （Facebook ad account timezone）来切“自然日”与计算窗口，保证和 FB 后台口径一致，不因为展示时区改变而误触发/漏触发。
+下面给你一套“完美解决方案”（方案 + 接口契约 + 落地步骤 + 验证清单），不需要我执行任何操作。
+
+## 核心原则（必须同时满足）
+- 计算时区 ≠ 展示时区
+  - 计算时区：账户时区（account timezone），用于“today/yesterday/last_7_days”的边界、归档 06:00 判断、规则触发判断。
+  - 展示时区：北京时间（Asia/Shanghai），用于前端显示所有时间字段与“数据更新时间”等 UI 体验。
+- 存储尽量用 UTC + 记录当时口径时区
+  - 所有“时间点”（synced_at / created_at / updated_at）用 UTC 存。
+  - 所有“日口径字段”（date_start/date_stop、以及这行数据按哪个 timezone 切的日）必须存 timezone_name （账户时区）。
+## 后端数据侧：时区与口径怎么定
+### 1) 时区来源的优先级（强烈建议固定为这条链）
+1. Facebook API 实时查询到的 ad account timezone （最可靠，流派2的第一步）
+2. 数据库中 account_mappings.timezone_name （兜底）
+3. 'UTC' （最后兜底，但要告警）
+### 2) “今日/昨日/近7天”的时间窗口如何算（关键点）
+- 所有 timeWindow（today/yesterday/last_3_days/last_7_days）边界，都用 账户时区 在 Luxon（或等价库）里先算出：
+  - window_start 、 window_end （账户本地时间）
+  - 再转换成 UTC 供数据库查询或写入使用（如果你们 SQL 走 UTC 时间点过滤）
+- 对 Facebook Insights API：
+  - 计算 time_range 时也用账户时区对齐自然日（避免出现“北京今天”与“账户今天”不一致导致的空窗）。
+### 3) “数据时区优先”（混合方案C）怎么用才不踩坑
+你现在遇到的坑本质是： ad_snapshots 已经按某个时区写入了“今日”，查询却用另一个时区去解释“今日” 。
+
+- 解决办法：查询“today”（热数据）时，优先用该批数据记录的 ad_snapshots.timezone_name 作为 data timezone；没有再退到账户配置时区。
+- 这保证“写入时怎么切日 → 查询时就怎么切日”，不会因为配置变更或历史遗留导致“今天查不到”。
+## 规则引擎侧：POST 执行一定以账户时区为准
+规则引擎的请求/执行链路建议固定成这样（保证一致性）：
+
+1. 解析规则的 timeWindow （today/yesterday/last_7_days…）
+2. resolveAccountTimezone(accountId) ：按“API → account_mappings → UTC”取账户时区
+3. queryRuleData(accountId, adIds, timeWindow, accountTimezone)
+4. 规则判断与阈值比较全部基于返回的口径数据，不引入“展示时区”的概念
+这样前端怎么显示都不会影响规则触发。
+
+## 前端展示侧：永远显示北京时间，但不改变口径
+你想要“前端看到的是转换为北京时间后的数据”，推荐用**后端输出即为北京时间（display timezone）**的方式做成“无脑展示”，避免前端各处自己转导致不一致。
+
+### 1) 后端 API 增加展示时区参数（默认北京时间）
+- GET /api/... 增加：
+  - display_tz ：默认 Asia/Shanghai
+- 后端对以下字段统一输出 北京时间 ISO 字符串 或格式化字符串：
+  - synced_at 、 created_at 、 updated_at
+  - 任何“时间点”字段（不是 date_start/date_stop 这种日粒度）
+### 2) 同时返回“口径说明元信息”（避免误解）
+强烈建议接口返回 meta，让运营知道“这份数据按哪个账户时区切的日”，但显示仍是北京时间：
+
+```
+{
+  "meta": {
+    "accountTimezone": "America/Los_Angeles",
+    "displayTimezone": "Asia/Shanghai",
+    "timeWindow": "today",
+    "range": {
+      "account": {"start": "...", "end": "..."},
+      "display": {"start": "...", "end": "..."}
+    },
+    "dataTimezoneUsed": "America/Los_Angeles"
+  },
+  "data": [...]
+}
+```
+前端 UI 可以在筛选器旁边显示一行小字（不需要复杂）：
+
+- “统计口径：账户时区 America/Los_Angeles；展示：北京时间 Asia/Shanghai”
+  这能彻底消灭“为什么我北京还是昨天但它显示今日”的沟通成本。
+## 归档（06:00 落盘）与多时区账户：完美做法
+如果你有多个账户分布在不同国家时区，“统一服务器 06:00”会天然不准确。完美做法是：
+
+- 定时任务高频跑（例如每 10 分钟），每次对每个账户判断：
+  - 当前是否处于“该账户本地 06:00 左右的窗口”（例如 06:00~06:09）
+  - 是则执行该账户的 yesterday 归档
+- 并做幂等：同一账户同一天只归档一次（用唯一键或 archive_log 表都行）
+## 落地步骤（不执行，只给你步骤）
+- 统一定义两个概念：
+  - accountTimezone ：用于计算/规则/归档
+  - displayTimezone ：用于所有 UI 输出（默认 Asia/Shanghai）
+- Ingestor（流派2）：
+  - 先拉 ad account timezone
+  - 再按该时区计算 time_range 拉 insights
+  - 写入时把 timezone_name 一并落库
+- Query 服务（混合方案C）：
+  - today 查询优先用数据行上的 timezone_name；没有再用账户配置
+  - yesterday/多天窗口按账户时区算边界与 06:00 降级
+- API 层：
+  - 所有返回给前端的“时间点字段”按 displayTimezone 预转换
+  - 返回 meta 说明 accountTimezone 与 displayTimezone
+- 前端：
+  - 不再自行“猜测时区”转换；直接展示后端提供的字符串
+  - 在筛选器区域展示口径信息（避免运营误读）
+## 验证清单（你可以用来验收是否“完美”）
+- “today” 在账户时区跨日边界（例如美西 00:30，而北京已下午）时：
+  - 规则判断与 FB 后台今日一致
+  - 前端显示的时间是北京时间，但 meta 明确口径是美西今日
+- yesterday 在账户本地 06:00 前：
+  - 查询会正确降级（或提示数据未归档）而不是空
+- 任意账户 timezone 配置被修改：
+  - 已写入的历史数据仍按 dataTimezoneUsed 查询得到一致结果，不出现“今天突然没数据”
+如果你愿意，我可以基于你现有项目的实际表结构与接口（你现在这套 dashboard + rule POST）把“接口返回字段规范（哪些字段转北京时间、哪些字段保留原样）”写成一份可直接交付前后端对齐的契约清单。
+
+## 时区契约清单（前后端一致口径）
+### 0. 目标说明
+- 展示目标（运营体验） ：前端所有“时间点”统一展示为北京时间 Asia/Shanghai ，避免运营理解成本。
+- 计算目标（自动化准确性） ：规则引擎与数据切日（today/yesterday/last_7_days）统一以 广告账户时区 为准，确保与 Facebook 后台口径一致。
+- 一致性目标（不再出现“今天查不到数据”） ：查询“today”热数据时，优先使用数据行自身的 data_timezone （快照写入时记录的时区）来解释自然日边界。
+## 1. 名词与字段定义（必须统一）
+### 1.1 两个时区概念
+- account_timezone ：广告账户时区（Facebook ad account timezone），用于所有 计算/切日/规则判断/归档 。
+- display_timezone ：展示时区（固定为北京时间 Asia/Shanghai ），用于前端显示所有“时间点”。
+### 1.2 两类时间字段
+- 时间点（Instant） ：如 synced_at / created_at / updated_at / last_success_at
+  - 存储：UTC（数据库内部）
+  - 输出给前端：按 display_timezone 转换显示
+- 自然日（Date粒度） ：如 date_start / date_stop / stat_date
+  - 含义：按 account_timezone 切分的自然日（不是北京时间的日）
+  - 输出给前端：保持日期字符串不变，同时用 meta 告知口径时区
+## 2. 时区来源与优先级（硬规则）
+后端必须实现统一的 resolveAccountTimezone(accountId) ，优先级如下：
+
+1. Facebook API： /{adAccountId}?fields=timezone_name
+2. 数据库： account_mappings.timezone_name
+3. 默认： UTC （必须记录告警，便于排查）
+同时，对于“today 热数据查询”，允许出现 data_timezone_used ：
+
+- 若 ad_snapshots.timezone_name 存在且可信，则 优先用它 作为 data_timezone_used
+- 若不存在，再回退 account_timezone
+## 3. API 输出契约（统一返回结构）
+所有给前端的“数据查询类接口”统一返回结构：
+
+### 3.1 Response 顶层结构
+- meta ：口径说明（必须有）
+- data ：数据列表/对象（必须有）
+- error ：仅失败时出现（可选）
+### 3.2 meta 字段（必须包含）
+- account_timezone ：本次计算口径使用的账户时区（字符串）
+- display_timezone ：本次输出显示使用的时区（固定 Asia/Shanghai ，字符串）
+- time_window ： today | yesterday | last_3_days | last_7_days | last_30_days | lifetime | custom_range
+- custom_range 时需要携带 range_input：{ start_date: 'YYYY-MM-DD', end_date: 'YYYY-MM-DD', input_timezone: 'Asia/Shanghai' | IANA TZ }
+- data_timezone_used ：本次数据解释所用的时区（today 热数据场景可能是快照时区；其它通常等于 account_timezone）
+- range ：本次窗口范围（必须同时给 account/display 两套，避免误读）
+  - range.account.start / range.account.end ：ISO 字符串（账户时区）
+  - range.display.start / range.display.end ：ISO 字符串（北京时间）
+- generated_at ：ISO 字符串（北京时间展示用）
+### 3.3 data 字段：时间字段输出规范（强制）
+对任意数据项（例如广告行、账户行、规则执行结果行）：
+
+- 所有“时间点字段”统一输出为：
+  - *_utc ：UTC ISO（用于排障/对账，可选但推荐）
+  - * ：北京时间 ISO（用于前端直接展示，必须）
+  - 示例： synced_at_utc + synced_at
+- 所有“自然日字段”（ date_start/date_stop/stat_date ）：
+  - 保持 YYYY-MM-DD 字符串，不做时区转换
+  - 依赖 meta 中的 account_timezone 解释其含义
+### 3.4 自定义时间范围（custom_range）输入契约
+- 前端在选择 custom_range 时，必须传 range_input：
+- start_date/end_date：字符串，格式 YYYY-MM-DD（不含时间）
+- input_timezone：IANA 时区字符串，默认 Asia/Shanghai
+- 解释规则：后端以 account_timezone 对两端做“自然日”对齐（start→00:00:00, end→23:59:59），并进行多天聚合；若区间包含今日或昨日未归档日，则进行冷热数据混合路由（ad_snapshots + daily_stats）。
+- 路由策略：
+- 全部已归档日 → 仅 daily_stats
+- 包含今日 → 当日使用 ad_snapshots，其他日用 daily_stats
+- 包含昨日且在账户本地 06:00 前 → 昨日走 ad_snapshots 降级，其余日用 daily_stats
+
+### 3.5 新增时间窗口：last_30_days（最近30天）
+- 定义：账户时区下，从 30 天前的 00:00:00 到今日 23:59:59
+- 数据源：daily_stats，多天聚合；若包含今日，今日部分自动使用 ad_snapshots 与归档数据混合重算
+- 计算：所有单价/比率类指标按“总分子/总分母”重算，避免辛普森悖论
+
+## 4. 前端展示契约（必须遵守）
+- 前端默认 不再自行做时区推断/转换 ：
+  - 直接展示后端返回的 synced_at / generated_at 等（已是北京时间）
+- 前端必须在页面显著但不打扰的位置展示口径说明（从 meta 取）：
+  - “统计口径：账户时区 {account_timezone}；展示：北京时间 Asia/Shanghai”
+- 前端筛选器的 time_window 支持：today/yesterday/last_3_days/last_7_days/last_30_days/lifetime/custom_range。
+- 选择 custom_range 时，必须同时传 range_input.start_date、range_input.end_date、range_input.input_timezone（默认 Asia/Shanghai）；其余窗口仅传枚举值即可；日期范围由后端按 account_timezone 计算。
+## 5. 规则引擎（POST）契约（必须遵守）
+### 5.1 规则触发请求（示例字段要求）
+POST 触发规则时：
+
+- 输入： account_id , rule_id , time_window , ad_ids[] （可选）
+- 后端必须：
+  1. resolve account_timezone
+  2. 用 account_timezone 计算窗口与拉取数据
+  3. 输出结果 meta 里带上 account_timezone 与 data_timezone_used
+### 5.2 规则判断严禁使用 display_timezone
+- 规则阈值判断（如 ROAS/CPA/花费）必须全部基于 account_timezone 切日后的数据。
+- display_timezone 仅用于日志展示/返回给前端的可读时间。
+## 6. 归档任务（06:00 冷数据落盘）契约
+- 归档判断以 account_timezone 为准：
+  - “昨日”定义：账户本地昨天 00:00~23:59:59
+  - 执行时刻：账户本地 06:00 左右（允许 10 分钟窗口）
+- 幂等性要求：
+  - 同一 account_id + stat_date 只能归档一次（用唯一键或归档记录表保证）
+## 7. 兼容性与迁移说明（非常重要）
+- 若历史 ad_snapshots 中存在不同 timezone_name 混写：
+  - “today 查询”必须优先用最新快照的 timezone_name 作为 data_timezone_used ，避免出现“今天为空”的错觉。
+- 若 account_mappings.timezone_name 为空或不可信：
+  - 仍可通过 Facebook API 获取 timezone_name 修复口径；失败才用 UTC，并输出告警信息（可在 meta 中加 warnings[] ）。
+## 8. 必要枚举与约束（避免前后端各自理解）
+- time_window 允许： today | yesterday | last_3_days | last_7_days | last_30_days | lifetime | custom_range
+- custom_range 的 start_date/end_date 必须为自然日（不含时间），input_timezone 必须为 IANA TZ；后端按 account_timezone 对齐自然日后执行查询与聚合。
+- display_timezone 固定： Asia/Shanghai
+- account_timezone / data_timezone_used 必须是 IANA TZ（如 America/Los_Angeles ），禁止 GMT+8 这种非标准字符串。
+如果你把你当前用的“数据查询接口列表”（比如 dashboard 列表接口路径、规则执行 POST 路径、以及返回字段）贴出来，我可以按你现有字段名生成一份“逐接口契约清单”（每个 endpoint 的 request/response 字段表格化对齐），便于你直接分配给前后端改造。
+
+虽然方案很完美，但在落地代码时，有 2 个细节需要特别注意，否则会功亏一篑：
+1. 数据库查询的“最后一公里”
+当你在后端 getDataTimezoneFromSnapshots 拿到时区（例如 America/New_York）并计算出 window_start 和 window_end 后，这两个时间通常是 Luxon/Moment 对象。
+关键点：在拼接到 SQL（或 ORM 查询）时，必须 转换为 UTC 时间戳 或 数据库存储的原始 UTC 格式。
+错误做法：直接把纽约时间的字符串 '2024-01-20 00:00:00' 传给 SQL，数据库如果按服务器时区（北京）理解，就又错位了。
+正确做法：window_start.toUTC().toISO() -> SQL 比较 created_time 或 date_start。
+2. “混合方案C”中的脏数据清洗
+如果你的 ad_snapshots 表里以前存过一些没有 timezone_name 的老数据：
+建议：上线前写一个脚本，把所有 timezone_name 为 NULL 的记录，用 account_mappings 里的时区刷一遍。这样能保证历史数据的查询也是稳的。
+
+
+- 数据库查询边界的时区一致性
+  - 风险说明：当前工具 timeWindow.js 返回的是“指定时区的本地时间字符串”，而并非 UTC。若数据库字段以 UTC 写入或 MySQL 会话时区是非 UTC，直接用本地字符串比对可能发生错位。
+  - 建议落地：
+    - 在计算窗口后，查询落库前统一使用 start.toUTC().toISO() 或转换为 UTC 时间戳进行 SQL 比较。
+    - 建议在数据库连接层将会话时区固定为 UTC（如在 connection.js 建连后执行 SET time_zone = '+00:00'），保证时间比较不受服务器时区影响。
+- 时间窗口枚举一致性
+  - 契约中明确了仅允许 today | yesterday | last_3_days | last_7_days | lifetime。
+  - 现有代码中存在 last_7d 的写法（例如 ingestorService.js ），建议统一为 last_7_days，避免前后端枚举不一致引起分支逻辑偏差。
+- 冷数据归档触发策略
+  - 方案建议“每 10 分钟检查一次，仅在账户本地 06:00 执行”，以适配多时区账户。
+  - 现有定时器仍是固定服务器 06:00（参见 cronService.js ）。落地时需改为高频检查 + 按账户时区 06:00 执行，并保证幂等（同一 account_id + stat_date 只归档一次）。
+- 账户时区变更的跨窗口聚合口径
+  - 你在方案中已说明 “today 用快照行的 timezone_name”，很好。但当账户时区在近 7 天中途变更时，daily_stats 以 timezone_name 精确过滤会丢掉变更前的天数。
+  - 建议明确策略：近 7 天聚合以“当前账户时区”为准，仅聚合 timezone_name=当前时区的 daily_stats；如需跨时区连续口径，则对涉变更的日期用 ad_snapshots 重建口径或标注 warnings[] 提醒“区间包含不同时区日，聚合值可能与 FB 连续口径不完全一致”。
+- 前端展示字段命名统一
+  - 契约中 data 的业务字段多为 snake_case（account_id 等），meta 字段也建议统一 snake_case（当前草案后半段已使用 account_timezone 等）。
+  - 保持一套风格有利于消费与测试（例如：synced_at_utc + synced_at、account_timezone/display_timezone）。
+- DST（夏令时）边界提醒
+  - IANA 时区已能正确处理 DST，但文档中可补一句：归档边界与日窗口计算采用 setZone(account_timezone) 的“本地墙钟时间”，6:00 基准以当地时区为准，避免“缺一小时/多一小时”的误解。
+- 接口 warnings[] 与调试字段
+  - 文档已建议 warnings[]，落地时建议在 meta 中一并提供：
+    - warnings[]（例如“账户时区获取失败，使用 UTC 兜底”）
+    - generated_at（北京时间）
+    - server_timezone（可选，用于排障）
+    - range.account/display 两套 ISO 时间，便于可视化校验
+验证补充（在你已有验收清单基础上加一项）
+
+- SQL 会话时区验证
+  - 执行后端启动时打印并核对：SELECT @@global.time_zone, @@session.time_zone；确保为 UTC。
+  - 对比一条 ad_snapshots.synced_at 的原始 UTC 值与 API 返回 display 时区值，确认边界转换准确。

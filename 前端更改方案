@@ -1,0 +1,484 @@
+根据 DEV_PLAN.md 和 TASKS.md，结合“简洁明了、不浮夸、满足后端需求”的要求，我为你设计了以下 前端规则配置改造方案。
+🎨 前端规则页面设计方案 (RuleManager.vue)
+核心理念：分块清晰，逻辑直观。将复杂的规则配置拆解为 "基本信息"、"作用对象 (Where)"、"触发条件 (When)"、"执行动作 (Then)" 四个自然逻辑块。
+1. 页面布局结构
+顶部 (Head)
+免责提示 Banner (浅黄色底)：显著提示“请先在本系统暂停规则，再去 FB 后台开启广告”。
+操作栏：标题、新建规则按钮、全局开关（可选）。
+主体 (Body)
+规则卡片网格：保持现有卡片布局，但优化信息展示。
+增加 Scope 标签：显示该规则作用于 Ad 还是 Campaign。
+增加 Dry Run 标记：如果是模拟模式，显示“🧪 模拟中”标签。
+2. 编辑模态框设计 (重点改造)
+模态框将加宽，内容分为上下四个清晰的板块，避免拥挤：
+🟢 第一块：基本设置
+规则名称：输入框。
+模式开关：
+启用/禁用 开关。
+模拟运行 (Dry Run) 开关（开启后仅记录日志，不执行动作）。
+🔵 第二块：作用对象 (Scope)
+目标层级：单选按钮组 [ 广告 (Ad) ] [ 广告组 (AdSet) ] [ 广告系列 (Campaign) ]。
+级联选择器：
+选择账户：下拉框。
+选择具体对象：多选下拉框 (Multi-select) 或 穿梭框。
+交互优化：选择账户后，自动加载该账户下的对应层级列表。
+提示：若未选择具体 ID，则默认作用于该账户下所有对应层级对象。
+🟠 第三块：触发条件 (Trigger)
+逻辑关系：单选 [ 且 (AND) - 满足所有 ] / [ 或 (OR) - 满足任一 ]。
+预设模板 (快捷键)：右上角放两个小按钮 [⚡ 应用止损模板] [🚀 应用扩量模板]，点击直接填充下方条件。
+条件列表：每行包含 5 个元素，紧凑排列：
+指标 (Select): Spend, ROAS, CPA, Purchases 等。
+时间窗口 (Select, 新增): Today, Yesterday, Last 3 Days, Lifetime。
+运算符 (Select): >, <, =, etc.
+阈值 (Input): 数值。
+删除 (Icon)。
+🔴 第四块：执行动作 (Action)
+动作列表：每行一个动作。
+类型 (Select): 暂停、开启、调预算等。
+参数 (Input): 如预算调整百分比、预算上限（护栏）。
+🛠️ 实施步骤 (按此顺序执行)
+为了保证代码可维护，我们将分 3 步 完成改造：
+第 1 步：基础结构与数据模型升级
+目标：更新 RuleManager.vue 的 HTML 结构，引入“免责提示”，升级 ruleForm 数据结构以匹配后端新 Schema（增加 target_level, time_window, logic_operator 等字段）。
+验证：页面长相更新，打开模态框能看到新字段（暂无级联数据），保存后数据结构正确。
+第 2 步：触发条件与逻辑增强
+目标：实现带有“时间窗口”和“逻辑运算符”的条件编辑器，增加“预设模板”功能。
+验证：点击模板按钮能自动填充条件，时间窗口可保存。
+第 3 步：作用对象级联选择 (难点)
+目标：实现“层级 -> 账户 -> 具体对象”的加载逻辑。
+验证：切换账户能加载对应的广告/广告组列表并保存。
+🚀 开始第 1 步：基础结构与数据模型升级
+我将先更新 RuleManager.vue 的模板结构和基础数据定义。
+变更点：
+添加顶部免责提示 Banner。
+重构模态框布局，分为 4 个 Section。
+升级 ruleForm 和 saveRule 逻辑。
+
+RuleManager.Vue的代码是：
+《// ... existing code ...
+<template>
+  <div class="rule-page">
+    <!-- 1. 免责提示 Banner (新增) -->
+    <div class="disclaimer-banner">
+      <span class="icon">⚠️</span>
+      <div class="text">
+        <strong>安全提示：</strong> 
+        在 Facebook 后台手动开启被系统关闭的广告前，请务必先在本系统 <strong>暂停相关规则</strong>，否则可能会被系统再次自动关闭。
+      </div>
+    </div>
+
+    <!-- 顶部操作栏 -->
+    <div class="header-actions">
+// ... existing code ...
+      </div>
+    </div>
+
+    <!-- 规则编辑模态框 (重构) -->
+    <div v-if="showRuleModal" class="modal-overlay" @click="showRuleModal = false">
+      <div class="modal-content wide" @click.stop>
+        <div class="modal-header">
+          <h3>{{ editingRuleId ? '编辑规则' : '新建规则' }}</h3>
+          <button class="close-btn" @click="showRuleModal = false">×</button>
+        </div>
+
+        <div class="modal-body">
+          <!-- 区块1: 基本信息 -->
+          <div class="section-block">
+            <h4 class="section-title">1. 基本信息</h4>
+            <div class="form-row">
+              <div class="form-group flex-2">
+                <label>规则名称</label>
+                <input v-model="ruleForm.name" placeholder="例如：亏损严重自动关停" class="input-text" />
+              </div>
+              <div class="form-group flex-1">
+                <label>模拟运行 (Dry Run)</label>
+                <div class="switch-wrapper">
+                  <label class="switch">
+                    <input type="checkbox" v-model="ruleForm.is_simulation">
+                    <span class="slider round"></span>
+                  </label>
+                  <span class="switch-label">{{ ruleForm.is_simulation ? '🧪 仅模拟日志' : '⚡ 真实执行' }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 区块2: 作用对象 (Scope) -->
+          <div class="section-block">
+            <h4 class="section-title">2. 作用对象 (Where)</h4>
+            <div class="form-group">
+              <label>目标层级</label>
+              <div class="radio-group">
+                <label v-for="opt in levelOptions" :key="opt.value" class="radio-label">
+                  <input type="radio" v-model="ruleForm.target_level" :value="opt.value">
+                  {{ opt.label }}
+                </label>
+              </div>
+            </div>
+            <!-- 级联选择器占位，下一步实现 -->
+            <div class="form-group">
+              <label>选择具体对象 (ID列表)</label>
+              <textarea 
+                v-model="targetIdsString" 
+                class="input-text" 
+                placeholder="暂时手动输入ID，用逗号分隔（后续步骤实现级联选择）"
+                rows="2"
+              ></textarea>
+            </div>
+          </div>
+
+          <!-- 区块3: 触发条件 (Trigger) -->
+          <div class="section-block">
+            <div class="section-header">
+              <h4 class="section-title">3. 触发条件 (When)</h4>
+              <div class="template-actions">
+                <button class="btn-tiny" @click="applyTemplate('stop_loss')">⚡ 止损模板</button>
+                <button class="btn-tiny" @click="applyTemplate('scale_up')">🚀 扩量模板</button>
+              </div>
+            </div>
+            
+            <div class="form-group">
+              <label>逻辑关系</label>
+              <div class="radio-group">
+                <label class="radio-label">
+                  <input type="radio" v-model="ruleForm.logic_operator" value="AND"> 满足所有条件 (AND)
+                </label>
+                <label class="radio-label">
+                  <input type="radio" v-model="ruleForm.logic_operator" value="OR"> 满足任一条件 (OR)
+                </label>
+              </div>
+            </div>
+
+            <div class="conditions-container">
+              <div v-for="(c, idx) in ruleForm.conditions" :key="idx" class="condition-row">
+                <select v-model="c.metric" class="select metric-select">
+                  <option value="spend">花费 (Spend)</option>
+                  <option value="roas">ROAS</option>
+                  <option value="cpa">CPA (单次成本)</option>
+                  <option value="cpc">CPC</option>
+                  <option value="purchases">购买次数</option>
+                  <option value="link_clicks">链接点击</option>
+                </select>
+                
+                <!-- 新增：时间窗口 -->
+                <select v-model="c.time_window" class="select window-select">
+                  <option value="today">今天 (Today)</option>
+                  <option value="yesterday">昨天 (Yesterday)</option>
+                  <option value="last_3_days">近3天 (包含今天)</option>
+                  <option value="lifetime">累计 (Lifetime)</option>
+                </select>
+
+                <select v-model="c.operator" class="select operator-select">
+                  <option value="gt">大于 (>)</option>
+                  <option value="lt">小于 (<)</option>
+                  <option value="gte">≥</option>
+                  <option value="lte">≤</option>
+                </select>
+
+                <input type="number" v-model.number="c.value" class="input-number" step="0.01" />
+                <button class="btn-icon danger" @click="ruleForm.conditions.splice(idx, 1)">×</button>
+              </div>
+              <button class="btn-add" @click="addCondition">+ 添加条件</button>
+            </div>
+          </div>
+
+          <!-- 区块4: 执行动作 (Action) -->
+          <div class="section-block">
+            <h4 class="section-title">4. 执行动作 (Then)</h4>
+            <div v-for="(a, idx) in ruleForm.actions" :key="idx" class="action-row">
+              <select v-model="a.type" class="select action-select">
+                <option value="pause">⏸ 暂停 (Pause)</option>
+                <option value="activate">▶️ 开启 (Activate)</option>
+                <option value="increase_budget">💰 增加预算</option>
+                <option value="decrease_budget">💸 减少预算</option>
+              </select>
+              <input 
+                v-if="a.type.includes('budget')" 
+                type="number" 
+                v-model.number="a.value" 
+                class="input-number" 
+                placeholder="%" 
+              />
+              <span v-else class="placeholder">-</span>
+              <button class="btn-icon danger" @click="ruleForm.actions.splice(idx, 1)">×</button>
+            </div>
+            <button class="btn-add" @click="addAction">+ 添加动作</button>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button class="btn secondary" @click="showRuleModal = false">取消</button>
+          <button class="btn" @click="saveRule">保存规则</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import { ref, onMounted, computed } from 'vue'
+import ruleEngine from '../services/ruleEngine'
+import facebookApi from '../services/facebookApi'
+
+export default {
+  name: 'RuleManager',
+  setup() {
+    // ... existing refs ...
+    const rules = ref([])
+    const showRuleModal = ref(false)
+    const editingRuleId = ref(null)
+    const running = ref(false)
+    
+    // 升级表单数据结构
+    const ruleForm = ref({
+      name: '',
+      enabled: true,
+      is_simulation: false, // 新增
+      target_level: 'ad',   // 新增
+      target_ids: [],       // 新增
+      logic_operator: 'AND', // 新增
+      conditions: [],
+      actions: []
+    })
+
+    const levelOptions = [
+      { label: '广告 (Ad)', value: 'ad' },
+      { label: '广告组 (AdSet)', value: 'adset' },
+      { label: '广告系列 (Campaign)', value: 'campaign' }
+    ]
+
+    // 临时的 ID 字符串处理 (用于 input <-> array 转换)
+    const targetIdsString = computed({
+      get: () => ruleForm.value.target_ids.join(', '),
+      set: (val) => {
+        ruleForm.value.target_ids = val.split(',').map(s => s.trim()).filter(Boolean)
+      }
+    })
+
+    // ... existing loadRules ...
+    const loadRules = () => {
+      rules.value = ruleEngine.getRules()
+    }
+
+    // ... existing metricLabel/opLabel ...
+    const metricLabel = (m) => {
+      const map = { spend: '花费', roas: 'ROAS', cpa: 'CPA', ctr: 'CTR', cpc: 'CPC', clicks: '点击', purchases: '购买' }
+      return map[m] || m
+    }
+    
+    // 新增 openCreateRule
+    const openCreateRule = () => {
+      editingRuleId.value = null
+      ruleForm.value = {
+        name: '',
+        enabled: true,
+        is_simulation: false,
+        target_level: 'ad',
+        target_ids: [],
+        logic_operator: 'AND',
+        conditions: [{ metric: 'spend', operator: 'gt', value: 20, time_window: 'today' }],
+        actions: [{ type: 'pause', value: null }]
+      }
+      showRuleModal.value = true
+    }
+
+    // 新增 openEditRule
+    const openEditRule = (r) => {
+      editingRuleId.value = r.id
+      ruleForm.value = JSON.parse(JSON.stringify({
+        name: r.name,
+        enabled: r.enabled,
+        is_simulation: r.is_simulation || false,
+        target_level: r.target_level || 'ad',
+        target_ids: r.target_ids || [],
+        logic_operator: r.logic_operator || 'AND',
+        conditions: r.conditions || [],
+        actions: r.actions || []
+      }))
+      showRuleModal.value = true
+    }
+
+    // 辅助方法
+    const addCondition = () => {
+      ruleForm.value.conditions.push({ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' })
+    }
+    
+    const addAction = () => {
+      ruleForm.value.actions.push({ type: 'pause', value: null })
+    }
+
+    // 模板功能
+    const applyTemplate = (type) => {
+      if (!confirm('这将覆盖当前的条件设置，确定吗？')) return
+      if (type === 'stop_loss') {
+        // 止损模板：花费 > 20 且 ROAS < 0.5 (今天)
+        ruleForm.value.conditions = [
+          { metric: 'spend', operator: 'gt', value: 20, time_window: 'today' },
+          { metric: 'roas', operator: 'lt', value: 0.5, time_window: 'today' }
+        ]
+        ruleForm.value.logic_operator = 'AND'
+        ruleForm.value.actions = [{ type: 'pause', value: null }]
+      } else if (type === 'scale_up') {
+        // 扩量模板：ROAS > 2 (近3天)
+        ruleForm.value.conditions = [
+          { metric: 'roas', operator: 'gt', value: 2, time_window: 'last_3_days' }
+        ]
+        ruleForm.value.actions = [{ type: 'increase_budget', value: 20 }]
+      }
+    }
+
+    const saveRule = () => {
+      if (!ruleForm.value.name.trim()) return alert('请输入规则名称')
+      
+      const payload = JSON.parse(JSON.stringify(ruleForm.value))
+      
+      if (editingRuleId.value) {
+        ruleEngine.updateRule(editingRuleId.value, payload)
+      } else {
+        ruleEngine.addRule(payload)
+      }
+      showRuleModal.value = false
+      loadRules()
+    }
+
+    // ... existing deleteRule/toggleRule ...
+    const deleteRule = (r) => {
+        if (!confirm(`确定删除「${r.name}」吗？`)) return
+        ruleEngine.deleteRule(r.id)
+        loadRules()
+    }
+
+    const toggleRule = (r, checked) => {
+        ruleEngine.toggleRule(r.id, checked)
+        loadRules()
+    }
+    
+    const runRulesNow = async () => { /* ... existing code ... */ }
+
+    // ... existing getActionClass ...
+    const getActionClass = (type) => {
+        if (type === 'pause') return 'danger'
+        if (type === 'activate') return 'success'
+        return 'primary'
+    }
+    const opLabel = (op) => {
+      const map = { gt: '>', lt: '<', gte: '≥', lte: '≤', eq: '=' }
+      return map[op] || op
+    }
+    const actionLabel = (t) => {
+      const map = { pause: '暂停', activate: '开启', increase_budget: '加预算', decrease_budget: '减预算' }
+      return map[t] || t
+    }
+
+
+    onMounted(loadRules)
+
+    return {
+      rules, showRuleModal, editingRuleId, ruleForm, running,
+      levelOptions, targetIdsString,
+      loadRules, metricLabel, opLabel, actionLabel, getActionClass,
+      openCreateRule, openEditRule, saveRule, deleteRule, toggleRule, runRulesNow,
+      addCondition, addAction, applyTemplate
+    }
+  }
+}
+</script>
+
+<style scoped>
+/* 样式升级 */
+.disclaimer-banner {
+  background: #FFFBEB; border: 1px solid #FCD34D; color: #92400E;
+  padding: 12px 16px; border-radius: 8px; margin-bottom: 20px;
+  display: flex; align-items: flex-start; gap: 12px; font-size: 14px; line-height: 1.5;
+}
+.disclaimer-banner .icon { font-size: 18px; }
+
+/* 模态框加宽 */
+.modal-content.wide { max-width: 800px; }
+
+/* 分块样式 */
+.section-block {
+  background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 8px;
+  padding: 16px; margin-bottom: 16px;
+}
+.section-title {
+  margin: 0 0 12px 0; font-size: 14px; font-weight: 600; color: var(--text-primary);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+
+/* 表单布局 */
+.form-row { display: flex; gap: 16px; }
+.flex-1 { flex: 1; }
+.flex-2 { flex: 2; }
+
+/* 紧凑选择器 */
+.select { padding: 8px; border: 1px solid var(--border-color); border-radius: 6px; font-size: 13px; }
+.metric-select { width: 140px; }
+.window-select { width: 140px; background-color: #F0F9FF; border-color: #BAE6FD; color: #0369A1; }
+.operator-select { width: 80px; }
+.input-number { width: 80px; padding: 8px; border: 1px solid var(--border-color); border-radius: 6px; }
+
+/* Radio Group */
+.radio-group { display: flex; gap: 16px; }
+.radio-label { display: flex; align-items: center; gap: 6px; font-size: 14px; cursor: pointer; }
+
+/* Tiny Buttons */
+.btn-tiny {
+  padding: 2px 8px; font-size: 12px; border: 1px solid var(--border-color);
+  background: white; border-radius: 4px; cursor: pointer; margin-left: 8px;
+}
+.btn-tiny:hover { background: #f0f0f0; color: var(--primary-color); }
+
+.switch-label { margin-left: 8px; font-size: 13px; color: var(--text-secondary); }
+
+/* ... existing styles ... */
+.rule-page { padding-bottom: 40px; }
+.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.header-actions h2 { margin: 0; font-size: 24px; color: var(--text-primary); }
+.actions { display: flex; gap: 12px; }
+.rules-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+.rule-card { background: #fff; border-radius: 12px; border: 1px solid var(--border-color); box-shadow: 0 2px 8px rgba(0,0,0,0.04); transition: all 0.2s; display: flex; flex-direction: column; }
+.rule-card:hover { transform: translateY(-2px); box-shadow: 0 8px 16px rgba(0,0,0,0.08); }
+.rule-card.disabled { opacity: 0.7; background: #f9fafb; }
+.card-header { padding: 16px; border-bottom: 1px solid var(--bg-body); display: flex; justify-content: space-between; align-items: flex-start; }
+.rule-name { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; }
+.card-body { padding: 16px; flex: 1; }
+.section { margin-bottom: 8px; }
+.label { display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; font-weight: 600; }
+.arrow { text-align: center; color: var(--text-secondary); margin: 4px 0; font-size: 12px; }
+.pill { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 13px; margin: 0 6px 6px 0; border: 1px solid transparent; }
+.condition { background: #EAF3FF; color: var(--primary-color); border-color: #D6E4FF; }
+.action { font-weight: 600; }
+.action.danger { background: #FFF5F5; color: var(--danger-color); border-color: #FED7D7; }
+.action.success { background: #F0FFF4; color: var(--secondary-color); border-color: #C6F6D5; }
+.val { font-weight: 400; opacity: 0.9; }
+.card-footer { padding: 12px 16px; border-top: 1px solid var(--bg-body); display: flex; justify-content: flex-end; gap: 12px; }
+.btn-text { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+.btn-text:hover { color: var(--primary-color); text-decoration: underline; }
+.btn-text.danger:hover { color: var(--danger-color); }
+.switch { position: relative; display: inline-block; width: 36px; height: 20px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 20px; }
+.slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+input:checked + .slider { background-color: var(--secondary-color); }
+input:checked + .slider:before { transform: translateX(16px); }
+.empty-rules { text-align: center; padding: 60px 0; color: var(--text-secondary); }
+.empty-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-content { background: #fff; width: 90%; max-width: 600px; border-radius: 12px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); animation: slideUp 0.3s ease; }
+@keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.modal-header { padding: 16px 24px; border-bottom: 1px solid var(--bg-body); display: flex; justify-content: space-between; align-items: center; }
+.modal-body { padding: 24px; max-height: 70vh; overflow-y: auto; }
+.modal-footer { padding: 16px 24px; border-top: 1px solid var(--bg-body); display: flex; justify-content: flex-end; gap: 12px; }
+.form-group { margin-bottom: 20px; }
+.form-group label { display: block; margin-bottom: 8px; font-weight: 500; font-size: 14px; }
+.input-text { width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px; }
+.condition-row, .action-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.placeholder { width: 80px; text-align: center; color: #999; line-height: 36px; }
+.btn-icon { width: 36px; height: 36px; border: 1px solid var(--border-color); background: #fff; border-radius: 6px; cursor: pointer; color: #666; }
+.btn-icon:hover { background: #f5f5f5; }
+.btn-icon.danger { color: var(--danger-color); border-color: #fed7d7; background: #fff5f5; }
+.btn-add { width: 100%; border: 1px dashed var(--border-color); background: #fafafa; padding: 8px; border-radius: 6px; color: var(--primary-color); cursor: pointer; font-size: 13px; }
+.btn-add:hover { background: #f0f7ff; border-color: var(--primary-color); }
+</style>》
