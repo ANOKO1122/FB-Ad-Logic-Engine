@@ -1,0 +1,75 @@
+{
+  "clientName": "Thunder Client",
+  "collectionName": "2.3 DNF 集成验收",
+  "folders": [],
+  "requests": [
+    {
+      "name": "1. 验证3-time_window不一致(400)",
+      "url": "http://localhost:3001/api/rules",
+      "method": "POST",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json" },
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"ruleName\": \"验证3-time_window不一致\",\n  \"accountId\": \"act_1155891202142879\",\n  \"conditions\": [\n    { \"metric\": \"spend\", \"operator\": \"gt\", \"value\": 0, \"time_window\": \"today\" },\n    { \"metric\": \"cpc\", \"operator\": \"gt\", \"value\": 0, \"time_window\": \"last_3_days\" }\n  ],\n  \"logicOperator\": \"AND\",\n  \"actions\": [{ \"type\": \"pause_ad\" }]\n}"
+      }
+    },
+    {
+      "name": "2. 验证4-v2空conditions(400)",
+      "url": "http://localhost:3001/api/rules",
+      "method": "POST",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json" },
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"ruleName\": \"验证4-v2空组\",\n  \"accountId\": \"act_1155891202142879\",\n  \"conditions\": {\n    \"version\": 2,\n    \"groups\": [{ \"operator\": \"AND\", \"conditions\": [] }]\n  },\n  \"actions\": [{ \"type\": \"pause_ad\" }]\n}"
+      }
+    },
+    {
+      "name": "3. 验证1-创建v1 OR规则",
+      "url": "http://localhost:3001/api/rules",
+      "method": "POST",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json" },
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"ruleName\": \"验证1-v1 OR\",\n  \"accountId\": \"act_1155891202142879\",\n  \"conditions\": [\n    { \"metric\": \"spend\", \"operator\": \"gt\", \"value\": 999999, \"time_window\": \"today\" },\n    { \"metric\": \"cpc\", \"operator\": \"gt\", \"value\": 0.01, \"time_window\": \"today\" }\n  ],\n  \"logicOperator\": \"OR\",\n  \"actions\": [{ \"type\": \"pause_ad\" }]\n}"
+      }
+    },
+    {
+      "name": "4. 验证1-执行(需填ruleId)",
+      "url": "http://localhost:3001/api/rules/REPLACE_WITH_RULE_ID/execute",
+      "method": "POST",
+      "headers": [
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ]
+    },
+    {
+      "name": "5. 验证2-创建v2 DNF规则",
+      "url": "http://localhost:3001/api/rules",
+      "method": "POST",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json" },
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"ruleName\": \"验证2-v2 DNF\",\n  \"accountId\": \"act_1155891202142879\",\n  \"conditions\": {\n    \"version\": 2,\n    \"groups\": [\n      {\n        \"operator\": \"AND\",\n        \"conditions\": [\n          { \"metric\": \"spend\", \"operator\": \"gt\", \"value\": 0.8, \"time_window\": \"today\" },\n          { \"metric\": \"link_clicks\", \"operator\": \"eq\", \"value\": 0, \"time_window\": \"today\" }\n        ]\n      },\n      {\n        \"operator\": \"AND\",\n        \"conditions\": [\n          { \"metric\": \"cpc\", \"operator\": \"gt\", \"value\": 0.8, \"time_window\": \"today\" }\n        ]\n      }\n    ]\n  },\n  \"actions\": [{ \"type\": \"pause_ad\" }]\n}"
+      }
+    },
+    {
+      "name": "6. 验证2-执行(需填ruleId)",
+      "url": "http://localhost:3001/api/rules/REPLACE_WITH_RULE_ID/execute",
+      "method": "POST",
+      "headers": [
+        { "key": "Authorization", "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsImlhdCI6MTc3MDQ1NTQzMCwiZXhwIjoxNzcxMDYwMjMwfQ.5HqOzuaMaERMkr4ax5n2Ve8HdpHC4rgnaCBQicctFxw" }
+      ]
+    }
+  ]
+}

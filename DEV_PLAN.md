@@ -24,11 +24,42 @@
 
 结合 README.md 的 Phase 划分与《自动化优化方案》：
 
-- Phase 1：稳定性与透明化 —— 已完成，用于支撑后续迭代。
-- Phase 2：多用户隔离架构 —— 已完成，规则应继续遵守 owner 维度隔离。
-- Phase 3：规则重心下沉与 7x24h 自动化 —— 进行中，是本计划的主要施工范围。
-- Phase 4：前端布局优化 —— 已完成，可在后续做小幅改进。
-- Phase 5：审计、模拟与安全实战 —— 规划中，对应《自动化优化方案》的第 4 部分。
+- Phase 1：稳定性与透明化 —— ✅ 已完成，用于支撑后续迭代。
+- Phase 2：多用户隔离架构 —— ✅ 已完成，规则应继续遵守 owner 维度隔离。
+- Phase 3：规则重心下沉与 7x24h 自动化 —— 🔄 进行中（约 75%），是本计划的主要施工范围。
+  - ✅ 数据架构层（M2）：已完成（约 98%）
+  - ✅ 规则配置层（M3）：基础功能已完成（约 80%）
+  - 🔄 动作执行层（M4）：部分完成（约 40%）
+  - ⏳ 反馈与监控层（M5）：规划中（约 10%）
+- Phase 4：前端布局优化 —— ✅ 已完成，可在后续做小幅改进。
+- Phase 5：审计、模拟与安全实战 —— ⏳ 规划中，对应《自动化优化方案》的第 4 部分。
+
+**最新进度（2026-02-14）**：
+- ✅ **多账户规则 target_by_account 优化**：evaluateRule 当当前 accountId 不在 target_by_account 时设 targetAdIds=[] 不查全量；getRuleAccountIds/ruleAppliesToAccount 仅对「value 为非空数组」的账户执行；GET /api/structure/objects/multi 响应 meta 增加 per_account_limit、has_more；前端 refreshScopeItems 移除不在 scope 的 targetIds。详见 `项目开发过程/项目总结-2026-02-14-多账户target_by_account优化与ThunderClient验证.md`。
+- ✅ **Thunder Client 小白验证步骤**：`docs/Thunder_Client_小白验证步骤.md`（登录→objects/multi 带 token 与 Query→检查 meta）；验证通过。
+- ⏳ **下一窗口建议（按优先级）**：
+  1. **Step 4 体验与完整性**：结构增量/定时同步、选择器优化等剩余项；可选将 RuleManager 选择器迁到 getStructureObjectsUnified。
+  2. **4.2 IM 机器人**：钉钉/飞书通知、60 秒聚合、告警接入。
+  3. 回归：规则执行（含 campaign/adset、多账户 target_by_account）、结构列表筛选、统一接口与旧接口并存。
+
+**此前进度（2026-02-13）**：
+- ✅ campaign/adset 维度补齐、规则目标解析改造、前端状态筛选、结构索引方案 B。详见 `项目开发过程/项目总结-2026-02-13-campaign_adset补齐与规则目标解析及结构统一接口.md`。
+
+**此前进度（2026-02-12）**：
+- ✅ 广告系列与 CBO 及 daily_stats campaign_id；自定义模板页面 UI 优化；TASKS 文档同步；归档口径与回退对齐；推荐顺序 Step 0～3 已全部验收完成。详见 `项目开发过程/项目总结-2026-02-12-*.md`
+
+**此前进度（2026-02-11）**：
+- ✅ 预算 GET 单位修复 + 2.3.1 收尾；Route 1 字段补齐（purchase_value 根因）；ROAS 方案 A 落地；RuleEngineDispatcher（§2.4）落地。详见 `项目开发过程/项目总结-2026-02-11-*.md`
+
+**此前进度（2026-02-10）**：
+- ✅ Winston 应用日志已落地：统一 logger、双写、关键模块替换为 logger。详见 `项目开发过程/项目总结-2026-02-10-Winston应用日志与双写及关键模块替换.md`
+
+**此前进度（2026-02-07）**：
+- ✅ 2.3 DNF 集成验收、3 模板 v2；代理瞬态重试 + CONCURRENT_LIMIT=6；resolve 回显、刷新列表已落地。详见 `项目开发过程/项目总结-2026-02-07-DNF集成验收与3模板v2及代理重试.md`
+
+**此前进度（2026-02-05 / 2026-02-04 / 2026-02-02 / 2026-01-27 / 2026-01-30）**：
+- ✅ 顺序2 伪增量 + Piggyback + 每小时全量轮转已落地并验证通过（8 项验收打勾）；2.2 选择器查库（GET /api/structure/ads 查 structure_ads）、2.1/2.4 已验收
+- ✅ 规则管理功能完整实现、规则执行框架（AdsPolar、账户级锁、冷却期）、数据清洗与归档口径；M4 Vitest 验证与历史测试修复（94 用例通过）
 
 **本 DEV_PLAN 的重点：**
 
@@ -57,6 +88,10 @@
 - 接入 Facebook Batch API，按 20 条子请求分组。
 - 实现 API 频率自适应与超时自愈机制。
 - 保证 ID 精度、滑动窗口回溯、冷热数据分层。
+- **数据清洗逻辑**（2026-01-27 完成）：在写入队列中过滤 spend=0 且 impressions=0 的僵尸数据，减少热表空间占用。实现位置：`server/services/ingestorService.js` 第1616-1637行。
+- **归档查询口径修正**（2026-01-27 完成）：归档查询使用 data_date 而非 synced_at，确保按账户时区的自然日进行归档，避免时区差异导致的数据查询错误。实现位置：`server/services/ingestorService.js` 第2121行。
+- **验证工具与文档**（2026-01-27 完成）：创建验证脚本（`test-verify-sync.js`、`test-verify-archive.js`）和文档（`验证执行步骤.md`、`验证SQL查询.sql`、`下一个窗口验证和测试清单.md`），支持系统化验证数据架构层功能。
+- **Route 1 字段完整性**（2026-02-11 完成）：Today 心跳走 Insights First 路径时，`server/index.js` 的 `getAdInsights()` 必须请求 action_values、purchase_roas、website_purchase_roas 等 ROI 核心字段，否则 purchase_value 必为 0、规则 roas 判定失效。已补齐 fullFields 与 fallbackFields，mapItem 透传。
 
 ### M3：规则配置层（Rule Engine 配置与时区对齐）
 
@@ -64,7 +99,8 @@
 
 - 规则模型包含：目标对象、条件数组（AND/OR）、时间窗口、账户时区。
 - 支持 Today / Yesterday / Last 3 Days / 累计至今。
-- 保证只对 `effective_status === 'ACTIVE'` 的对象生效。
+- **对象与状态口径**：前端选择器默认按 ACTIVE/PAUSED（基于 effective_status）过滤；规则执行前用本地 `ad_snapshots.status` 做 Pre-Flight（目标已达成则 skipped），不新增 per-ad GET；FB 返回「already in that state」类错误容错为 skipped/success。
+- **比值类指标与规则比较语义**：cpc/ucpc/cpa/roas 在分母为 0 时为 null（不可比较）；规则比较时 null 与数值比较结果为 false；「坏 vs 空」口径见 **5.2.1 指标口径与规则引擎比较语义**。
 - 提供 JSON 模板化 SOP 与前端免责提示。
 
 ### M4：动作执行层（冲突仲裁与安全护栏）
@@ -75,6 +111,7 @@
 - 同一广告同一轮扫描只执行优先级最高的动作。
 - 支持 Smart Mute（手动/自动挂起），预算上限护栏。
 - 引入 Pre-Flight Check 和重试策略。
+- **动作下发与审计硬口径**：pause_ad 在非 Dry Run 下必须真实调用 FB API（POST），并在 automation_logs 记录 status=success/fail/skipped、skip_reason、is_simulation 等可复盘字段；验收以 FB 后台广告状态变为 PAUSED 为准。Pre-Flight 仅用本地 status + FB 返回 already-state 容错，不新增 per-ad GET。
 
 ### M5：反馈与监控层（审计日志 + IM 机器人 + 健康看板）
 
@@ -103,7 +140,8 @@
 围绕以下核心概念设计/补齐数据表（推荐使用 Drizzle ORM）：
 
 - `ad_snapshots`（热数据：Today）
-  - 主键：`id`（自增或雪花）、唯一索引：`ad_id + sync_session_id`
+  - 主键：`id`（自增或雪花）；包含自然日字段 `data_date`(DATE)
+  - 索引：唯一索引 `uk_account_ad_date(account_id, ad_id, data_date)`（保证每个账户+广告+自然日仅一行），`sync_session_id` 普通索引
   - 字段说明：
     - 基本信息：`account_id`(VARCHAR)、`ad_id`(VARCHAR)、`ad_name`、`status`(VARCHAR)、`owner_id`
     - 指标（今日快照入库，严格围绕 10 个字段与其所需原始计数）：
@@ -126,8 +164,9 @@
       - 原文与上下文：
         - `actions`(JSON)：所有动作数据（用于解析 counts 与 purchases）
         - `action_values`(JSON)：动作金额（用于解析 `purchase_value`）
-    - 元信息：`sync_session_id`(VARCHAR)、`synced_at`(DATETIME)、`timezone_name`(VARCHAR)
+    - 元信息：`data_date`(DATE)、`sync_session_id`(VARCHAR)、`synced_at`(DATETIME)、`timezone_name`(VARCHAR)
     - 自动化相关：`mute_until`(DATETIME)、`mute_reason`(VARCHAR)、`is_simulation`(BOOL 可选)
+  - 热表清理：通过每日定时任务（建议账户本地时间 04:00 左右）删除 2 天前的旧快照，仅保留最近 2 天数据用于真空期兜底与问题排查。
 - `daily_stats`（冷数据：历史快照）
   - 主键：`id`
   - 索引：`account_id + date`、`ad_id + date`
@@ -144,12 +183,21 @@
     - API 原文：`api_request`(TEXT)、`api_response`(TEXT)
     - 状态：`status`(success/fail/skipped)、`error_message`
     - 时间：`triggered_at`(DATETIME)、`created_at`(DATETIME)
+- `structure_ads`（结构镜像：广告清单/选择器数据源，0 次 FB 调用）
+  - 存：ad_id、name、effective_status、层级 id、updated_time、last_synced_at
+  - 不存：spend/roas 等指标
+  - 用途：规则创建/编辑的指定对象选择器、名称搜索、分页、默认 ACTIVE/PAUSED 展示口径
+- 口径对齐：**ad_snapshots** = 热指标快照（且 Today 口径可只收 spend>0）；**structure_ads** = 结构与状态镜像（覆盖 0 花费广告，供选择器与状态展示）。结构镜像是「广告清单/选择器读库」用，与「热数据与广告的匹配」无关——热数据与广告的对应由 Insights 返回的 ad_id/ad_name 在写入 ad_snapshots 时已完成。
 
 ### 4.2 Data Ingestor 批量同步流程
 
 - 入口：在后端（建议 `server/services/cronService.js` 或新建 `ingestorService.js`）提供：
   - `syncAccountTodayStats(accountId)`：同步单账户 Today 数据。
   - `syncAllAccountsTodayStats()`：同步当前系统内所有账户的 Today 数据。
+  - **受控并发调度**：在统一心跳任务内，同步所有账户的 Today 数据时，要对账户列表采用受控并发调度：
+    - 限制同一时刻并发运行的账户同步任务数量为 6。
+    - 可以使用 `p-limit(6)` 或自实现并发池。
+    - 避免"纯串行"或"一次性全并发"。
 - 20-Batch 聚合：
   - 从待同步广告列表中，使用 `lodash.chunk`（或自实现）按 20 个一组切分。
   - 按 FB Batch API 规范，构造一个包含 20 个子请求的批处理请求。
@@ -171,8 +219,17 @@
     - < 50%：`sleep(500ms)`
     - 50%–85%：`sleep(2000ms)`
     - > 85%：`sleep(10000ms)` 且记录警报（发送到机器人）。
+- **受控并发（Throttled Concurrency）**：
+  - 在所有"按账户遍历 + 调用 Facebook API"的任务中：
+    - Today 热同步
+    - 冷路径双窗口归档
+    - last_7d / last_14d 回补
+  - 都要统一限制"同一时间并发运行的账户任务数量 = 6"。
+  - 建议使用 `p-limit(6)` 或等价并发池，在统一心跳内调度账户任务。
+  - 受控并发 + Header 自适应休眠是一起工作的：
+    - 使用率高时，可以通过延长 sleep 或临时降低并发度继续保护配额。
 - 日志与告警接入（补充）：
-  - 在占用率高与熔断触发时写入 warn/error 级日志；将告警事件纳入“应用日志与轮转”的验收范围
+  - 在占用率高与熔断触发时写入 warn/error 级日志；将告警事件纳入"应用日志与轮转"的验收范围
 - 超时保护：
   - 封装 `fetchWithTimeout`（或对 axios request 使用 `Promise.race`）：
     - 超时时间：45 秒。
@@ -194,17 +251,14 @@
   - 使用 `ON DUPLICATE KEY UPDATE` 覆盖更新过去一周的数据。
   - 解决 FB 归因延迟导致的「迟到事件」。
 - 热/冷数据分离：
-  - 热数据（Today）：每 10 分钟轮询，用于规则触发。
-  - 冷数据（历史）：每天 06:00（账户时区）将昨天数据落盘到 `daily_stats`，报表查询优先读取此表。
+  - 热数据（Today）：每 15 分钟统一心跳同步（用于规则触发），所有请求统一走 `UnifiedSyncJob` 入口，避免为 Today/Yesterday 分别起独立 Cron。
+  - 冷数据（历史）：在统一心跳内每 15 分钟基于 `daily_archive_status` 任务注册表做巡检（Sliding Window / Trigger Threshold），按账户时区判断并执行双窗口归档：账户本地时间 ≥02:00 对 Yesterday 执行初步归档（将状态从 PENDING 标记为 ARCHIVED），账户本地时间 ≥12:00 对 Yesterday 执行深度对账覆盖（将 ARCHIVED 标记为 FINALIZED），错过可在后续心跳中补跑。
 - 冷数据落盘口径（补充细化）：
-  - 当日值取“每广告最后快照”，不可对快照 SUM（详见《方案B+优化版》三章）
-  - 实现方式：
-    - MySQL 8.0+：使用 `ROW_NUMBER() OVER (PARTITION BY account_id, ad_id ORDER BY synced_at DESC)` 取 `rn=1`
-    - 非 8.0：使用“最大时间戳连接法”（先取 MAX(synced_at)，再连接原表）
-  - 索引与性能：确认/增加 `idx_account_synced`、`idx_ad_synced`、`idx_ad_synced_desc`
-  - 06:00 边界降级：若 `daily_stats` 暂不可用，按账户时区降级到 `ad_snapshots` 的“昨日最后快照”，误差约 0.7%–1%
+  - 冷路径归档建议统一直接拉取 Facebook API 的 Yesterday 全天汇总包写入 `daily_stats`（UPSERT 覆盖写，最终一致）。
+  - 展示层兜底：在冷归档未完成的真空期，可按账户时区降级到 `ad_snapshots` 的“昨日最后快照”（基于 `data_date = 昨日` 且 `synced_at` 最大的一行，尽力而为），无需额外 00:15 冷回溯任务。
   - 单日比值入库与迟到回补：
     - 昨日批量洞察：按 `date_preset=yesterday` 拉取 `cpc, roas, inline_link_clicks, unique_inline_link_clicks, actions, action_values, cost_per_action_type, cost_per_unique_link_click, cost_per_unique_inline_link_click`
+      - 备注：此处用 `date_preset` 仅作为现阶段实现简化；中期优化以显式 `time_range(since/until)` 统一口径为目标，避免平台变更 `date_preset` 语义带来风险。
     - 与“最后快照”结果按 `ad_id` 合并，写入 `daily_stats` 的比值列与原始计数字段；比值类优先 API 值，缺失用原始计数兜底；`cpa` 按 `spend/purchases` 计算入库
     - 迟到归因回补：增加“近 7 天单日回补”任务，覆盖更新 `daily_stats` 的 `cpc/roas/ucpc/cpa/各成本` 与原始计数
   - 查询路由与聚合口径：
@@ -221,6 +275,31 @@
     - 状态、花费、购买：
       - `status`：取最新状态展示
       - `spend`、`purchases`：区间直接 SUM
+
+### 4.5 顺序2：结构镜像与选择器口径
+
+- **结构同步**：
+  1. **首次全量（Bootstrap）必须**：每个账户第一次跑一次真全量分页同步 `/act_xxx/ads`（6 类状态）→ upsert structure_ads；写入 structure_sync_status：has_full_synced=1、last_full_count=COUNT(*)、last_full_success_at、last_success_at。
+  2. **Bootstrap 与轮转优先级（写死）**：① 任何账户 **has_full_synced=0** 或 has_full_synced=1 且 last_full_count=0（未铺表）时，轮转任务**必须优先处理该账户**（先铺表再谈伪增量）。② 若结构表本地 COUNT(*)=0 且 **has_full_synced=1**（异常态），本次**直接全量修复**并重置 last_full_count。③ **判定已铺表的最低标准**：**has_full_synced=1 且 last_full_count>0** 才算真正完成过一次可用的全量铺表。
+  3. **后续增量主策略 = 伪增量**：不依赖 FB updated_time filtering（现网不可靠）。**Piggyback 与伪增量关系（写死，防重复调用）**：**结构写库用的 resolveObjectsByIds 同一轮心跳内只执行一次**；Piggyback 承担 activeAdIds 补齐，**尽量复用 Today 同步里已拿到的 ad name/status**（能复用就复用，只对「缺口」补查）；伪增量**只对 diffIds** 调用 resolveObjectsByIds。**diffIds** = recentActiveIds − activeAdIds。**recentActiveIds 取数口径（写死）**：`effective_status='ACTIVE' AND last_synced_at >= UTC_TIMESTAMP() - INTERVAL 24 HOUR`（6h/12h/24h 项目选一写死；用 UTC_TIMESTAMP 避免 session time_zone 歧义）。**每账户每轮差异上限 maxDiffIds=200**，超过按 **last_synced_at 最新优先**。仅对 diffIds 拉 id, name, effective_status, status, configured_status, updated_time → upsert 到 structure_ads；diffIds 为空则不调 FB。
+  4. **全量保底**：每小时结构全量轮转，**默认 6 个账户**，**允许动态上调到 12**（条件：API 使用率低 + P0 不繁忙；降级：usage 高/退避/429 → 本小时少跑或不跑）。**结构全量并发固定 1**。结构全量必须为 P1 后台任务：**永远让路 P0**（主心跳/归档/回补），撞上就跳过或延后。
+  5. **退避策略**：基于 **x-business-use-case-usage** 的强制降级；水池紧张时优先保主心跳，结构全量立即降级/停跑。
+  - **历史方案/可选优化**：原「对外 ISO Z/对内 Unix 秒、5 分钟回看窗口、updated_time > sinceISO 拉增量」仅当**确认 FB 支持 updated_time filtering** 时再启用；**当前版本不依赖该能力**。structure_sync_status 的 last_sync_updated_ts 可仍记录本轮 max(updated_time)（可选），但不作为 FB filtering 的依赖。
+- **展示策略**：基于查库，不增加 FB 列表调用。**展示过滤与 q 的组合逻辑（写死）**：① q 为空：只返回 ACTIVE；`include_paused=1` 时再加 PAUSED。② q 非空：放宽到 6 类状态；`include_paused` 仍表示「至少包含 PAUSED」，不需另开 ALL。**本期选用：A 安全优先**（q 非空仍排除 DELETED/ARCHIVED；验收不包含「能搜到已归档/删除」）；B 留待后续任务。
+
+### 4.5.1 结构同步优先级策略（P0/P1/P2）
+
+- **P0（最高）统一心跳**：15min 跑 Today/滑动窗口/归档/触发规则；任何结构同步不得抢占 P0。
+- **P1 Piggyback**：在 Today 热同步发现 spend>0 的新广告时，按需补齐 structure_ads（缺失才补）；**结构写库用的 resolveObjectsByIds 同一轮只执行一次**；**尽量复用 Today 同步里已拿到的 name/status**，只对「缺口」补查；伪增量只补 diffIds。
+- **P1 伪增量 + 每小时结构全量**：伪增量在心跳后置阶段**只对 diffIds** 做 resolveObjectsByIds（activeAdIds 不重复调）；每小时结构全量轮转默认 6 账户、可上调 12，**结构全量并发固定 1**，**has_full_synced=0 优先铺表、count=0 且 has_full_synced=1 时全量修复**，必须后置、可跳过、让路 P0；**usage 高时本小时直接跳过结构任务**。
+- **P2 手动刷新**：运营兜底开关（最高优先级体验），重型全量/分页路径；日常新鲜度主要靠伪增量 + 低频轮转全量。
+- **数据一致性 SLO**：新建广告产生 spend>0 后在同轮/下一轮可搜到；若需立刻配规则，可点一次「刷新列表/手动同步结构」兜底。
+
+### 4.6 合并同类项：Batching / Piggybacking / Deduping
+
+- 数据同步层（UnifiedSyncJob）：统一以“统一心跳 + 滑动窗口”方式调度所有同步与回补任务，禁止为 Today / Yesterday 分别起独立 Cron；统一的同步入口根据心跳时间与账户时区决定本轮使用的 time_range（Today、last_3d、last_7d、last_14d），最大化复用同一次 API 请求。
+- 规则执行层（RuleEngineDispatcher）：在每轮规则扫描时，先按账户和目标层级一次性从 `ad_snapshots`/`daily_stats` 拉取最新指标，缓存在内存中，再将同一份数据依次通过多条规则的条件数组进行判断，避免“每条规则查一次 DB”。
+- 指令执行层（ActionExecutor + Dedup）：规则评估完成后先生成完整的 Action Plan，再按 (ad_id, action_type) 维度做去重与优先级仲裁，同一广告只保留最高优先级且不重复的动作，避免对同一对象多次调用相同 API，减少写入限流与报错。
 
 ---
 
@@ -257,6 +336,19 @@
   - `last_3_days`：当前自然日往前推 3 天。
   - `lifetime`：可映射为「从广告创建日到当前」或 FB 的 lifetime 统计。
 
+### 5.2.1 指标口径与规则引擎比较语义（比值类 + 坏 vs 空）
+
+- **比值类指标语义**（分母为 0 时记为 null，不可比较）：
+  - `cpc`：仅当 `link_clicks > 0` 时有意义；`link_clicks = 0` 时为 null。
+  - `ucpc`：仅当 `unique_link_clicks > 0` 时有意义；否则为 null。
+  - `cpa`：仅当 `purchases > 0` 时有意义；否则为 null。
+  - `roas`：仅当 `spend > 0` 时有意义；否则为 null。
+- **规则引擎比较规则**：任意 **null** 与数值做 `gt/gte/lt/lte/eq` 比较，结果均为 **false**（避免用空值误杀/误触发）；不得用 spend 等去「伪造」cpc。
+- **「坏 vs 空」产品口径**（AdsPolar 落地）：
+  - **贵点击**：`link_clicks > 0 AND cpc > 阈值` → pause_ad（点击贵才关）。
+  - **空耗（Zero Click Spend）**：`spend > 阈值 AND link_clicks = 0` → pause_ad（有花费无点击）。
+  - **空转化（Zero Purchase Spend）**：`spend > 阈值 AND purchases = 0` → pause_ad（有花费无转化）。
+
 ### 5.3 前端规则配置与 SOP 模板
 
 - 级联选择流（前端）：
@@ -266,6 +358,9 @@
   - 提供预设 JSON 模板，例如：
     - 止损：`spend > 20 && purchases < 1`
     - 扩量：`purchases > 5 && cpa < 10`
+    - **空耗**：`spend > X AND link_clicks = 0` → pause_ad
+    - **贵点击**：`link_clicks > 0 AND cpc > Y` → pause_ad
+    - **空转化**：`spend > Z AND purchases = 0` → pause_ad
   - 前端以「一键填空」方式展示，减少运营配置成本。
 - 前端免责提示：
   - 在规则页或监控页显著位置提示：
@@ -307,10 +402,9 @@
   - 规则配置中加入 `max_daily_budget`。
   - 对于加预算动作：
     - 新预算 = `min(当前预算 * (1 + 增幅), max_daily_budget)`。
-- Pre-Flight 检查：
-  - 在执行 `PAUSE` 等动作前：
-    - 调用一次轻量级 GET 查询广告当前状态。
-    - 若已被运营手动关闭，记录为 `status = skipped`，不再调用修改接口。
+- Pre-Flight 检查（定稿口径）：
+  - **不新增**对每个广告的 GET；仅用本地 `ad_snapshots.status` 判断「目标已达成则 skipped」（如 pause 前已是 PAUSED/DISABLED/ARCHIVED）。
+  - FB 返回「already in that state」/「duplicate」类错误时容错为 skipped 或 success，不记为失败。
 - 异常与重试：
   - 对于临时性错误（网络、5xx）：
     - 支持最多 3 次指数退避重试（如 1s, 2s, 4s）。
@@ -381,6 +475,12 @@
   - 进一步提升到 >= 80%（长期目标）。
 - 冷数据落盘与时区一致性（补充）：
   - 同一广告同日多快照时，`daily_stats` 当日值等于“最后快照”的值（非 SUM）
-  - 跨时区账户在“昨日”边界选择正确（含 06:00 前后场景）；`daily_stats` 缺席时降级策略生效
+  - 跨时区账户在“昨日”边界选择正确（含冷归档未完成真空期场景）；`daily_stats` 缺席时降级策略生效
 - 应用日志与轮转（补充）：
   - 按日期生成分级日志；异常与拒绝可追踪；保留策略生效；敏感信息不暴露
+- AdsPolar 修复验证（2026-01-27 新增）：
+  - 写入清洗逻辑验证：确认僵尸数据被正确过滤
+  - 归档查询 data_date 验证：确认使用 data_date 而非 synced_at
+  - 验证脚本热数据差异验证：确认 ≤1% 差异被正确识别
+  - SQL 综合验证：确认数据一致性和查询口径正确性
+- **顺序2 结构同步自检**：主策略为伪增量（不依赖 FB updated_time filtering）；全量保底为每小时轮转、并发 1、P0 抢占；usage 高时结构任务本小时跳过。

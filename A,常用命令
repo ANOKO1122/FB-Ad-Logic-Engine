@@ -1,0 +1,15 @@
+node server/scripts/sync-all-timezones.js
+
+
+WHERE is_active = 1
+ORDER BY fb_account_id;
+
+-- 检查是否有账户时区仍为 UTC（可能需要手动处理）
+SELECT 
+  fb_account_id,
+  timezone_name,
+  COUNT(*) as count
+FROM account_mappings
+WHERE is_active = 1
+  AND (timezone_name IS NULL OR timezone_name = 'UTC')
+GROUP BY fb_account_id, timezone_name;

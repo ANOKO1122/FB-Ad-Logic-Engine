@@ -2,6 +2,7 @@
 // 按照方案B+优化版-最终版.md 阶段4的要求实现
 // 负责智能路由、06:00边界降级、动态聚合计算
 
+import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { DateTime } from 'luxon'
 import { calculateTimeWindow, getTimeWindowForQuery } from '../utils/timeWindow.js'
@@ -24,11 +25,11 @@ function selectDataSource(timeWindow, timezoneName = 'UTC') {
     case 'today':
       // 第1-4行：Today → ad_snapshots（热数据，毫秒级响应）
       // needAggregation: false 表示单天数据，不需要聚合
-      // useApiValues: true 表示可以直接使用 API 返回的值（如 cpc、roas）
+      // 注意：读侧统一由 calculateSingleDayMetrics 计算口径；API ROAS 仅作为兜底值（DB 字段 roas）
       return { 
         source: 'ad_snapshots', 
         needAggregation: false,  // 单天不需要聚合
-        useApiValues: true       // 展示时可优先用 API 值
+        useApiValues: true       // 兼容字段（当前不作为“直接用 API 派生值”的开关）
       }
     
     case 'yesterday':
@@ -152,7 +153,7 @@ export async function getDataTimezone(accountId, adIds, accountTimezone) {
     return accountTimezone
   } catch (error) {
     // 第12-13行：如果查询失败，记录警告但回退到账户时区（优雅降级）
-    console.warn(`⚠️  获取数据时区失败，使用账户时区 ${accountTimezone}:`, error.message)
+    logger.warn(`⚠️  获取数据时区失败，使用账户时区 ${accountTimezone}:`, error.message)
     return accountTimezone
   }
 }
@@ -295,7 +296,7 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
 }
 
 // ============================================
-// 数据查询函数（待实现）
+// 数据查询函数
 // ============================================
 
 /**
@@ -311,7 +312,7 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
  * - today：查询今日最新快照（实时数据）
  * - yesterday（降级）：查询昨日最后快照（06:00 前，daily_stats 未归档）
  * - 使用 ROW_NUMBER() 窗口函数取每个广告的最后一次快照（MySQL 8.0+）
- * - 兼容方案：如果数据库不支持窗口函数，使用最大时间戳连接法
+ * - 要求 MySQL 8.0+（today、yesterday fallback、custom_range 均使用窗口函数）
  */
 async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFallback = false, customRange = null) {
   try {
@@ -322,88 +323,27 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
     const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds])
     const hasAdFilter = adIdArray != null && adIdArray.length > 0
     
-    // 第5-12行：计算时间窗口的起止时间（统一转换为 UTC）
-    // 为什么必须转换为 UTC？
-    // - MySQL 的 TIMESTAMP 类型会根据会话时区进行转换
-    // - 如果直接使用本地时间字符串，MySQL 会按会话时区解释，导致时间比较错位
-    // - 统一转换为 UTC 后，无论会话时区如何，都能正确比较
-    // 
-    // 步骤：
-    // 1. 使用 dataTimezoneUsed（数据时区）计算时间窗口的起止时间（本地时间）
-    // 2. 转换为 UTC 时间（.toUTC()）
-    // 3. 格式化为 MySQL 日期格式（用于 SQL 比较）
-    // 优先级2任务：支持 custom_range（传递 customRange 参数）
+    // 第5-12行：计算时间窗口的起止时间
+    // today / yesterday fallback：用 data_date（自然日）过滤，避免 synced_at/UTC 边界问题
     const { start, end } = calculateTimeWindow(timeWindow, timezoneName, customRange)
-    const startUTC = start.toUTC()  // 转换为 UTC
-    const endUTC = end.toUTC()      // 转换为 UTC
-    const startDate = startUTC.toFormat('yyyy-MM-dd HH:mm:ss')  // UTC 时间字符串
-    const endDate = endUTC.toFormat('yyyy-MM-dd HH:mm:ss')      // UTC 时间字符串
-    
+    const startUTC = start.toUTC()
+    const endUTC = end.toUTC()
+    const startDate = startUTC.toFormat('yyyy-MM-dd HH:mm:ss')
+    const endDate = endUTC.toFormat('yyyy-MM-dd HH:mm:ss')
+    const todayDateStr = timeWindow === 'today' ? start.toFormat('yyyy-MM-dd') : null
+    const yesterdayDateStr = (isFallback && timeWindow === 'yesterday') ? start.toFormat('yyyy-MM-dd') : null
+    const customSingleDateStr = (timeWindow === 'custom_range' && customRange?.since && customRange.since === customRange.until) ? customRange.since : null
+
     // 第8-9行：初始化 SQL 和参数数组
     // 使用参数化查询（? 占位符）防止 SQL 注入攻击
     let sql = ''
     const params = []
     
     // 第10-40行：根据是否为降级查询，构建不同的 SQL
-    // 降级查询（isFallback=true）：使用最大时间戳连接法（兼容非 MySQL 8.0）
+    // 降级查询（isFallback=true）：用 ROW_NUMBER 取每 ad 昨日最后快照（要求 MySQL 8.0+）
     // 普通查询：使用 ROW_NUMBER() 窗口函数（MySQL 8.0+）
     if (isFallback && timeWindow === 'yesterday') {
-      // 降级查询：取"昨日最后快照"（使用最大时间戳连接法）
-      // 参考：方案B+优化版-最终版.md 第十四章
-      sql = `
-        SELECT 
-          s.account_id,
-          s.ad_id,
-          s.ad_name,
-          s.ad_set_id,
-          s.owner_id,
-          s.status,
-          s.spend,
-          s.purchases,
-          s.link_clicks,
-          s.unique_link_clicks,
-          s.purchase_value,
-          s.add_to_cart_count,
-          s.initiate_checkout_count,
-          s.add_payment_info_count,
-          s.cpc,
-          s.roas,
-          s.ucpc,
-          s.cpa,
-          s.add_to_cart_cost,
-          s.checkout_cost,
-          s.payment_cost,
-          s.synced_at
-        FROM ad_snapshots s
-        INNER JOIN (
-          SELECT 
-            account_id,
-            ad_id,
-            MAX(synced_at) AS last_synced_at
-          FROM ad_snapshots
-          WHERE account_id = ?
-            ${hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''}
-            AND synced_at >= ?
-            AND synced_at <= ?
-          GROUP BY account_id, ad_id
-        ) t
-        ON s.account_id = t.account_id
-        AND s.ad_id = t.ad_id
-        AND s.synced_at = t.last_synced_at
-      `
-      // 第41行：填充参数（accountId, adIds..., startDate, endDate）
-      params.push(accountId)
-      if (hasAdFilter) {
-        params.push(...adIdArray)
-      }
-      params.push(startDate, endDate)
-    } else {
-      // 普通查询：使用 ROW_NUMBER() 窗口函数（MySQL 8.0+）
-      // PARTITION BY account_id, ad_id：按账户和广告分组
-      // ORDER BY synced_at DESC：按同步时间降序排列
-      // rn = 1：只取每个广告的最后一次快照
-      // 构建 SQL：如果指定了 adIds，则过滤；否则查询所有广告
-      const adIdFilter = hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''
+      // 降级查询：取"昨日最后快照"（用 data_date=昨天，自然日口径，ROW_NUMBER 范式避免同秒多行重复）
       sql = `
         SELECT * FROM (
           SELECT 
@@ -411,6 +351,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             ad_id,
             ad_name,
             ad_set_id,
+            campaign_id,
             owner_id,
             status,
             spend,
@@ -428,25 +369,85 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             add_to_cart_cost,
             checkout_cost,
             payment_cost,
+            mute_until,
+            mute_reason,
             synced_at,
             ROW_NUMBER() OVER (
-              PARTITION BY account_id, ad_id 
-              ORDER BY synced_at DESC
+              PARTITION BY account_id, ad_id
+              ORDER BY synced_at DESC, id DESC
             ) as rn
           FROM ad_snapshots
           WHERE account_id = ?
-            ${adIdFilter}
-            AND synced_at >= ?
-            AND synced_at <= ?
+            ${hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''}
+            AND data_date = ?
         ) ranked
         WHERE rn = 1
       `
-      // 第42行：填充参数
       params.push(accountId)
       if (hasAdFilter) {
         params.push(...adIdArray)
       }
-      params.push(startDate, endDate)
+      params.push(yesterdayDateStr)
+    } else {
+      // 普通查询
+      // today：用 data_date = 账户时区今日（自然日），避免 synced_at/UTC 边界
+      // 其他窗口：用 synced_at 范围
+      const adIdFilter = hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''
+      const dateFilter = (timeWindow === 'today' && todayDateStr)
+        ? `AND data_date = ?`
+        : customSingleDateStr
+          ? `AND data_date = ?`
+          : `AND synced_at >= ? AND synced_at <= ?`
+      sql = `
+        SELECT * FROM (
+          SELECT 
+            account_id,
+            ad_id,
+            ad_name,
+            ad_set_id,
+            campaign_id,
+            owner_id,
+            status,
+            spend,
+            purchases,
+            link_clicks,
+            unique_link_clicks,
+            purchase_value,
+            add_to_cart_count,
+            initiate_checkout_count,
+            add_payment_info_count,
+            cpc,
+            roas,
+            ucpc,
+            cpa,
+            add_to_cart_cost,
+            checkout_cost,
+            payment_cost,
+            mute_until,
+            mute_reason,
+            synced_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY account_id, ad_id 
+              ORDER BY synced_at DESC, id DESC
+            ) as rn
+          FROM ad_snapshots
+          WHERE account_id = ?
+            ${adIdFilter}
+            ${dateFilter}
+        ) ranked
+        WHERE rn = 1
+      `
+      params.push(accountId)
+      if (hasAdFilter) {
+        params.push(...adIdArray)
+      }
+      if (timeWindow === 'today' && todayDateStr) {
+        params.push(todayDateStr)
+      } else if (customSingleDateStr) {
+        params.push(customSingleDateStr)
+      } else {
+        params.push(startDate, endDate)
+      }
     }
     
     // 第43-44行：执行查询
@@ -461,6 +462,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
       ad_id: row.ad_id,
       ad_name: row.ad_name,
       ad_set_id: row.ad_set_id,
+      campaign_id: row.campaign_id ?? null,
       owner_id: row.owner_id,
       status: row.status,
       // 绝对值指标（直接转换）
@@ -473,14 +475,16 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
       add_to_cart_count: parseInt(row.add_to_cart_count || 0),
       initiate_checkout_count: parseInt(row.initiate_checkout_count || 0),
       add_payment_info_count: parseInt(row.add_payment_info_count || 0),
-      // 单价/比率类指标（可能需要重新计算）
-      cpc: row.cpc != null ? parseFloat(row.cpc) : null,
+      // 单价/比率类指标：映射层不做本地兜底，统一交给 calculateSingleDayMetrics 计算
+      cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null,
-      ucpc: row.ucpc != null ? parseFloat(row.ucpc) : null,
+      ucpc: null,
       cpa: row.cpa != null ? parseFloat(row.cpa) : null,
       add_to_cart_cost: row.add_to_cart_cost != null ? parseFloat(row.add_to_cart_cost) : null,
       checkout_cost: row.checkout_cost != null ? parseFloat(row.checkout_cost) : null,
       payment_cost: row.payment_cost != null ? parseFloat(row.payment_cost) : null,
+      mute_until: row.mute_until,
+      mute_reason: row.mute_reason,
       // 元信息
       synced_at: row.synced_at
     }))
@@ -488,7 +492,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
     // 第71-72行：错误处理
     // 记录错误日志（包含账户ID和时间窗口，便于排查问题）
     // 重新抛出错误，让调用方知道查询失败
-    console.error(`❌ 查询 ad_snapshots 失败 (accountId: ${accountId}, timeWindow: ${timeWindow}):`, error.message)
+    logger.error(`❌ 查询 ad_snapshots 失败 (accountId: ${accountId}, timeWindow: ${timeWindow}):`, error.message)
     throw error
   }
 }
@@ -594,7 +598,7 @@ async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezone
       }
     }
   } catch (error) {
-    console.warn(`⚠️  查询历史数据失败，仅使用今天的数据:`, error.message)
+    logger.warn(`⚠️  查询历史数据失败，仅使用今天的数据:`, error.message)
     warnings.push({
       code: 'HISTORY_QUERY_FAILED',
       message: `查询历史数据失败: ${error.message}，仅返回今天的数据`
@@ -606,7 +610,7 @@ async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezone
   try {
     todayData = await queryAdSnapshots(accountId, adIds, 'today', dataTimezoneUsed, false, null)
   } catch (error) {
-    console.warn(`⚠️  查询今天数据失败:`, error.message)
+    logger.warn(`⚠️  查询今天数据失败:`, error.message)
     warnings.push({
       code: 'TODAY_QUERY_FAILED',
       message: `查询今天数据失败: ${error.message}`
@@ -649,6 +653,7 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
         ad_id,
         ad_name,
         ad_set_id,
+        campaign_id,
         owner_id,
         date,
         timezone_name,
@@ -684,6 +689,7 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
       ad_id: row.ad_id,
       ad_name: row.ad_name,
       ad_set_id: row.ad_set_id,
+      campaign_id: row.campaign_id ?? null,
       owner_id: row.owner_id,
       date: row.date,
       timezone_name: row.timezone_name,
@@ -695,11 +701,11 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
       add_to_cart_count: parseInt(row.add_to_cart_count || row.add_to_cart_count_legacy || 0),
       initiate_checkout_count: parseInt(row.initiate_checkout_count || 0),
       add_payment_info_count: parseInt(row.add_payment_info_count || 0),
-      cpc: row.cpc != null ? parseFloat(row.cpc) : null,
+      cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null
     }))
   } catch (error) {
-    console.error(`❌ 查询 daily_stats 失败 (accountId: ${accountId}):`, error.message)
+    logger.error(`❌ 查询 daily_stats 失败 (accountId: ${accountId}):`, error.message)
     throw error
   }
 }
@@ -742,6 +748,7 @@ async function queryDailyStats(accountId, adIds, timeWindow, timezoneName, custo
         ad_id,
         ad_name,
         ad_set_id,
+        campaign_id,
         owner_id,
         date,
         timezone_name,
@@ -782,6 +789,7 @@ async function queryDailyStats(accountId, adIds, timeWindow, timezoneName, custo
       ad_id: row.ad_id,
       ad_name: row.ad_name,
       ad_set_id: row.ad_set_id,
+      campaign_id: row.campaign_id ?? null,
       owner_id: row.owner_id,
       date: row.date,
       timezone_name: row.timezone_name,
@@ -796,19 +804,19 @@ async function queryDailyStats(accountId, adIds, timeWindow, timezoneName, custo
       add_to_cart_count: parseInt(row.add_to_cart_count || row.add_to_cart_count_legacy || 0),
       initiate_checkout_count: parseInt(row.initiate_checkout_count || 0),
       add_payment_info_count: parseInt(row.add_payment_info_count || 0),
-      // 单价/比率类指标（单日值，多天窗口需要重新计算）
-      cpc: row.cpc != null ? parseFloat(row.cpc) : null,
+      // 单价/比率类指标：映射层不做本地兜底
+      cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null
     }))
   } catch (error) {
     // 第56-57行：错误处理
-    console.error(`❌ 查询 daily_stats 失败 (accountId: ${accountId}, timeWindow: ${timeWindow}):`, error.message)
+    logger.error(`❌ 查询 daily_stats 失败 (accountId: ${accountId}, timeWindow: ${timeWindow}):`, error.message)
     throw error
   }
 }
 
 // ============================================
-// 动态聚合计算（待实现）
+// 动态聚合计算
 // ============================================
 
 /**
@@ -885,12 +893,15 @@ function aggregateMultiDayMetrics(dailyStatsArray) {
     
     // 第26-70行：动态重算单价/比率类指标（含除零保护）
     // 参考：方案B+优化版-最终版.md 第七章
+    // CBO 执行需要 campaign_id：优先取任一天中有的值（多天合并时 today 有、历史可能无）
+    const campaignId = days.map(d => d.campaign_id).find(Boolean) ?? days[0].campaign_id ?? null
     const result = {
-      // 基本信息（取第一条记录的）
+      // 基本信息（取第一条记录的；campaign_id 见上）
       account_id: days[0].account_id,
       ad_id: adId,
       ad_name: days[0].ad_name,
       ad_set_id: days[0].ad_set_id,
+      campaign_id: campaignId,
       owner_id: days[0].owner_id,
       
       // 绝对值指标（直接使用累加值）
@@ -906,26 +917,18 @@ function aggregateMultiDayMetrics(dailyStatsArray) {
       add_payment_info_count: totals.totalAddPaymentInfoCount,
       
       // 单价/比率类指标（必须重算，含除零保护）
-      // ROAS = 总购买金额 / 总花费
-      roas: totals.totalSpend > 0 ? totals.totalPurchaseValue / totals.totalSpend : 0,
+      // ROAS：totalSpend==0 => null；有花费但无金额 => 0.0
+      roas: totals.totalSpend === 0
+        ? null
+        : (totals.totalPurchaseValue > 0 ? totals.totalPurchaseValue / totals.totalSpend : 0),
       
-      // CPA = 总花费 / 总购买次数
-      cpa: totals.totalPurchases > 0 ? totals.totalSpend / totals.totalPurchases : 0,
-      
-      // CPC = 总花费 / 总链接点击次数
-      cpc: totals.totalLinkClicks > 0 ? totals.totalSpend / totals.totalLinkClicks : 0,
-      
-      // uCPC = 总花费 / 总独立链接点击次数
-      ucpc: totals.totalUniqueLinkClicks > 0 ? totals.totalSpend / totals.totalUniqueLinkClicks : 0,
-      
-      // 加购费 = 总花费 / 总加购次数
-      add_to_cart_cost: totals.totalAddToCartCount > 0 ? totals.totalSpend / totals.totalAddToCartCount : 0,
-      
-      // 结账费 = 总花费 / 总结账次数
-      checkout_cost: totals.totalInitiateCheckoutCount > 0 ? totals.totalSpend / totals.totalInitiateCheckoutCount : 0,
-      
-      // 支付费 = 总花费 / 总支付次数
-      payment_cost: totals.totalAddPaymentInfoCount > 0 ? totals.totalSpend / totals.totalAddPaymentInfoCount : 0
+      // 其余成本类：分母为 0 返回 null（无数据）
+      cpa: totals.totalPurchases > 0 ? totals.totalSpend / totals.totalPurchases : null,
+      cpc: totals.totalLinkClicks > 0 ? totals.totalSpend / totals.totalLinkClicks : null,
+      ucpc: totals.totalUniqueLinkClicks > 0 ? totals.totalSpend / totals.totalUniqueLinkClicks : null,
+      add_to_cart_cost: totals.totalAddToCartCount > 0 ? totals.totalSpend / totals.totalAddToCartCount : null,
+      checkout_cost: totals.totalInitiateCheckoutCount > 0 ? totals.totalSpend / totals.totalInitiateCheckoutCount : null,
+      payment_cost: totals.totalAddPaymentInfoCount > 0 ? totals.totalSpend / totals.totalAddPaymentInfoCount : null
     }
     
     // 第71行：将结果添加到结果数组
@@ -970,21 +973,28 @@ function calculateSingleDayMetrics(dailyStats) {
   const initiateCheckoutCount = parseInt(dailyStats.initiate_checkout_count || 0)
   const addPaymentInfoCount = parseInt(dailyStats.add_payment_info_count || 0)
   
-  // 第9-30行：计算单价/比率类指标（含除零保护）
-  // 为什么需要除零保护？如果分母为 0，除法运算会产生 Infinity 或 NaN
-  // 这会导致 UI 显示异常，所以必须在计算层处理
+  // 单天指标统一口径：计算优先 -> API 兜底 -> 零兜底（仅 ROAS）
+  const dbRoas = dailyStats.roas != null ? parseFloat(dailyStats.roas) : null
+  const roas = spend === 0
+    ? null
+    : (purchaseValue > 0 ? purchaseValue / spend : (dbRoas != null && dbRoas > 0 ? dbRoas : 0))
+
   return {
     // 基本信息（直接传递）
     account_id: dailyStats.account_id,
     ad_id: dailyStats.ad_id,
     ad_name: dailyStats.ad_name,
     ad_set_id: dailyStats.ad_set_id,
+    campaign_id: dailyStats.campaign_id ?? null,  // CBO 执行层需要
     owner_id: dailyStats.owner_id,
-    
+    status: dailyStats.status,
+    mute_until: dailyStats.mute_until,
+    mute_reason: dailyStats.mute_reason,
+
     // 绝对值指标（直接使用）
     spend: spend,
     purchases: purchases,
-    
+
     // 原始计数字段（直接使用）
     link_clicks: linkClicks,
     unique_link_clicks: uniqueLinkClicks,
@@ -992,30 +1002,20 @@ function calculateSingleDayMetrics(dailyStats) {
     add_to_cart_count: addToCartCount,
     initiate_checkout_count: initiateCheckoutCount,
     add_payment_info_count: addPaymentInfoCount,
-    
-    // 单价/比率类指标（单天计算，含除零保护）
-    // ROAS = 购买金额 / 花费（如果花费为 0，返回 0）
-    roas: spend > 0 ? purchaseValue / spend : 0,
-    
-    // CPA = 花费 / 购买次数（如果购买次数为 0，返回 0）
-    cpa: purchases > 0 ? spend / purchases : 0,
-    
-    // CPC = 花费 / 链接点击次数（如果点击次数为 0，返回 0）
-    cpc: linkClicks > 0 ? spend / linkClicks : (dailyStats.cpc != null ? parseFloat(dailyStats.cpc) : 0),
-    
-    // uCPC = 花费 / 独立链接点击次数（如果点击次数为 0，返回 0）
-    ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : (dailyStats.ucpc != null ? parseFloat(dailyStats.ucpc) : 0),
-    
-    // 加购费 = 花费 / 加购次数（如果加购次数为 0，返回 0）
-    add_to_cart_cost: addToCartCount > 0 ? spend / addToCartCount : (dailyStats.add_to_cart_cost != null ? parseFloat(dailyStats.add_to_cart_cost) : 0),
-    
-    // 结账费 = 花费 / 结账次数（如果结账次数为 0，返回 0）
-    checkout_cost: initiateCheckoutCount > 0 ? spend / initiateCheckoutCount : (dailyStats.checkout_cost != null ? parseFloat(dailyStats.checkout_cost) : 0),
-    
-    // 支付费 = 花费 / 支付次数（如果支付次数为 0，返回 0）
-    payment_cost: addPaymentInfoCount > 0 ? spend / addPaymentInfoCount : (dailyStats.payment_cost != null ? parseFloat(dailyStats.payment_cost) : 0)
+
+    // 单价/比率类指标：除 ROAS 外，分母为 0 时返回 null（表示无数据）
+    roas: roas,
+    cpa: purchases > 0 ? spend / purchases : null,
+    cpc: linkClicks > 0 ? spend / linkClicks : null,
+    ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : null,
+    add_to_cart_cost: addToCartCount > 0 ? spend / addToCartCount : null,
+    checkout_cost: initiateCheckoutCount > 0 ? spend / initiateCheckoutCount : null,
+    payment_cost: addPaymentInfoCount > 0 ? spend / addPaymentInfoCount : null
   }
 }
+
+// 导出供单测验证「规则判断一律用本地计算」
+export { calculateSingleDayMetrics }
 
 /**
  * 从 account_mappings 表获取账户时区
@@ -1043,7 +1043,7 @@ export async function getAccountTimezone(accountId) {
     // 第3-4行：如果查询结果为空，说明账户不存在或已停用
     // 使用默认时区 'UTC'，并记录警告日志（不抛错，保证系统可用性）
     if (rows.length === 0) {
-      console.warn(`⚠️  账户 ${accountId} 未找到，使用默认时区 UTC`)
+      logger.warn(`⚠️  账户 ${accountId} 未找到，使用默认时区 UTC`)
       return 'UTC'  // 默认时区
     }
     
@@ -1053,7 +1053,7 @@ export async function getAccountTimezone(accountId) {
     // 第6-7行：如果数据库查询出错（如连接失败、SQL 语法错误）
     // 记录错误日志，但返回默认时区，避免整个系统崩溃
     // 这是"优雅降级"策略：即使时区查询失败，系统仍能继续运行
-    console.error(`❌ 获取账户时区失败 (accountId: ${accountId}):`, error.message)
+    logger.error(`❌ 获取账户时区失败 (accountId: ${accountId}):`, error.message)
     return 'UTC'  // 出错时使用默认时区
   }
 }

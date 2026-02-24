@@ -1,12 +1,16 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { authFetch } from '../utils/authFetch.js'
 
 const Login = () => import('../views/Login.vue')
 const Register = () => import('../views/Register.vue')
 const Pending = () => import('../views/Pending.vue')
 const Dashboard = () => import('../views/Dashboard.vue')
-const RuleManager = () => import('../views/RuleManager.vue') // 引入新组件
+const RuleManager = () => import('../views/RuleManager.vue')
+const Logs = () => import('../views/Logs.vue')
+const SystemStatus = () => import('../views/SystemStatus.vue')
 const AdminReview = () => import('../views/AdminReview.vue')
 const AdminAccountMapping = () => import('../views/AdminAccountMapping.vue')
+const AdminTemplates = () => import('../views/AdminTemplates.vue')
 
 const MainLayout = () => import('../layouts/MainLayout.vue')
 
@@ -24,9 +28,12 @@ const router = createRouter({
       children: [
         { path: '', redirect: '/dashboard' },
         { path: 'dashboard', component: Dashboard },
-        { path: 'rules', component: RuleManager }, // 指向新组件
+        { path: 'rules', component: RuleManager },
+        { path: 'logs', component: Logs },
+        { path: 'system', component: SystemStatus, meta: { requiresAdmin: true } },
         { path: 'admin/review', component: AdminReview, meta: { requiresAdmin: true } },
-        { path: 'admin/account-mapping', component: AdminAccountMapping, meta: { requiresAdmin: true } }
+        { path: 'admin/account-mapping', component: AdminAccountMapping, meta: { requiresAdmin: true } },
+        { path: 'admin/templates', component: AdminTemplates, meta: { requiresAdmin: true } }
       ]
     },
 
@@ -39,7 +46,7 @@ router.beforeEach(async (to, from, next) => {
   const needAuth = to.meta.requiresAuth !== false
   let user = null
   try {
-    const resp = await fetch('/api/me', { credentials: 'include' })
+    const resp = await authFetch('/api/me')
     if (resp.ok) {
       const data = await resp.json()
       user = data.user

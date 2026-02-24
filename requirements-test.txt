@@ -1,0 +1,5 @@
+# 测试依赖
+# 安装方法：pip install -r requirements-test.txt
+
+pytest>=7.4.0
+requests>=2.31.0

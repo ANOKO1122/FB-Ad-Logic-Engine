@@ -1,6 +1,7 @@
 // API 频率控制与熔断服务
 // 按照 TASKS.md 1.3 节的要求实现
 // 负责：响应头解析、动态休眠、超时控制、Token 熔断
+import logger from '../utils/logger.js'
 
 /**
  * 解析 Facebook API 响应头 x-business-use-case-usage
@@ -27,7 +28,7 @@ export function parseUsageHeader(headerValue) {
     return null
   } catch (error) {
     // 解析失败，返回 null（不影响主流程）
-    console.warn('⚠️  解析 x-business-use-case-usage 响应头失败:', error.message)
+    logger.warn('⚠️  解析 x-business-use-case-usage 响应头失败:', error.message)
     return null
   }
 }
@@ -98,7 +99,7 @@ export function calculateSleepTime(usageInfo, options = {}) {
       alert = true // 触发告警
     }
     
-    console.log(`[RateLimit] ⚠️  Facebook API 强制要求等待 ${estimatedTime} ${estimatedTimeUnit}，系统将休眠 ${finalWaitMs}ms（含 ${safetyBufferMs}ms 安全缓冲）`)
+    logger.info(`[RateLimit] ⚠️  Facebook API 强制要求等待 ${estimatedTime} ${estimatedTimeUnit}，系统将休眠 ${finalWaitMs}ms（含 ${safetyBufferMs}ms 安全缓冲）`)
     
     return {
       sleepMs: finalWaitMs,
@@ -148,6 +149,16 @@ export function calculateSleepTime(usageInfo, options = {}) {
   }
 }
 
+/** 最近一次已知的 API 使用率（0–100），供结构全量轮转「usage 高本小时跳过」判断 */
+let lastKnownUsageRate = null
+
+/**
+ * 返回最近一次由 sleepBasedOnUsage/calculateSleepTime 得出的使用率（可能为 null）
+ */
+export function getLastUsageRate() {
+  return lastKnownUsageRate
+}
+
 /**
  * 动态休眠（根据使用率）
  * @param {Object|null} usageInfo - 使用率信息
@@ -156,15 +167,16 @@ export function calculateSleepTime(usageInfo, options = {}) {
  */
 export async function sleepBasedOnUsage(usageInfo, options = {}) {
   const { sleepMs, usageRate, alert } = calculateSleepTime(usageInfo, options)
-  
+  if (usageRate !== null) lastKnownUsageRate = usageRate
+
   if (usageRate !== null) {
-    console.log(`⏸️  API 使用率: ${usageRate}%，休眠 ${sleepMs}ms`)
+    logger.info(`⏸️  API 使用率: ${usageRate}%，休眠 ${sleepMs}ms`)
   } else {
-    console.log(`⏸️  使用默认休眠时间: ${sleepMs}ms`)
+    logger.info(`⏸️  使用默认休眠时间: ${sleepMs}ms`)
   }
   
   if (alert) {
-    console.warn(`⚠️  API 使用率过高（${usageRate}%），已触发告警`)
+    logger.warn(`⚠️  API 使用率过高（${usageRate}%），已触发告警`)
     // TODO: 这里可以发送告警通知（IM 机器人）
   }
   
@@ -211,12 +223,12 @@ class TokenCircuitBreaker {
     this.failureCount++
     this.lastFailureTime = new Date()
     
-    console.warn(`⚠️  Token 失败计数: ${this.failureCount}/${this.threshold}`)
+    logger.warn(`⚠️  Token 失败计数: ${this.failureCount}/${this.threshold}`)
     
     // 达到阈值，触发熔断
     if (this.failureCount >= this.threshold) {
       this.isSystemLocked = true
-      console.error(`❌ Token 熔断触发：连续 ${this.failureCount} 次失败，系统已锁定`)
+      logger.error(`❌ Token 熔断触发：连续 ${this.failureCount} 次失败，系统已锁定`)
       // TODO: 这里可以发送高优先级告警（IM 机器人）
     }
   }
@@ -226,7 +238,7 @@ class TokenCircuitBreaker {
    */
   recordSuccess() {
     if (this.failureCount > 0) {
-      console.log(`✅ Token 恢复：重置失败计数（之前: ${this.failureCount}）`)
+      logger.info(`✅ Token 恢复：重置失败计数（之前: ${this.failureCount}）`)
     }
     this.failureCount = 0
     this.isSystemLocked = false
@@ -257,7 +269,7 @@ class TokenCircuitBreaker {
    * 手动重置熔断器（用于测试或手动恢复）
    */
   reset() {
-    console.log('🔄 手动重置 Token 熔断器')
+    logger.info('🔄 手动重置 Token 熔断器')
     this.failureCount = 0
     this.isSystemLocked = false
     this.lastFailureTime = null

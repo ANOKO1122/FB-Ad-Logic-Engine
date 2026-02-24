@@ -1,0 +1,174 @@
+按教学方式拆解该需求，并给出可执行的分阶段方案。先快速查看当前规则页的账户选择与结构接口实现，以便方案落到具体文件和函数。
+查看规则表结构和执行时如何使用 account_id 与 targetIds：
+下面按「教学 + 可执行方案」的方式整理，不直接改代码，只给你目标、步骤、风险点和建议的验证方式。
+多选广告账户（规则创建页）— 教学与分阶段方案
+一、概念与目标（为什么要这样设计）
+1. 一句话比喻
+单账户：规则是「某个门店的巡检清单」。
+多账户：规则是「多个门店共用同一份巡检清单」，选店时一次选多个店，清单里是这些店合并后的商品（广告/广告组/广告系列），保存的仍是「在哪几家店、对哪些商品生效」。
+2. 为什么要做多选账户
+体验：一次选多个账户，在一个列表里勾选对象，避免反复切换账户。
+权限：列表、搜索、保存、执行都只在「当前用户有权限的账户」内，后端必须按账户做 assertAccountAccess，避免越权。
+执行：规则执行是按「账户」跑的（现有 cron 是 per-account），多账户 = 同一条规则在多个账户上各跑一遍，目标对象要能按账户区分（否则 ad_id 跨账户会歧义）。
+3. 和现有实现的对应关系（你仓库里已经有的）
+现有实现	文件/位置	多选后要动的点
+单选账户	RuleManager.vue：selectedAccountId（ref）、<select v-model="selectedAccountId">	改为多选（Tag 展示）+ 全选/清空
+结构列表	facebookApi.getStructureObjects(levelKey, selectedAccountId.value, { q, limit, after, include_paused })	有多选时改为调「多账户合并接口」并传 account_ids
+单账户结构接口	GET /api/structure/objects?account_id=act_xxx&type=...（server/index.js）	新增 GET /api/structure/objects/multi?account_ids=act_1,act_2&...，内部对每个 account 做权限校验再合并结果
+权限校验	assertAccountAccess(req, res, account_id)（server/utils/accountAccess.js）	对 account_ids 逐个校验，无权限的剔除或整请求 403（你设计里二选一）
+规则保存	payload.accountId = selectedAccountId.value（RuleManager 约 811 行）	多选时改为 targetAccounts 数组；若保留「主账户」可再保留 accountId 为首选
+规则执行	ruleEngineDispatcher 按 accountId 拉规则、resolveTargetAdIdsForRule(accountId, rule, ...)	多账户时：同一规则要按「每个 targetAccount」各执行一次，且目标 ID 需带 account 信息（见下）
+4. 执行层关键点：targetIds 在多账户下怎么存
+FB 的 ad_id / adset_id / campaign_id 是「账户内唯一」，跨账户可能数字相同，所以不能只存 id，必须带 account_id。
+你设计里「targetIds 仍为对象 ID」可以有两种实现方式（二选一即可）：
+方式	存储形态	优点	缺点
+A. 复合字符串	targetIds: ["act_1:123", "act_2:456"]	不改表结构，兼容旧逻辑（单账户时全为 act_xxx:id）	前端/后端都要 parse；resolve 回显要按 account_id:id 查
+B. 按账户分组	新增 target_by_account: { "act_1": ["id1","id2"], "act_2": ["id3"] }，targetIds 保留为扁平兼容字段（可选）	执行时直接按 account 取列表，语义清晰	需要改表/API 结构，前端保存时要按账户分组写入
+建议：先实现 A（复合字符串），不扩表，执行时解析 account_id:id 再按 account 分组；后续若要更强类型再上 B。
+二、分阶段实现步骤（按顺序做、每阶段可验收）
+阶段 1：后端多账户结构接口 + 权限
+目标：多账户合并列表、权限隔离、分页策略选一种。
+步骤：
+路由与顺序
+在 server/index.js 里，在 /api/structure/objects 之后、/api/structure/:level 之前，新增：
+GET /api/structure/objects/multi
+这样不会把 multi 当成 :level 匹配掉。
+参数与校验
+Query：account_ids=act_1,act_2,act_3（必填）、type=ad|adset|campaign、q、limit（如 50，上限 500）、after、include_paused。
+解析 account_ids 为数组，对每个 id 调用 assertAccountAccess(req, res, id)：
+策略 1（推荐）：无权限的从数组剔除，只对有权限的账户查库；若全部无权限则 403。
+策略 2：任一无权限则整请求 403。
+若采用策略 1，建议在响应 meta 里加 requested_accounts: 3, allowed_accounts: 2 便于前端/排查。
+合并列表实现
+复用现有 listStructureObjectsFromDb(accountId, opts)（structureSyncService.js）：
+对每个「通过权限」的 account_id 依次调用（或先并行再合并，注意 limit 是「总条数」不是每账户条数）。
+合并结果时：
+每条 item 必须带 account_id（你设计里已有）。
+去重：同一 (account_id, type, id) 只保留一条（若当前单账户接口本身无重复，合并时按 key 去重即可）。
+分页
+简化策略（先做）：after 暂不实现或只做「单账户内」游标；多账户时每次请求每个账户各取一页（例如每账户 limit/账户数），合并后截断到 limit 条返回；paging.after 可设为 undefined 或简单占位，前端「加载更多」用「每账户各自 after」或暂时不做真正跨页。
+完整策略（后续）：组合游标 {account_id}:{last_id}，后端按 (account_id, id) 排序做全局分页（实现量会大一些）。
+涉及文件：
+server/index.js（新路由、参数解析、循环 assertAccountAccess、调用 listStructureObjectsFromDb、合并 items、返回格式）。
+可选：server/services/structureSyncService.js 新增 listStructureObjectsFromDbMulti(accountIds, opts) 封装「多账户循环 + 合并 + 去重」，再由路由调一层。
+风险点：
+account_ids 传很多时，逐个 assertAccountAccess 会多几次 DB 查询，可接受；若以后要优化再考虑批量查 account_mappings。
+分页顺序与「跨账户游标」若以后要做，需要约定排序（例如先按 account_id 再按 id）。
+验证建议：
+用 Postman/Thunder Client：带 2 个有权限的 account_ids，type=ad，看返回 items 里是否都有 account_id，且只包含这两个账户的数据。
+带 1 个有权限 + 1 个无权限：是否只返回有权限账户的数据（策略 1）或 403（策略 2）。
+无权限用户带他人 account_id：应 403。
+阶段 2：前端多选账户 + 合并列表展示
+目标：账户从单选改为多选（Tag + 全选/清空），列表用多账户接口并展示 account_id。
+步骤：
+状态与数据
+把 selectedAccountId（单 ref）改为 selectedAccountIds（ref 数组，如 ref([])）。
+账户列表仍用现有 accounts（已有权限过滤），无需改。
+UI
+账户选择：由单个 <select> 改为「多选」控件：
+可用多选 <select multiple> 或下拉 + 复选框列表；选中项以 Tag 列表展示（如你设计图），每个 Tag 显示账户名或短 ID，带关闭按钮移除。
+增加「全选」「清空」按钮：全选 = 把当前 accounts 的 id 全放进 selectedAccountIds；清空 = selectedAccountIds = []。
+列表加载与展示
+当 selectedAccountIds.length > 0 时：
+若 selectedAccountIds.length === 1：可继续用现有单账户接口（getStructureObjects / getStructureObjectsUnified），保持兼容。
+若 selectedAccountIds.length > 1：调用新接口（见下）getStructureObjectsMulti(type, accountIds, { q, limit, after, include_paused })。
+列表项除现有「名称 / id」外，增加一列或一小标签：account_id（可显示账户名或短 ID，用当前 accounts 查 name）。
+占位与空状态：未选账户时仍显示「请先选择账户」；已选多账户但列表为空时「暂无可选对象」。
+搜索与过滤
+搜索框：仍绑定 scopeSearch（q），请求时把 q 传给多账户接口，作用范围仅为已选账户（后端已按 account_ids 过滤）。
+默认只展示 ACTIVE；勾选「包含暂停」传 include_paused=1，逻辑与现有一致。
+前端 API 封装
+在 src/services/facebookApi.js 新增：
+getStructureObjectsMulti(type, accountIds, { q, limit, after, include_paused })
+请求 GET /api/structure/objects/multi?account_ids=${accountIds.join(',')}&type=...&q=...&limit=...&after=...&include_paused=...
+返回格式与你设计的统一结构一致（items 带 account_id）。
+涉及文件：
+src/views/RuleManager.vue（selectedAccountIds、Tag 多选、全选/清空、根据账户数选单接口还是 multi、列表项展示 account_id、refreshScopeItems/loadMoreScopeItems 传参）。
+src/services/facebookApi.js（新方法 getStructureObjectsMulti）。
+风险点：
+多选时「加载更多」若后端暂未实现真正多账户游标，可先做成「再请求一页每账户」或暂时隐藏「加载更多」，避免逻辑复杂。
+编辑已有规则时，若旧规则是单账户，回填时要把 rule.accountId 转成 selectedAccountIds = [rule.accountId]。
+验证建议：
+选 2 个账户，切换层级（广告/广告组/广告系列），列表是否合并展示且每项有 account 标识。
+搜索、勾选「包含暂停」，行为是否符合「仅在已选账户范围内」。
+全选/清空、移除单个 Tag，列表是否随之刷新。
+阶段 3：规则保存与执行（多账户 + targetIds 带 account）
+目标：多选账户时保存 targetAccounts，且目标对象带 account 信息，执行时按账户分组、不跨账号混乱。
+步骤：
+保存 payload
+多选时：
+targetAccounts: selectedAccountIds.value（数组）。
+若保留「主账户」用于列表展示等，可设 accountId: selectedAccountIds.value[0] 或第一个有权限的。
+targetIds 的两种做法（与上文一致）：
+方案 A（推荐先做）：前端在保存前，把 ruleForm.targetIds 从「当前列表里的 id」改成「带 account 的字符串」：列表中每个 item 已有 account_id 和 id，勾选时用 item.account_id + ':' + item.id push 进 targetIds；单账户时全部是 act_xxx:id，旧规则无 account_id 时可在前端默认用当前选中唯一 account。
+方案 B：新增 target_by_account: { "act_1": ["id1","id2"], "act_2": ["id3"] }，表/API 增加该字段；前端在提交前按账户分组构造。
+后端规则表/API
+若用方案 A：
+表可只增加 target_account_ids JSON（可选），存账户列表；target_ids 继续存字符串数组，内容可为 "act_1:id1"。
+若暂时不想改表：可把「多账户」信息放在现有 account_id（如主账户）+ 在 target_ids 里用 act_xxx:id 表示；执行时从 target_ids 解析出所有 account，再按 account 分组执行（见下）。
+若用方案 B：需要 migration 增加列（如 target_by_account JSON）和 API 读写。
+执行逻辑（ruleEngineDispatcher / cron）
+当前逻辑是「按账户维度扫规则」：每个 account 拉出 rule.account_id === account 的规则。
+多账户规则有两种组织方式：
+方式 1：规则仍只属于一个「主」account_id（例如第一条 targetAccount），列表/执行筛选时仍按 rule.account_id；执行到这条规则时，根据 targetAccounts 或从 target_ids 解析出的 account 列表，对每个 account 分别调用一次「解析目标 + 评估 + 执行」（即同一条规则会出现在多个账户的「执行批次」里，但只处理该账户下的 targetIds）。
+方式 2：规则不再单属一个 account，而是「规则表里存 target_account_ids」；cron 扫规则时按「该规则涉及的每个 account」展开成 (account, rule) 对，再按 account 分组执行。
+无论哪种，解析目标时：
+从 target_ids 里解析出 account_id:id（方案 A），或从 target_by_account[accountId] 取 id 列表（方案 B）。
+只保留当前正在执行的 accountId 对应的 id 列表，再调现有 resolveTargetAdIdsForRule(accountId, rule, ...)（或传入「当前账户的 targetIds」而不是整条 rule.targetIds）。
+resolve 回显
+若 targetIds 存的是 act_1:id1，resolve 接口需要支持「带 account 的 id」：
+要么后端 resolveStructureByIds 接受 account_id:id 形式，按 account 分组后查 structure_* 表（同一 id 可能在不同 account 下都有）；
+要么前端把 act_1:id1 拆成 account_id 和 id，对每个 account 分别调现有 resolve（可能 N 次），再合并回显。先做后者实现更快。
+涉及文件：
+server/db/schema.js、server/routes/rules.js（若加 target_account_ids 或 target_by_account）。
+server/services/ruleEngineDispatcher.js（按账户展开规则、解析带 account 的 targetIds、只传当前账户的 id 列表给解析与评估）。
+server/index.js 或 resolve 所在处（若后端统一 resolve 带 account 的 id）。
+src/views/RuleManager.vue（保存时构造 targetAccounts、targetIds 为 account_id:id；回填时解析并还原选中状态；resolve 若前端做则拆 account:id 再调现有 resolve）。
+风险点：
+旧规则没有 target_account_ids、targetIds 仍是纯 id：执行层要兼容「仅当 target_ids 中不含 : 时，当作当前 rule.account_id 下的 id」以免老数据报错。
+执行时「同一条规则多账户」要避免重复写摘要/日志，需约定是按 (run_id, rule_id, account_id) 写还是一条规则一条摘要（多账户则多条）。
+验证建议：
+创建一条规则：选 2 个账户、选若干对象，保存后查 DB：targetAccounts 或 target_account_ids 为两账户，target_ids 为 act_1:id1 等形式。
+执行一次：仅这两个账户下应有对应执行记录，且目标广告正确、无其他账户被误动。
+单账户规则（旧数据）执行仍正常。
+三、验收标准（与你给的保持一致）
+选中多个账号后，列表包含多账号对象且每项带 account_id。
+搜索仅在已选账号范围内生效。
+默认只显示 ACTIVE；勾选「包含暂停」后含 PAUSED。
+无权限账号不会出现在结果中（后端剔除或 403）。
+规则保存后执行正常，按账户分组、不跨账号混乱。
+四、建议执行顺序与「下一步」
+先做阶段 1：只做后端 GET /api/structure/objects/multi + 权限 + 合并列表（分页可简化），用接口工具验收。
+再做阶段 2：前端多选账户 + Tag + 调用 multi 接口 + 列表展示 account_id，不做保存/执行改动，先验收「选多账户 → 列表合并 → 搜索/状态」。
+最后做阶段 3：targetAccounts / targetIds 带 account、保存与执行按账户分组，并做兼容旧规则。
+如果你愿意，我可以把「阶段 1」的接口实现拆成更细的几步（例如：先只做路由 + 参数解析 + 单账户循环调用并合并，再加固权限与分页），你按步实现或让我在征得你同意后按步给出补丁式修改建议（仍不擅自执行）。你只要说：从阶段 1 开始、要更细的步骤 或 从某一步开始给代码级说明 即可。
+
+
+
+名称包含，变成自动筛选那种，比如说我搜索名称包含“test”，然后就会自动筛选出名称包含“test”的广告或广告组或广告系列（层级由运营自己选）
+，然后会自动选择这些包含了test名称的所有广告或广告组或广告系列。
+
+---
+
+## 五、落地与优化补充（2026-02-14）
+
+阶段 1～3 已落地；本段记录针对「多账户 + 方案 B（target_by_account）」的优化与口径统一。
+
+### 5.1 执行层口径（与 getRuleAccountIds 一致）
+
+- **evaluateRule**：当规则存在 `target_by_account` 且**当前执行的 accountId 不在其 key 中**时，直接设 `targetAdIds = []`，不再对该账户查全量广告，避免无意义 DB 查询与误匹配。
+- **getRuleAccountIds(rule)**：优先从 `target_by_account` 取 key 列表；**仅保留「value 为非空数组」的账户**；若无 target_by_account 则回退 target_account_ids 或 [rule.accountId]。执行时按该列表逐个加锁执行 evaluateRule(rule, lockedAccountId)。
+- **ruleAppliesToAccount(rule, accountId)**：仅当 `target_by_account[accountId]` 为非空数组，或 target_account_ids 包含该账户时返回 true；**空数组视为不适用**，该账户不会进入执行列表、不会加锁。
+
+### 5.2 多账户结构接口 meta
+
+- **GET /api/structure/objects/multi** 在响应 `meta` 中增加：**per_account_limit**（每账户条数上限）、**has_more**（是否存在更多数据），便于前端分页与每账户配额展示。
+
+### 5.3 前端
+
+- **refreshScopeItems**（RuleManager.vue）：在「仅启用」且列表加载完成后，从 `ruleForm.targetIds` 中移除不在当前 `scopeItems` 的 id，避免保留已关闭/已删除广告。
+
+### 5.4 验证
+
+- 使用 Thunder Client：见 `docs/Thunder_Client_小白验证步骤.md`（登录 → GET objects/multi 带 token 与 Query → 检查 meta.per_account_limit、meta.has_more）。
+- 空数组不执行：可将某条规则的 target_by_account 中某账户改为 `[]`，触发执行后该账户不应出现在后端「获取锁/匹配」日志中。

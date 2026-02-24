@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { getStoredToken } from '../utils/authFetch.js'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
@@ -9,10 +10,89 @@ const apiClient = axios.create({
   withCredentials: true
 })
 
+apiClient.interceptors.request.use((config) => {
+  const token = getStoredToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
 class FacebookMarketingService {
   async getAdAccounts() {
     const resp = await apiClient.get('/accounts')
     return resp.data.accounts || []
+  }
+
+  async getStructureObjects(level, accountId, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+    const resp = await apiClient.get(`/structure/${level}`, {
+      params: {
+        account_id: accountId,
+        q: q || undefined,
+        limit,
+        after: after || undefined,
+        include_paused: include_paused ? 1 : undefined
+      }
+    })
+    return resp.data || { items: [], paging: null }
+  }
+
+  /**
+   * 统一结构列表（方案 B）：请求 /api/structure/objects，type=campaign|adset|ad，返回统一字段 id/type/name/campaign_id/adset_id/effective_status/account_id
+   */
+  async getStructureObjectsUnified(type, accountId, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+    const resp = await apiClient.get('/structure/objects', {
+      params: {
+        account_id: accountId,
+        type,
+        q: q || undefined,
+        limit,
+        after: after || undefined,
+        include_paused: include_paused ? 1 : undefined
+      }
+    })
+    return resp.data || { items: [], paging: {} }
+  }
+
+  /**
+   * 多账户结构列表（规则页多选账户）：请求 /api/structure/objects/multi，合并多个账户的对象列表
+   * @param {string} type - campaign | adset | ad
+   * @param {string[]} accountIds - 账户 ID 数组（有权限的）
+   * @param {Object} opts - q, limit, after, include_paused
+   * @returns {Promise<{ items, paging, meta }>} 每条 item 含 account_id
+   */
+  async getStructureObjectsMulti(type, accountIds, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+    if (!Array.isArray(accountIds) || accountIds.length === 0) {
+      return { items: [], paging: {}, meta: {} }
+    }
+    const resp = await apiClient.get('/structure/objects/multi', {
+      params: {
+        account_ids: accountIds.join(','),
+        type,
+        q: q || undefined,
+        limit,
+        after: after || undefined,
+        include_paused: include_paused ? 1 : undefined
+      }
+    })
+    return resp.data || { items: [], paging: {}, meta: {} }
+  }
+
+  async resolveObjectsByIds(ids) {
+    const resp = await apiClient.get('/structure/resolve', {
+      params: { ids: Array.isArray(ids) ? ids.join(',') : ids }
+    })
+    return resp.data.items || []
+  }
+
+  /**
+   * 强制同步该账户广告结构到 structure_ads（顺序2 2.4）
+   * 成功后本地 structure_ads 更新，选择器列表可刷新到最新
+   * @param {string} accountId - act_xxx
+   * @returns {Promise<{ ok, account_id, synced_count?, duration_ms? }>}
+   * @throws 429 冷却中 / 409 锁占用 / 500 其他错误
+   */
+  async syncStructure(accountId) {
+    const resp = await apiClient.post('/sync/structure', { account_id: accountId })
+    return resp.data
   }
 
   async getAds(accountId) {
@@ -59,6 +139,25 @@ class FacebookMarketingService {
 
   async executeRules(accountId, rules) {
     const resp = await apiClient.post('/execute-rules', { account_id: accountId, rules })
+    return resp.data || {}
+  }
+
+  /**
+   * 执行所有规则（离线查询模式）
+   * 从数据库查询数据，不调用 Facebook API，避免触发频率限制
+   */
+  async executeAllRulesOffline() {
+    const resp = await apiClient.post('/rules/execute-all')
+    return resp.data || {}
+  }
+
+  /**
+   * 单条规则手动执行（仅执行这一条规则）
+   * @param {number} ruleId - 规则 ID
+   * @returns {Promise<{ success, message, rule_id, account_id, matched_count, executed_count, failed_count, status, run_id }>}
+   */
+  async executeRuleById(ruleId) {
+    const resp = await apiClient.post(`/rules/${ruleId}/execute`)
     return resp.data || {}
   }
 }

@@ -1,0 +1,135 @@
+{
+  "clientName": "Thunder Client",
+  "collectionName": "阶段1验证测试",
+  "folders": [],
+  "requests": [
+    {
+      "name": "1. 登录 - test2 (staff)",
+      "url": "http://localhost:3000/api/auth/login",
+      "method": "POST",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"username\": \"test2\",\n  \"password\": \"your_password\"\n}"
+      },
+      "tests": [],
+      "note": "用 test2 测试时：1. 先发本请求 2. 从返回 JSON 复制 token 3. 在 2～7 的请求里，Headers 的 Authorization 把「登录test2后在此粘贴token」整段换成「Bearer 刚复制的token」"
+    },
+    {
+      "name": "2. Summary接口 - 非admin (test2)",
+      "url": "http://localhost:3000/api/automation-logs/stats/summary",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "3. 列表接口 - 非admin (test2) - 无参数",
+      "url": "http://localhost:3000/api/automation-logs?page=1&limit=10",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "4. 列表接口 - 非admin (test2) - include_all_status=true",
+      "url": "http://localhost:3000/api/automation-logs?include_all_status=true",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "5. 列表接口 - 非admin (test2) - include_all_status=True (大小写测试)",
+      "url": "http://localhost:3000/api/automation-logs?include_all_status=True",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "6. 详情接口 - 非admin (test2) - 自己的日志",
+      "url": "http://localhost:3000/api/automation-logs/1234",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": [],
+      "note": "注意：需要先查询一条 owner_id=5 的日志 ID，替换 1234"
+    },
+    {
+      "name": "7. 详情接口 - 非admin (test2) - 他人的日志 (应该404)",
+      "url": "http://localhost:3000/api/automation-logs/3688",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录test2后在此粘贴token"
+        }
+      ],
+      "tests": [],
+      "note": "注意：3688 是 owner_id=0 的日志，test2 (owner_id=5) 应该无法访问"
+    },
+    {
+      "name": "8. 列表接口 - admin - 无参数",
+      "url": "http://localhost:3000/api/automation-logs",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录admin后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "9. 列表接口 - admin - include_all_status=true",
+      "url": "http://localhost:3000/api/automation-logs?include_all_status=true",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录admin后在此粘贴token"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "name": "10. 列表接口 - admin - include_all_status=true&status=fail",
+      "url": "http://localhost:3000/api/automation-logs?include_all_status=true&status=fail",
+      "method": "GET",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录admin后在此粘贴token"
+        }
+      ],
+      "tests": []
+    }
+  ],
+  "version": "2.1"
+}

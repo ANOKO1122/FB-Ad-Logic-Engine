@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:server": "node server/server.js",
+    "dev:server:logs": "set NODE_ENV=production&& node server/server.js",
     "dev:all": "concurrently \"npm run dev:server\" \"npm run dev\"",
     "build": "vite build",
     "preview": "vite preview",
@@ -28,10 +29,13 @@
     "luxon": "^3.7.2",
     "mysql2": "^3.16.0",
     "node-cron": "^4.2.1",
+    "p-limit": "^7.2.0",
     "socks-proxy-agent": "^8.0.2",
     "undici": "^5.28.2",
     "vue": "^3.4.0",
-    "vue-router": "^4.6.4"
+    "vue-router": "^4.6.4",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",

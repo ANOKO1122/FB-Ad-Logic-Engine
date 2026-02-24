@@ -6,7 +6,7 @@ export default defineConfig({
   // 测试环境：Node.js（不是浏览器环境）
   test: {
     // 测试文件匹配规则：只测试 server/tests 目录下的 .test.js 文件
-    include: ['**/server/tests/**/*.test.js'],
+    include: ['**/server/tests/**/*.test.js', '**/src/**/*.test.js'],
     
     // 测试环境：Node.js
     environment: 'node',

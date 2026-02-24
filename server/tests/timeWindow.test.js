@@ -71,8 +71,8 @@ describe('时间窗口工具模块', () => {
       expect(end.month).toBe(now.month)
       expect(end.year).toBe(now.year)
       
-      // 验证开始时间是 3 天前
-      const expectedStart = now.minus({ days: 3 }).startOf('day')
+      // 实现约定：last_3_days = 今天 + 昨天 + 2天前（共 3 天），故 start = 2 天前 00:00
+      const expectedStart = now.minus({ days: 2 }).startOf('day')
       expect(start.day).toBe(expectedStart.day)
       expect(start.month).toBe(expectedStart.month)
       expect(start.year).toBe(expectedStart.year)

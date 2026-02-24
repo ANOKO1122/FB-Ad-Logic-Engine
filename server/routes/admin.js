@@ -1,7 +1,9 @@
 import { Router } from 'express'
+import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { requireAuth, requireActive, requireAdmin } from '../middleware/authJwt.js'
 import { manualExecute, getCronStatus } from '../services/cronService.js'
+import { validateTemplateBody } from '../utils/templateValidator.js'
 
 const router = Router()
 
@@ -99,6 +101,41 @@ router.get('/owners', async (req, res) => {
   }
 })
 
+// POST /api/admin/owners
+// 创建新负责人
+router.post('/owners', async (req, res) => {
+  try {
+    const { owner_name, owner_key } = req.body
+    if (!owner_name || !owner_name.trim()) {
+      return res.status(400).json({ error: '负责人名称不能为空', code: 'MISSING_PARAMS' })
+    }
+    
+    // owner_key 可选，如果没有提供则使用 owner_name
+    const finalOwnerKey = owner_key?.trim() || owner_name.trim()
+    
+    // 检查是否已存在同名负责人
+    const [existing] = await pool.execute(
+      'SELECT id FROM owners WHERE owner_name = ? OR owner_key = ?',
+      [owner_name.trim(), finalOwnerKey]
+    )
+    
+    if (existing.length > 0) {
+      return res.status(400).json({ error: '负责人已存在', code: 'DUPLICATE' })
+    }
+    
+    // 插入新负责人
+    await pool.execute(
+      'INSERT INTO owners (owner_name, owner_key, is_active) VALUES (?, ?, 1)',
+      [owner_name.trim(), finalOwnerKey]
+    )
+    
+    res.json({ success: true, message: `负责人 "${owner_name.trim()}" 创建成功` })
+  } catch (err) {
+    logger.error('创建负责人失败:', err)
+    res.status(500).json({ error: '创建失败', code: 'ERROR', details: err?.message })
+  }
+})
+
 router.get('/account-mappings', async (req, res) => {
   try {
     const { owner_id } = req.query
@@ -181,6 +218,181 @@ router.post('/account-mappings/batch-import', async (req, res) => {
     res.json({ success: true, message: `导入完成：成功 ${successCount} 条，失败 ${failCount} 条`, successCount, failCount })
   } catch (err) {
     res.status(500).json({ error: '操作失败', code: 'ERROR' })
+  }
+})
+
+// ===========================
+// 规则模板管理（2.3.2）
+// ===========================
+
+// GET /api/admin/templates
+router.get('/templates', async (req, res) => {
+  try {
+    const { include_inactive, query, limit, offset } = req.query
+    const includeInactive = include_inactive === '1' || include_inactive === 'true'
+    const q = (query && typeof query === 'string' ? query.trim() : '') || ''
+    const lim = Math.min(100, Math.max(1, parseInt(limit, 10) || 100))
+    const off = Math.min(100000, Math.max(0, parseInt(offset, 10) || 0))
+
+    let sql = `SELECT id, name, slug, description, when_lines, when_time_window, when_custom_range, actions, sort_order, is_active, created_by, updated_by, created_at, updated_at
+               FROM rule_templates`
+    const params = []
+    if (!includeInactive) {
+      sql += ' WHERE is_active = 1'
+    }
+    if (q) {
+      sql += includeInactive ? ' WHERE' : ' AND'
+      sql += ' (name LIKE ? OR slug LIKE ? OR description LIKE ?)'
+      const p = `%${q}%`
+      params.push(p, p, p)
+    }
+    sql += ' ORDER BY sort_order ASC, name ASC'
+    sql += ` LIMIT ${lim} OFFSET ${off}`
+
+    const [rows] = await pool.execute(sql, params)
+    const templates = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      slug: r.slug,
+      description: r.description,
+      when_lines: typeof r.when_lines === 'string' ? JSON.parse(r.when_lines) : r.when_lines,
+      when_time_window: r.when_time_window,
+      when_custom_range: r.when_custom_range ? (typeof r.when_custom_range === 'string' ? JSON.parse(r.when_custom_range) : r.when_custom_range) : null,
+      actions: typeof r.actions === 'string' ? JSON.parse(r.actions) : r.actions,
+      sort_order: r.sort_order,
+      is_active: !!r.is_active,
+      created_by: r.created_by,
+      updated_by: r.updated_by,
+      created_at: r.created_at,
+      updated_at: r.updated_at
+    }))
+    res.json({ success: true, templates })
+  } catch (err) {
+    logger.error('获取模板列表失败:', err)
+    res.status(500).json({ error: '获取失败', code: 'ERROR' })
+  }
+})
+
+// POST /api/admin/templates
+router.post('/templates', async (req, res) => {
+  try {
+    const userId = req.user?.id
+    const v = validateTemplateBody(req.body, false)
+    if (!v.valid) {
+      return res.status(400).json({ error: v.error, code: 'INVALID_PARAMS', field: v.field })
+    }
+
+    const { name, slug, description, when_lines, when_time_window, when_custom_range, actions, sort_order } = req.body
+    const slugTrim = String(slug).trim()
+
+    const [existing] = await pool.execute('SELECT id FROM rule_templates WHERE slug = ?', [slugTrim])
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'slug 已存在', code: 'DUPLICATE_SLUG' })
+    }
+
+    const whenLinesJson = JSON.stringify(when_lines)
+    const whenCustomRangeJson = when_custom_range ? JSON.stringify(when_custom_range) : null
+    const actionsJson = JSON.stringify(actions)
+    const sort = sort_order != null ? Number(sort_order) : 0
+
+    await pool.execute(
+      `INSERT INTO rule_templates (name, slug, description, when_lines, when_time_window, when_custom_range, actions, sort_order, is_active, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      [name.trim(), slugTrim, description?.trim() || null, whenLinesJson, when_time_window, whenCustomRangeJson, actionsJson, sort, userId, userId]
+    )
+    const [inserted] = await pool.execute('SELECT id, name, slug, created_at FROM rule_templates WHERE slug = ?', [slugTrim])
+    res.status(201).json({ success: true, template: inserted[0], message: '模板创建成功' })
+  } catch (err) {
+    logger.error('创建模板失败:', err)
+    res.status(500).json({ error: '创建失败', code: 'ERROR', details: err?.message })
+  }
+})
+
+// PUT /api/admin/templates/:id（乐观并发：body.updated_at 不匹配返回 409）
+router.put('/templates/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10)
+    if (Number.isNaN(id)) return res.status(400).json({ error: '无效的 ID', code: 'INVALID_ID' })
+
+    const userId = req.user?.id
+    const clientUpdatedAt = req.body?.updated_at
+    if (clientUpdatedAt == null || clientUpdatedAt === '') {
+      return res.status(400).json({ error: '缺少 updated_at，请刷新后重试', code: 'MISSING_VERSION' })
+    }
+
+    const v = validateTemplateBody(req.body, true)
+    if (!v.valid) {
+      return res.status(400).json({ error: v.error, code: 'INVALID_PARAMS', field: v.field })
+    }
+
+    const [existing] = await pool.execute('SELECT id, slug, sort_order, updated_at FROM rule_templates WHERE id = ?', [id])
+    if (existing.length === 0) {
+      return res.status(404).json({ error: '模板不存在', code: 'NOT_FOUND' })
+    }
+
+    const dbUpdatedAt = existing[0].updated_at
+    const dbSec = Math.floor((dbUpdatedAt instanceof Date ? dbUpdatedAt : new Date(dbUpdatedAt)).getTime() / 1000)
+    const clientSec = Math.floor(new Date(clientUpdatedAt).getTime() / 1000)
+    if (Number.isNaN(clientSec) || dbSec !== clientSec) {
+      return res.status(409).json({ error: '模板已被他人修改，请刷新后重试', code: 'CONFLICT', current_updated_at: dbUpdatedAt })
+    }
+
+    const { name, description, when_lines, when_time_window, when_custom_range, actions, sort_order } = req.body
+    const whenLinesJson = JSON.stringify(when_lines)
+    const whenCustomRangeJson = when_custom_range ? JSON.stringify(when_custom_range) : null
+    const actionsJson = JSON.stringify(actions)
+    const sort = sort_order != null ? Number(sort_order) : existing[0].sort_order
+
+    await pool.execute(
+      `UPDATE rule_templates SET name=?, description=?, when_lines=?, when_time_window=?, when_custom_range=?, actions=?, sort_order=?, updated_by=?, updated_at=NOW() WHERE id=?`,
+      [name?.trim() || existing[0].name, description?.trim() || null, whenLinesJson, when_time_window, whenCustomRangeJson, actionsJson, sort, userId, id]
+    )
+    const [updated] = await pool.execute('SELECT id, name, slug, updated_at FROM rule_templates WHERE id = ?', [id])
+    res.json({ success: true, template: updated[0], message: '模板更新成功' })
+  } catch (err) {
+    logger.error('更新模板失败:', err)
+    res.status(500).json({ error: '更新失败', code: 'ERROR', details: err?.message })
+  }
+})
+
+// DELETE /api/admin/templates/:id（软删除）
+router.delete('/templates/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10)
+    if (Number.isNaN(id)) return res.status(400).json({ error: '无效的 ID', code: 'INVALID_ID' })
+
+    const [existing] = await pool.execute('SELECT id, name FROM rule_templates WHERE id = ?', [id])
+    if (existing.length === 0) {
+      return res.status(404).json({ error: '模板不存在', code: 'NOT_FOUND' })
+    }
+
+    await pool.execute('UPDATE rule_templates SET is_active=0, updated_at=NOW() WHERE id=?', [id])
+    res.json({ success: true, message: `模板「${existing[0].name}」已删除（软删除）。如需复用 slug，请使用「恢复」而非新建。` })
+  } catch (err) {
+    logger.error('删除模板失败:', err)
+    res.status(500).json({ error: '删除失败', code: 'ERROR', details: err?.message })
+  }
+})
+
+// POST /api/admin/templates/:id/restore（恢复软删除的模板）
+router.post('/templates/:id/restore', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10)
+    if (Number.isNaN(id)) return res.status(400).json({ error: '无效的 ID', code: 'INVALID_ID' })
+
+    const [existing] = await pool.execute('SELECT id, name, is_active FROM rule_templates WHERE id = ?', [id])
+    if (existing.length === 0) {
+      return res.status(404).json({ error: '模板不存在', code: 'NOT_FOUND' })
+    }
+    if (existing[0].is_active) {
+      return res.status(400).json({ error: '模板已是启用状态，无需恢复', code: 'ALREADY_ACTIVE' })
+    }
+
+    await pool.execute('UPDATE rule_templates SET is_active=1, updated_at=NOW() WHERE id=?', [id])
+    res.json({ success: true, message: `模板「${existing[0].name}」已恢复` })
+  } catch (err) {
+    logger.error('恢复模板失败:', err)
+    res.status(500).json({ error: '恢复失败', code: 'ERROR', details: err?.message })
   }
 })
 

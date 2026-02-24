@@ -1,0 +1,67 @@
+{
+  "clientName": "Thunder Client",
+  "collectionName": "结构同步验证 (POST /api/sync/structure)",
+  "folders": [],
+  "requests": [
+    {
+      "name": "1. 登录 - 获取 Token",
+      "url": "http://localhost:3001/api/auth/login",
+      "method": "POST",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"username\": \"你的用户名\",\n  \"password\": \"你的密码\"\n}"
+      },
+      "tests": [],
+      "note": "1. 把 username/password 改成你的 2. Send 后从 Response 里复制 token 3. 在下面请求的 Authorization 里用 Bearer <粘贴的token>"
+    },
+    {
+      "name": "2. 第一次同步结构 (期望 200)",
+      "url": "http://localhost:3001/api/sync/structure",
+      "method": "POST",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录后在此粘贴token"
+        }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"account_id\": \"act_你的账户\"\n}"
+      },
+      "tests": [],
+      "note": "1. 先执行「1. 登录」并复制 token，把上面 Authorization 的「登录后在此粘贴token」换成真实 token 2. account_id 换成你有权限的广告账户（如 act_123456789）3. 期望：200，body 里 ok:true, synced_count>0, duration_ms 有值"
+    },
+    {
+      "name": "3. 冷却期 - 2分钟内再调 (期望 429)",
+      "url": "http://localhost:3001/api/sync/structure",
+      "method": "POST",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "key": "Authorization",
+          "value": "Bearer 登录后在此粘贴token"
+        }
+      ],
+      "body": {
+        "type": "json",
+        "raw": "{\n  \"account_id\": \"act_你的账户\"\n}"
+      },
+      "tests": [],
+      "note": "不改参数，在第一次同步成功后的 2 分钟内再 Send。期望：429，body 里 reason:cooldown, retry_after_sec 有值；DB 里 MAX(last_synced_at) 不变"
+    }
+  ],
+  "version": "2.1"
+}

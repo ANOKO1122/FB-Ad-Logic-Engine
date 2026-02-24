@@ -2,7 +2,7 @@
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
 > 
-> **最新更新**：2026-01-16 - 已完成规则配置层（M3）第一阶段（约 60%），包括规则数据模型扩展、时区与时间窗口逻辑、测试完善，详见 `项目开发过程/项目总结-2026-01-16-规则配置层与方案B+设计.md`
+> **最新更新**：2026-01-22 - 已完成归档完整性检查修复、ROW_NUMBER排序稳定性增强、观测性增强、诊断脚本优化。核心改进：完整性检查机制（expectedCount vs archivedCount）、自动补齐缺失数据、跳过原因分类统计、诊断脚本优化（识别多次归档）。详见 `项目开发过程/项目总结-2026-01-22-归档完整性检查修复与验证.md`
 
 ---
 
@@ -37,10 +37,9 @@
 - [x] 后端：在 Ingestor 中实现 20-Batch 聚合：
   - 使用自实现 `chunkArray` 对广告 ID 列表按 20 个一组切分。
   - 按 Facebook Batch API 规范构造请求并发送。
-- [x] 后端：在 Batch 请求中显式请求字段：`ad_id, ad_name, spend, cpc, roas, actions, action_values, cost_per_action_type, cost_per_unique_link_click, cost_per_unique_inline_link_click`，并将时间范围锁定为 today，强制加上 `use_account_attribution_setting=true`。
-  - 注意：虽然请求了 `cpc` 和 `roas`，但这两个字段**不入库**（当天数据从 API 获取，历史数据通过计算得出）。
+- [x] 后端：在 Batch 请求中显式请求字段（围绕 10 个字段与其计算所需的原始计数）：`ad_id, ad_name, adset_id, spend, cpc, purchase_roas, actions, action_values, cost_per_action_type, cost_per_unique_link_click, cost_per_unique_inline_link_click, inline_link_clicks, unique_inline_link_clicks`，并将时间范围锁定为 today（快照）或 yesterday（归档），强制加上 `use_account_attribution_setting=true`。注意：`purchase_roas` 返回数组格式，需要提取；`roas` 不是有效字段名。
 - [x] 后端：为每次同步生成 `sync_session_id`，将全部写入 `ad_snapshots` 的该字段，并记录同步完成时间。
-- [x] 后端：实现数据字段提取逻辑（10 个核心字段：状态、花费、成效(购买)、CPA、uCPC、加购费、结账费、支付费，以及 CPC 和 ROAS 的特殊处理）。
+- [x] 后端：实现数据字段提取逻辑（10 个核心字段：状态、花费、成效(购买)、CPA、ROAS、CPC、uCPC、加购费、结账费、支付费，以及区间计算所需的原始计数）。
 - [x] 后端：实现获取广告状态的逻辑（从 `/ads` API 获取并合并到 insights 数据中）。
 
 ### 1.3 API 频率自适应与自愈
@@ -60,18 +59,41 @@
 - [x] 后端/DB：在 Ingestor 中实现滑动窗口同步（Today + Past 7 Days），使用 `ON DUPLICATE KEY UPDATE` 更新过去一周数据。
 - [x] 后端：实现定时任务（在 `server/services/cronService.js` 或类似文件中）：
   - 每 10 分钟执行一次「热数据」Today 同步。
-  - 每天账户当地时间 06:00，将昨日数据汇总写入 `daily_stats`，并用于报表查询。
+  - 每 10 分钟检查一次冷数据归档（高频检查 + 账户本地 06:00 窗口）。
+  - 每 30 分钟执行一次滑动窗口同步（修复归因延迟）。
+- [x] 后端：滑动窗口语义修复（2026-01-21）：
+  - `today` 数据只写入 `ad_snapshots`（只包含 today 数据）。
+  - 过去 N 天的按日数据更新到 `daily_stats`（使用 `time_increment=1` 拉取按日数据）。
+  - 修复语义污染：`today` 查询只返回 today 的真实数据，不包含 `last_7d` 聚合值。
+- [x] 后端：时区自动更新机制（2026-01-21）：
+  - 每次数据同步时自动从 Facebook API 获取最新时区。
+  - 如果时区不一致，自动更新 `account_mappings.timezone_name`。
+  - 历史时区刷新工具：`refresh-timezone-history.js`。
 - [x] 测试：为 Data Ingestor 的核心逻辑编写集成测试或单元测试，尤其是滑动窗口覆盖逻辑。
 
 ### 1.5 冷数据落盘口径修正（当日最后快照）
 
-- [ ] 后端/DB：修正冷数据落盘为“当日最后快照”而非 SUM
-  - [ ] MySQL 8.0+：使用 `ROW_NUMBER() OVER (PARTITION BY account_id, ad_id ORDER BY synced_at DESC)`，取 `rn = 1`
-  - [ ] 非 8.0 兼容：使用“最大时间戳连接法”（先取 MAX(synced_at)，再连接原表取该时间点的完整字段）
-- [ ] 后端：落盘与查询均使用账户 `timezone_name` 计算“昨日”自然日边界；06:00 固化；无数据时降级到 `ad_snapshots` 的“昨日最后快照”
-- [ ] 后端/DB：`daily_stats` 写入 6 个原始计数字段与 `ad_set_id`，与 `ad_snapshots` 字段口径一致
-- [ ] 索引：确认/增加 `idx_account_synced`、`idx_ad_synced`、`idx_ad_synced_desc` 提升检索性能
-- [ ] 测试：构造同一广告同日多快照样例，验证 `daily_stats` 当日值等于“最后快照”的值；跨时区边界验证；降级查询误差控制在约 0.7%-1%
+- [x] 后端/DB：修正冷数据落盘为"当日最后快照"而非 SUM
+  - [x] MySQL 8.0+：使用 `ROW_NUMBER() OVER (PARTITION BY account_id, ad_id ORDER BY synced_at DESC)`，取 `rn = 1`
+  - [x] 非 8.0 兼容：使用"最大时间戳连接法"（先取 MAX(synced_at)，再连接原表取该时间点的完整字段）
+- [x] 后端：落盘与查询均使用账户 `timezone_name` 计算"昨日"自然日边界；高频检查（每 10 分钟）+ 账户本地 06:00 窗口；无数据时降级到 `ad_snapshots` 的"昨日最后快照"
+- [x] 后端/DB：冷数据归档幂等与并发控制（2026-01-21）：
+  - COUNT(*) 检查：快速跳过已归档记录。
+  - GET_LOCK：防止多实例并发归档。
+  - 唯一索引 `uk_account_ad_date(account_id, ad_id, date)`：数据库层幂等。
+  - ON DUPLICATE KEY UPDATE：自动更新已存在记录（包含 `timezone_name` 更新）。
+- [x] 后端/DB：归档完整性检查修复（2026-01-22）：
+  - 将"已归档跳过"改为"完整性检查"（expectedCount vs archivedCount）。
+  - 只有已归档且完整才跳过，否则继续归档补齐。
+  - 增强 ROW_NUMBER 排序稳定性（添加 `id DESC` 作为 tie-breaker）。
+  - 增强观测性（跳过原因分类统计：已归档且完整、已归档但不完整、锁占用、窗口未到、无效账户、异常失败）。
+  - 手动归档改为强制模式（绕过时区窗口和跳过检查）。
+- [x] 后端/DB：`daily_stats` 写入 6 个原始计数字段与 `ad_set_id`，与 `ad_snapshots` 字段口径一致；同时写入 10 个核心字段的单日值（`cpc`、`roas`、`ucpc`、`cpa`、`add_to_cart_cost`、`checkout_cost`、`payment_cost` 等），API 缺失时以原始计数兜底计算入库
+- [x] 后端/DB：移除 CTR/CPM 相关处理与字段引用，统一围绕 10 个核心字段与原始计数
+- [x] 后端/DB：`ad_snapshots` 今日入库 10 个核心字段（比值/成本类直接存 API 值）；其中 `cpa` 今日按 `spend/purchases` 计算；同时入库区间计算所需原始计数（link_clicks、unique_link_clicks、purchase_value、add_to_cart_count、initiate_checkout_count、add_payment_info_count）
+- [x] 后端：调整 CPA 计算口径：不使用 `cost_per_action_type` 的 purchase 成本，统一按 `spend/purchases` 计算（今日与区间）
+- [x] 索引：确认/增加 `idx_account_synced`、`idx_ad_synced`、`idx_ad_synced_desc` 提升检索性能；创建唯一索引 `uk_account_ad_date(account_id, ad_id, date)` 确保幂等更新
+- [x] 测试：构造同一广告同日多快照样例，验证 `daily_stats` 当日值等于"最后快照"的值；跨时区边界验证；降级查询误差控制在约 0.7%-1%
 
 ---
 
@@ -94,7 +116,9 @@
 - [x] 后端：引入时间库（如 Luxon），在规则执行路径中统一使用该库处理时间和时区。
 - [x] 后端：实现时间窗口解析逻辑：
   - today / yesterday / last_3_days / lifetime 对应的起止时间计算，基于 `timezone_name`。
-- [ ] 后端：在规则引擎的指标查询中，使用时间窗口参数从 `ad_snapshots` 或 `daily_stats` 中筛选数据。
+- [x] 后端：在规则引擎的指标查询中，使用时间窗口参数从 `ad_snapshots` 或 `daily_stats` 中筛选数据。（已完成：阶段4 - 创建规则数据查询服务）
+- [x] 后端：增强 RuleEngine 类，支持从数据库查询数据、AND/OR 逻辑、target_level/target_ids 筛选、时间窗口。（已完成：阶段5 - 增强 RuleEngine）
+- [x] 后端：修复时区不一致问题（数据同步时区 vs 账户时区）。（已完成：2026-01-20 - 时区配置方案实施完成）
 - [x] 测试：为时间窗口计算逻辑编写单元测试，验证不同时区与日期边界情况下的正确性。
 
 ### 2.3 前端规则配置改造
@@ -103,6 +127,11 @@
 - [ ] 前端：在规则编辑界面中，支持配置多个条件（metric/operator/value/time_window），并选择逻辑运算符（AND/OR）。
 - [ ] 前端：增加预设 JSON 模板（止损、扩量）快捷按钮，点击后自动填充典型规则组合。
 - [ ] 前端：在显著位置增加免责提示文案，提醒用户在 FB 后台手动开启被系统关闭的广告前，应先在本系统暂停相关规则。
+- [ ] 前端：规则管理接入后端规则 API（/api/rules CRUD + toggle），替换本地 localStorage 实现。
+- [ ] 前端：规则编辑新增 Dry Run（is_simulation）开关，并持久化到后端字段。
+- [ ] 前端：规则编辑新增目标层级 target_level 与目标IDs（先支持手动输入，占位级联选择）。
+- [ ] 前端：规则编辑“作用对象”改为可选（账户 -> 层级 -> 多选列表，支持搜索）。
+- [ ] 前端：触发条件时间窗口支持 Today/Yesterday/Last 3 Days/Lifetime（每条条件可独立设置）。
 
 ---
 

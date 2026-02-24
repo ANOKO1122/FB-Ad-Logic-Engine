@@ -5,7 +5,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { 
   syncAccountSlidingWindow,
-  archiveDailyStats 
+  archiveDailyStats,
+  parseActions
 } from '../services/ingestorService.js'
 import { getCircuitBreakerStatus, resetCircuitBreaker } from '../services/rateLimitService.js'
 
@@ -189,6 +190,35 @@ describe('Data Ingestor 服务测试', () => {
       expect(results[0].timezoneName).toBe('Asia/Shanghai')
       expect(results[1].timezoneName).toBe('UTC') // NULL → 'UTC'
       expect(results[2].timezoneName).toBe('America/New_York')
+    })
+  })
+
+  // ============================================
+  // 测试 4：购买次数 parseActions（保守防双算）
+  // ============================================
+
+  describe('parseActions（保守防双算）', () => {
+    it('同一响应同时含 offsite 与 website 时，返回两者最大值', () => {
+      const actions = [
+        { action_type: 'offsite_conversion.fb_pixel_purchase', value: '3' },
+        { action_type: 'website_purchase', value: '5' }
+      ]
+      expect(parseActions(actions)).toBe(5)
+    })
+
+    it('仅有 omni_purchase 时，直接返回 omni_purchase 的 value', () => {
+      const actions = [
+        { action_type: 'omni_purchase', value: '7' },
+        { action_type: 'offsite_conversion.fb_pixel_purchase', value: '3' }
+      ]
+      expect(parseActions(actions)).toBe(7)
+    })
+
+    it('仅有 purchase 时，才使用 purchase 作为兜底', () => {
+      const actions = [
+        { action_type: 'purchase', value: '4' }
+      ]
+      expect(parseActions(actions)).toBe(4)
     })
   })
 })

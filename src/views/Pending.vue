@@ -19,6 +19,7 @@
 <script>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { authFetch, setStoredToken } from '../utils/authFetch.js'
 
 export default {
   name: 'Pending',
@@ -30,7 +31,7 @@ export default {
     const refresh = async () => {
       loading.value = true
       try {
-        const resp = await fetch('/api/me', { credentials: 'include' })
+        const resp = await authFetch('/api/me')
         if (!resp.ok) return router.push('/login')
         const data = await resp.json()
         user.value = data.user
@@ -41,7 +42,10 @@ export default {
     }
 
     const logout = async () => {
-      try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }) } catch {}
+      try {
+        await authFetch('/api/auth/logout', { method: 'POST' })
+        setStoredToken(null)
+      } catch {}
       router.push('/login')
     }
 

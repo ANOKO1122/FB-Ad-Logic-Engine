@@ -1,0 +1,185 @@
+mysql> ALTER DATABASE fb_ad_brain CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 1 row affected (0.33 sec)
+
+mysql> SHOW VARIABLES LIKE 'collation_database';
++--------------------+--------------------+
+| Variable_name      | Value              |
++--------------------+--------------------+
+| collation_database | utf8mb4_0900_ai_ci |
++--------------------+--------------------+
+1 row in set, 1 warning (0.04 sec)
+
+mysql> ALTER TABLE account_mappings     CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 0 rows affected (1.45 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE ad_snapshots         CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 6789 rows affected (4.28 sec)
+Records: 6789  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE daily_stats          CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 27849 rows affected (18.49 sec)
+Records: 27849  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE daily_archive_status CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 587 rows affected (1.41 sec)
+Records: 587  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE owners               CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 15 rows affected (1.75 sec)
+Records: 15  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE users                CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 7 rows affected (1.22 sec)
+Records: 7  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE automation_logs          CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 0 rows affected (0.16 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE rule_execution_summaries CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 0 rows affected (0.17 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE rules                    CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 0 rows affected (0.16 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE structure_ads            CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 82767 rows affected (7.89 sec)
+Records: 82767  Duplicates: 0  Warnings: 0
+
+mysql> ALTER TABLE structure_sync_status    CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+Query OK, 0 rows affected (0.15 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> -- 以 account_mappings.fb_account_id 为例（ASCII，一般安全）
+mysql> SELECT fb_account_id, COUNT(*) AS c
+    -> FROM account_mappings
+    -> GROUP BY fb_account_id COLLATE utf8mb4_0900_ai_ci
+    -> HAVING c > 1;
+ERROR 1055 (42000): Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'fb_ad_brain.account_mappings.fb_account_id' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+mysql>
+mysql> -- 如需检查 ad_snapshots (account_id, ad_id, data_date) 组合唯一性：
+mysql> SELECT account_id, ad_id, data_date, COUNT(*) AS c
+    -> FROM ad_snapshots
+    -> GROUP BY account_id COLLATE utf8mb4_0900_ai_ci,
+    ->          ad_id      COLLATE utf8mb4_0900_ai_ci,
+    ->          data_date
+    -> HAVING c > 1;
+ERROR 1055 (42000): Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'fb_ad_brain.ad_snapshots.account_id' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+mysql> SELECT TABLE_NAME, TABLE_COLLATION
+    -> FROM INFORMATION_SCHEMA.TABLES
+    -> WHERE TABLE_SCHEMA = DATABASE()
+    -> ORDER BY TABLE_NAME;
++----------------------------+--------------------+
+| TABLE_NAME                 | TABLE_COLLATION    |
++----------------------------+--------------------+
+| account_mappings           | utf8mb4_0900_ai_ci |
+| ad_snapshots               | utf8mb4_0900_ai_ci |
+| automation_logs            | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | utf8mb4_unicode_ci |
+| daily_archive_status       | utf8mb4_0900_ai_ci |
+| daily_stats                | utf8mb4_0900_ai_ci |
+| owners                     | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | utf8mb4_0900_ai_ci |
+| rules                      | utf8mb4_0900_ai_ci |
+| structure_ads              | utf8mb4_0900_ai_ci |
+| structure_sync_status      | utf8mb4_0900_ai_ci |
+| users                      | utf8mb4_0900_ai_ci |
+| v_account_owners           | NULL               |
++----------------------------+--------------------+
+13 rows in set (0.10 sec)
+
+mysql>
+mysql> SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME
+    -> FROM INFORMATION_SCHEMA.COLUMNS
+    -> WHERE TABLE_SCHEMA = DATABASE() AND COLLATION_NAME IS NOT NULL
+    -> ORDER BY TABLE_NAME, ORDINAL_POSITION;
++----------------------------+-------------------+--------------------+
+| TABLE_NAME                 | COLUMN_NAME       | COLLATION_NAME     |
++----------------------------+-------------------+--------------------+
+| account_mappings           | fb_account_id     | utf8mb4_0900_ai_ci |
+| account_mappings           | fb_account_name   | utf8mb4_0900_ai_ci |
+| account_mappings           | timezone_name     | utf8mb4_0900_ai_ci |
+| ad_snapshots               | account_id        | utf8mb4_0900_ai_ci |
+| ad_snapshots               | ad_id             | utf8mb4_0900_ai_ci |
+| ad_snapshots               | ad_name           | utf8mb4_0900_ai_ci |
+| ad_snapshots               | status            | utf8mb4_0900_ai_ci |
+| ad_snapshots               | sync_session_id   | utf8mb4_0900_ai_ci |
+| ad_snapshots               | timezone_name     | utf8mb4_0900_ai_ci |
+| ad_snapshots               | mute_reason       | utf8mb4_0900_ai_ci |
+| ad_snapshots               | ad_set_id         | utf8mb4_0900_ai_ci |
+| automation_logs            | run_id            | utf8mb4_0900_ai_ci |
+| automation_logs            | account_id        | utf8mb4_0900_ai_ci |
+| automation_logs            | ad_id             | utf8mb4_0900_ai_ci |
+| automation_logs            | ad_name           | utf8mb4_0900_ai_ci |
+| automation_logs            | rule_name         | utf8mb4_0900_ai_ci |
+| automation_logs            | action_type       | utf8mb4_0900_ai_ci |
+| automation_logs            | api_request       | utf8mb4_0900_ai_ci |
+| automation_logs            | api_response      | utf8mb4_0900_ai_ci |
+| automation_logs            | status            | utf8mb4_0900_ai_ci |
+| automation_logs            | error_message     | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | run_id            | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | account_id        | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | ad_id             | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | ad_name           | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | rule_name         | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | action_type       | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | api_request       | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | api_response      | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | status            | utf8mb4_0900_ai_ci |
+| automation_logs_fix_backup | error_message     | utf8mb4_0900_ai_ci |
+| daily_archive_status       | account_id        | utf8mb4_0900_ai_ci |
+| daily_archive_status       | status            | utf8mb4_0900_ai_ci |
+| daily_archive_status       | last_error        | utf8mb4_0900_ai_ci |
+| daily_stats                | account_id        | utf8mb4_0900_ai_ci |
+| daily_stats                | ad_id             | utf8mb4_0900_ai_ci |
+| daily_stats                | ad_name           | utf8mb4_0900_ai_ci |
+| daily_stats                | timezone_name     | utf8mb4_0900_ai_ci |
+| daily_stats                | ad_set_id         | utf8mb4_0900_ai_ci |
+| owners                     | owner_key         | utf8mb4_0900_ai_ci |
+| owners                     | owner_name        | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | run_id            | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | rule_name         | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | account_id        | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | status            | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | skip_reason       | utf8mb4_0900_ai_ci |
+| rule_execution_summaries   | error_message     | utf8mb4_0900_ai_ci |
+| rules                      | account_id        | utf8mb4_0900_ai_ci |
+| rules                      | rule_name         | utf8mb4_0900_ai_ci |
+| rules                      | target_level      | utf8mb4_0900_ai_ci |
+| rules                      | logic_operator    | utf8mb4_0900_ai_ci |
+| rules                      | timezone_name     | utf8mb4_0900_ai_ci |
+| structure_ads              | account_id        | utf8mb4_0900_ai_ci |
+| structure_ads              | ad_id             | utf8mb4_0900_ai_ci |
+| structure_ads              | adset_id          | utf8mb4_0900_ai_ci |
+| structure_ads              | campaign_id       | utf8mb4_0900_ai_ci |
+| structure_ads              | name              | utf8mb4_0900_ai_ci |
+| structure_ads              | effective_status  | utf8mb4_0900_ai_ci |
+| structure_ads              | status            | utf8mb4_0900_ai_ci |
+| structure_ads              | configured_status | utf8mb4_0900_ai_ci |
+| structure_ads              | updated_time      | utf8mb4_0900_ai_ci |
+| structure_sync_status      | account_id        | utf8mb4_0900_ai_ci |
+| structure_sync_status      | last_error        | utf8mb4_0900_ai_ci |
+| users                      | username          | utf8mb4_0900_ai_ci |
+| users                      | password_hash     | utf8mb4_0900_ai_ci |
+| users                      | role              | utf8mb4_0900_ai_ci |
+| users                      | status            | utf8mb4_0900_ai_ci |
+| v_account_owners           | account_id        | utf8mb4_0900_ai_ci |
+| v_account_owners           | account_name      | utf8mb4_0900_ai_ci |
+| v_account_owners           | owner_name        | utf8mb4_0900_ai_ci |
+| v_account_owners           | status_text       | utf8mb4_0900_ai_ci |
++----------------------------+-------------------+--------------------+
+71 rows in set (0.00 sec)
+
+mysql> SELECT COUNT(*)
+    -> FROM account_mappings am
+    -> LEFT JOIN ad_snapshots ad
+    ->   ON am.fb_account_id = ad.account_id;
++----------+
+| COUNT(*) |
++----------+
+|     6797 |
++----------+
+1 row in set (0.01 sec)

@@ -1,5 +1,6 @@
 // Facebook Marketing API 客户端类和规则引擎类
 // 注意：这个文件现在只包含业务逻辑类，不包含 Express 应用配置
+import logger from './utils/logger.js'
 import axios from 'axios'
 import https from 'https'
 import http from 'http'
@@ -7,6 +8,7 @@ import tls from 'tls'
 import net from 'net'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
+import { parseProxyUrl, isSocksProxy } from './utils/proxyUtils.js'
 import { fileURLToPath } from 'url'
 import { recordRequest } from './utils/tlsErrorMonitor.js'
 import { dirname, join } from 'path'
@@ -23,6 +25,22 @@ import {
   getCircuitBreakerStatus
 } from './services/rateLimitService.js'
 import { queryRuleData, getAccountTimezone } from './services/ruleDataService.js'
+import { getAccountsFromDatabase, syncAccountsFromFacebook } from './services/accountSyncService.js'
+import {
+  syncAccountStructureAds,
+  listStructureAdsFromDb,
+  listStructureCampaignsFromDb,
+  listStructureAdsetsFromDb,
+  listStructureObjectsFromDb,
+  resolveStructureByIds
+} from './services/structureSyncService.js'
+import { assertAccountAccess, hasAccountAccess } from './utils/accountAccess.js'
+import {
+  normalizeConditionsToV2,
+  getAllConditionsFromV2,
+  validateTimeWindowConsistency
+} from './utils/conditionsValidator.js'
+import { calculateTimeWindow } from './utils/timeWindow.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -31,29 +49,6 @@ const __dirname = dirname(__filename)
 
 // 代理协议探测缓存：host:port -> 'socks5' | 'http'
 const proxyProtocolCache = new Map()
-
-function parseProxyUrl(raw) {
-  if (!raw) return null
-  const v = String(raw).trim()
-
-  // 显式协议
-  if (v.startsWith('socks5://') || v.startsWith('socks4://')) {
-    const u = new URL(v)
-    return { scheme: v.startsWith('socks5://') ? 'socks5' : 'socks4', host: u.hostname, port: Number(u.port || 10809), raw: v }
-  }
-  if (v.startsWith('http://') || v.startsWith('https://')) {
-    const u = new URL(v)
-    return { scheme: 'http', host: u.hostname, port: Number(u.port || 10809), raw: v }
-  }
-
-  // host:port 或其它（默认 auto）
-  if (v.includes(':')) {
-    const [host, port] = v.split(':')
-    return { scheme: 'auto', host: host || '127.0.0.1', port: Number(port || 10809), raw: v }
-  }
-
-  return { scheme: 'auto', host: v || '127.0.0.1', port: 10809, raw: v }
-}
 
 async function detectProxyProtocol(host, port) {
   const key = `${host}:${port}`
@@ -100,6 +95,158 @@ class FacebookMarketingAPI {
     this.accessToken = accessToken
   }
 
+  /**
+   * 通用：拉取结构化对象列表的一页数据（campaigns / adsets / ads）
+   * - 不使用 insights，避免“无消耗对象不可见”
+   * - 支持 cursor(after) 分页、limit、filtering（effective_status / name contains）
+   */
+  async getStructurePage(adAccountId, edge, { fields, limit = 50, after = null, filtering = null } = {}) {
+    const url = `${FACEBOOK_API_BASE}/${adAccountId}/${edge}`
+    const params = {
+      fields,
+      limit,
+      access_token: this.accessToken
+    }
+    if (after) params.after = after
+    if (filtering) params.filtering = JSON.stringify(filtering)
+
+    const data = await this.makeRequest(url, params, 'GET')
+    if (data.error) {
+      throw new Error(`Facebook API Error: ${data.error.message}`)
+    }
+
+    const items = (data.data || []).map((x) => ({
+      id: String(x.id || ''),
+      name: x.name || '',
+      status: x.status,
+      effective_status: x.effective_status,
+      configured_status: x.configured_status,
+      campaign_id: x.campaign_id,
+      adset_id: x.adset_id,
+      updated_time: x.updated_time || null
+    })).filter(x => x.id)
+
+    const afterCursor = data?.paging?.cursors?.after || null
+    return { items, paging: { after: afterCursor, next: data?.paging?.next || null } }
+  }
+
+  /**
+   * Batch API：一次请求拉取多个账户的 ads 结构页（最多 50 个子请求/批）
+   * 用于每小时多账户结构轮转，减少 HTTP 往返。
+   * @param {Array<{ accountId: string, after?: string }>} requests
+   * @param {{ fields: string, filtering: Array }} opts - fields 与 filtering（与 getStructurePage 一致）
+   * @returns {Promise<Array<{ accountId: string, items: Array, after?: string }>>}
+   */
+  async getStructureAdsBatch(requests, { fields, filtering } = {}) {
+    if (!requests || requests.length === 0) return []
+    const list = requests.slice(0, 50)
+    const filteringStr = filtering ? JSON.stringify(filtering) : ''
+    const batchRequests = list.map(({ accountId, after }) => {
+      let rel = `${accountId}/ads?fields=${encodeURIComponent(fields)}&limit=100`
+      if (filteringStr) rel += `&filtering=${encodeURIComponent(filteringStr)}`
+      if (after) rel += `&after=${encodeURIComponent(after)}`
+      return { method: 'GET', relative_url: rel }
+    })
+    const batchUrl = `${FACEBOOK_API_BASE}/`
+    const batchParams = {
+      batch: JSON.stringify(batchRequests),
+      access_token: this.accessToken
+    }
+    const response = await this.makeRequest(batchUrl, batchParams, 'POST', null, {
+      returnHeaders: true,
+      timeout: 60000
+    })
+    const responseData = (response && typeof response === 'object' && 'data' in response) ? response.data : response
+    const responseHeaders = (response && typeof response === 'object' && 'headers' in response) ? response.headers : {}
+    if (responseData?.error) throw new Error(`Batch API Error: ${responseData.error?.message || 'unknown'}`)
+    const batchResponses = Array.isArray(responseData) ? responseData : []
+    const results = []
+    for (let i = 0; i < list.length; i++) {
+      const { accountId } = list[i]
+      const item = batchResponses[i]
+      try {
+        if (item?.code === 200 && item?.body) {
+          const bodyData = JSON.parse(item.body)
+          if (bodyData.error) {
+            logger.warn(`[Batch] account=${accountId} ads 失败:`, bodyData.error.message)
+            results.push({ accountId, items: [], after: null })
+            continue
+          }
+          const data = bodyData.data || []
+          const items = data.map((x) => ({
+            id: String(x.id || ''),
+            name: x.name || '',
+            status: x.status,
+            effective_status: x.effective_status,
+            configured_status: x.configured_status,
+            campaign_id: x.campaign_id,
+            adset_id: x.adset_id,
+            updated_time: x.updated_time || null
+          })).filter(x => x.id)
+          const afterCursor = bodyData?.paging?.cursors?.after || null
+          results.push({ accountId, items, after: afterCursor })
+        } else {
+          results.push({ accountId, items: [], after: null })
+        }
+      } catch (e) {
+        logger.warn(`[Batch] account=${accountId} 解析失败:`, e.message)
+        results.push({ accountId, items: [], after: null })
+      }
+    }
+    // 解析 usage 并动态休眠（与 ingestorService 一致）
+    const usageHeader = responseHeaders['x-business-use-case-usage'] || responseHeaders['x-business-use-case-usage'.toLowerCase()]
+    if (usageHeader) {
+      const usageInfo = parseUsageHeader(usageHeader)
+      await sleepBasedOnUsage(usageInfo)
+    }
+    return results
+  }
+
+  /**
+   * 通用：根据对象 IDs 解析名称/状态（用于“回显”与 structure_ads 写库）
+   * Graph 支持：GET /?ids=id1,id2&fields=...
+   * 当 fields 含 adset_id,campaign_id,updated_time 时会一并映射到返回对象（供结构镜像表使用）。
+   */
+  async resolveObjectsByIds(ids, { fields = 'id,name,effective_status,status,configured_status' } = {}) {
+    const list = (Array.isArray(ids) ? ids : String(ids || '').split(','))
+      .map(s => String(s || '').trim())
+      .filter(Boolean)
+    if (list.length === 0) return []
+
+    // Graph 限制：URL 过长会失败，做一个保守切分（每批 50）
+    const chunks = []
+    for (let i = 0; i < list.length; i += 50) chunks.push(list.slice(i, i + 50))
+
+    const all = []
+    for (const chunk of chunks) {
+      const url = `${FACEBOOK_API_BASE}/`
+      const params = {
+        ids: chunk.join(','),
+        fields,
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, params, 'GET')
+      if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
+
+      for (const id of chunk) {
+        const obj = data?.[id]
+        if (!obj) continue
+        const item = {
+          id: String(obj.id || id),
+          name: obj.name || '',
+          effective_status: obj.effective_status,
+          status: obj.status,
+          configured_status: obj.configured_status
+        }
+        if (obj.adset_id !== undefined) item.adset_id = obj.adset_id
+        if (obj.campaign_id !== undefined) item.campaign_id = obj.campaign_id
+        if (obj.updated_time !== undefined) item.updated_time = obj.updated_time || null
+        all.push(item)
+      }
+    }
+    return all
+  }
+
   async getAdAccounts() {
     try {
       let url = `${FACEBOOK_API_BASE}/me/adaccounts`
@@ -109,8 +256,8 @@ class FacebookMarketingAPI {
         access_token: this.accessToken
       }
 
-      console.log('📡 请求Facebook API(分页):', url)
-      console.log('📋 参数: fields=id,name,account_id, limit=200')
+      logger.info('📡 请求Facebook API(分页):', url)
+      logger.info('📋 参数: fields=id,name,account_id, limit=200')
 
       const all = []
       const seen = new Set()
@@ -132,19 +279,19 @@ class FacebookMarketingAPI {
         params = {} // next URL 已包含必要参数
       }
 
-      console.log(`✅ 分页汇总后广告账户数: ${all.length}`)
+      logger.info(`✅ 分页汇总后广告账户数: ${all.length}`)
       return all
       
     } catch (error) {
-      console.error('❌ 获取广告账户失败:', error.message)
-      console.error('❌ 错误堆栈:', error.stack)
+      logger.error('❌ 获取广告账户失败:', error.message)
+      logger.error('❌ 错误堆栈:', error.stack)
       throw new Error(`网络连接失败: ${error.message}. 请检查网络连接、防火墙或代理设置。`)
     }
   }
   
   processAccountsResponse(data, method = '') {
     if (data.error) {
-      console.error('❌ Facebook API错误:', JSON.stringify(data.error, null, 2))
+      logger.error('❌ Facebook API错误:', JSON.stringify(data.error, null, 2))
       throw new Error(`Facebook API错误: ${data.error.message} (错误代码: ${data.error.code || 'N/A'}, 类型: ${data.error.type || 'N/A'})`)
     }
     
@@ -155,7 +302,7 @@ class FacebookMarketingAPI {
     }))
     
     const methodText = method ? `（使用${method}）` : ''
-    console.log(`✅ 成功获取 ${accounts.length} 个广告账户${methodText}`)
+    logger.info(`✅ 成功获取 ${accounts.length} 个广告账户${methodText}`)
     return accounts
   }
 
@@ -184,25 +331,25 @@ class FacebookMarketingAPI {
         access_token: this.accessToken
       }
       
-      console.log(`📡 获取账户 ${accountId} 的时区...`)
+      logger.info(`📡 获取账户 ${accountId} 的时区...`)
       
       // 第4-5行：发送请求
       const data = await this.makeRequest(url, params, 'GET')
       
       // 第6-7行：检查错误
       if (data.error) {
-        console.warn(`⚠️  获取账户 ${accountId} 时区失败:`, data.error.message)
+        logger.warn(`⚠️  获取账户 ${accountId} 时区失败:`, data.error.message)
         return 'UTC'  // 失败时返回默认时区
       }
       
       // 第8-10行：提取时区名称
       const timezoneName = data.timezone_name || 'UTC'
-      console.log(`✅ 账户 ${accountId} 时区: ${timezoneName}`)
+      logger.info(`✅ 账户 ${accountId} 时区: ${timezoneName}`)
       
       return timezoneName
     } catch (error) {
       // 第11-12行：如果请求失败，记录警告但返回默认时区（优雅降级）
-      console.warn(`⚠️  获取账户 ${accountId} 时区失败，使用默认 UTC:`, error.message)
+      logger.warn(`⚠️  获取账户 ${accountId} 时区失败，使用默认 UTC:`, error.message)
       return 'UTC'
     }
   }
@@ -227,23 +374,43 @@ class FacebookMarketingAPI {
     // 方法1: 如果配置了代理，则先探测该端口到底是 SOCKS5 还是 HTTP 代理，避免 protocol mismatch
     if (proxyUrl) {
       const info = parseProxyUrl(proxyUrl)
-      if (info) {
+      if (!info) {
+        logger.warn('⚠️ 代理解析失败，跳过代理，尝试后续方式:', proxyUrl)
+      } else {
         let scheme = info.scheme
         if (scheme === 'auto') {
           scheme = await detectProxyProtocol(info.host, info.port)
-          console.log(`🔎 代理协议探测结果: ${info.host}:${info.port} => ${scheme}`)
+          logger.info(`🔎 代理协议探测结果: ${info.host}:${info.port} => ${scheme}`)
         }
 
         if (scheme === 'socks5' || scheme === 'socks4') {
           const socksUrl = info.raw.startsWith('socks') ? info.raw : `socks5://${info.host}:${info.port}`
+          // 只重试「TLS 未建立前」的高置信瞬态错误，避免误重试 ECONNRESET/socket hang up（可能发生在请求已发送后）
+          const isTransientSocksError = (err) => {
+            const msg = (err?.message || err?.code || '') + ''
+            return /Client network socket disconnected before secure TLS connection was established/i.test(msg) ||
+              /收到空响应/i.test(msg)
+          }
           try {
-            console.log(`🔄 使用SOCKS代理: ${socksUrl}`)
-            return await requestViaSocks5(url, params, socksUrl, method, body)
+            logger.info(`🔄 使用SOCKS代理: ${socksUrl}`)
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              try {
+                return await requestViaSocks5(url, params, socksUrl, method, body)
+              } catch (e) {
+                if (attempt === 1 && isTransientSocksError(e)) {
+                  const jitter = 200 + Math.floor(Math.random() * 301) // 200-500ms
+                  logger.info(`⚠️ 瞬态错误，${jitter}ms 后重试: ${e.message}`)
+                  await new Promise(r => setTimeout(r, jitter))
+                  continue
+                }
+                throw e
+              }
+            }
           } catch (socks5Error) {
-            console.warn('⚠️ 原生SOCKS实现失败:', socks5Error.message)
+            logger.warn('⚠️ 原生SOCKS实现失败:', socks5Error.message)
             // 只有在明确是 socks URL 时才允许 socks-proxy-agent 兜底，避免对 HTTP 端口造成 protocol mismatch
             try {
-              console.log(`🔄 尝试使用socks-proxy-agent: ${socksUrl}`)
+              logger.info(`🔄 尝试使用socks-proxy-agent: ${socksUrl}`)
               const agent = new SocksProxyAgent(socksUrl, { timeout: timeout })
               const config = { params, httpsAgent: agent, httpAgent: agent, timeout: timeout }
               
@@ -269,29 +436,30 @@ class FacebookMarketingAPI {
                 }
               }
               
-              console.log('✅ socks-proxy-agent 请求成功')
+              logger.info('✅ socks-proxy-agent 请求成功')
               return returnHeaders ? { data: resp.data, headers: resp.headers } : resp.data
             } catch (socksError) {
               // 检查是否是 Token 错误
               checkTokenError(socksError)
-              console.warn('⚠️ socks-proxy-agent 也失败:', socksError.message)
+              logger.warn('⚠️ socks-proxy-agent 也失败:', socksError.message)
               throw socksError
             }
           }
-        } else {
-          // HTTP 代理：优先 CONNECT 隧道 / https-proxy-agent
+        } else if (scheme === 'http') {
+          // HTTP 代理：CONNECT 隧道（仅 http://；https:// 代理由方法3 HttpsProxyAgent 处理）
           try {
-            console.log('🔄 使用HTTP代理（CONNECT隧道）...')
+            logger.info('🔄 使用HTTP代理（CONNECT隧道）...')
             return await this.requestViaHttpProxy(url, params, `http://${info.host}:${info.port}`, method, body)
           } catch (proxyError) {
-            console.warn('⚠️ HTTP代理隧道失败:', proxyError.message)
+            logger.warn('⚠️ HTTP代理隧道失败:', proxyError.message)
           }
         }
+        // scheme === 'https' 或 其它：跳过 CONNECT，由方法3 HttpsProxyAgent 处理（支持 https:// 代理）
       }
     }
     
-    // 方法3: 尝试使用axios with HTTP代理agent
-    if (proxyUrl && !proxyUrl.includes('socks5://') && !proxyUrl.includes('socks4://')) {
+    // 方法3: 尝试使用axios with HTTP代理agent（排除 socks5h/socks5/socks4）
+    if (proxyUrl && !isSocksProxy(proxyUrl)) {
       try {
         let httpProxyUrl = proxyUrl
         if (!httpProxyUrl.startsWith('http://') && !httpProxyUrl.startsWith('https://')) {
@@ -329,7 +497,7 @@ class FacebookMarketingAPI {
         
         return returnHeaders ? { data: response.data, headers: response.headers } : response.data
       } catch (httpError) {
-        console.warn('⚠️ HTTP代理agent失败:', httpError.message)
+        logger.warn('⚠️ HTTP代理agent失败:', httpError.message)
       }
     }
     
@@ -338,7 +506,7 @@ class FacebookMarketingAPI {
       try {
         const queryString = new URLSearchParams(params).toString()
         const fullUrl = `${url}?${queryString}`
-        console.log('🔄 尝试使用原生fetch（自动使用系统代理）...')
+        logger.info('🔄 尝试使用原生fetch（自动使用系统代理）...')
         
         const fetchOptions = {
           method: method,
@@ -379,12 +547,12 @@ class FacebookMarketingAPI {
         
         return returnHeaders ? { data, headers: Object.fromEntries(response.headers.entries()) } : data
       } catch (fetchError) {
-        console.warn('⚠️ 原生fetch失败:', fetchError.message)
+        logger.warn('⚠️ 原生fetch失败:', fetchError.message)
       }
     }
     
     // 方法5: 最后尝试直接使用axios（不配置agent，依赖系统代理）
-    console.log('🔄 尝试使用axios（依赖系统代理）...')
+    logger.info('🔄 尝试使用axios（依赖系统代理）...')
     const config = {
       params,
       timeout: timeout
@@ -419,33 +587,24 @@ class FacebookMarketingAPI {
   async requestViaHttpProxy(targetUrl, params, proxyUrl, method = 'GET', body = null) {
     return new Promise((resolve, reject) => {
       try {
-        // 解析代理URL
-        let proxyHost = '127.0.0.1'
-        let proxyPort = 10809
-        
-        if (proxyUrl.startsWith('http://') || proxyUrl.startsWith('https://')) {
-          const urlObj = new URL(proxyUrl)
-          proxyHost = urlObj.hostname
-          proxyPort = parseInt(urlObj.port) || 10809
-        } else if (proxyUrl.includes(':')) {
-          const parts = proxyUrl.split(':')
-          proxyHost = parts[0]
-          proxyPort = parseInt(parts[1]) || 10809
-        }
+        // 解析代理URL（使用统一工具，避免 socks5h 等误入时解析错误）
+        const info = parseProxyUrl(proxyUrl)
+        const proxyHost = info?.host || '127.0.0.1'
+        const proxyPort = (info?.port && !Number.isNaN(info.port)) ? info.port : 10809
         
         // 解析目标URL
         const targetUrlObj = new URL(targetUrl)
         const targetHost = targetUrlObj.hostname
         const targetPort = targetUrlObj.port || 443
         
-        console.log(`🔗 通过HTTP代理建立隧道: ${proxyHost}:${proxyPort} -> ${targetHost}:${targetPort}`)
+        logger.info(`🔗 通过HTTP代理建立隧道: ${proxyHost}:${proxyPort} -> ${targetHost}:${targetPort}`)
         
         // 构建查询字符串和路径
         const queryString = new URLSearchParams(params).toString()
         const path = queryString ? `${targetUrlObj.pathname}?${queryString}` : targetUrlObj.pathname
         
         // 连接到代理服务器，使用CONNECT方法建立隧道
-        console.log(`📡 正在连接到代理服务器 ${proxyHost}:${proxyPort}...`)
+        logger.info(`📡 正在连接到代理服务器 ${proxyHost}:${proxyPort}...`)
         const proxyReq = http.request({
           host: proxyHost,
           port: proxyPort,
@@ -458,30 +617,30 @@ class FacebookMarketingAPI {
           },
           timeout: 10000
         }, (proxyRes) => {
-          console.log(`📥 收到代理响应: ${proxyRes.statusCode} ${proxyRes.statusMessage}`)
+          logger.info(`📥 收到代理响应: ${proxyRes.statusCode} ${proxyRes.statusMessage}`)
           
           // 检查代理响应状态
           if (proxyRes.statusCode !== 200) {
             let errorBody = ''
             proxyRes.on('data', (chunk) => { errorBody += chunk })
             proxyRes.on('end', () => {
-              console.error(`❌ 代理连接失败: ${proxyRes.statusCode} ${proxyRes.statusMessage}`)
+              logger.error(`❌ 代理连接失败: ${proxyRes.statusCode} ${proxyRes.statusMessage}`)
               if (errorBody) {
-                console.error(`❌ 错误详情: ${errorBody}`)
+                logger.error(`❌ 错误详情: ${errorBody}`)
               }
               reject(new Error(`代理连接失败: ${proxyRes.statusCode} ${proxyRes.statusMessage}${errorBody ? ' - ' + errorBody : ''}`))
             })
             return
           }
           
-          console.log('✅ 代理隧道建立成功')
+          logger.info('✅ 代理隧道建立成功')
           
           // 确保socket已准备好（CONNECT响应后，socket就是原始TCP连接）
           const tunnelSocket = proxyRes.socket
           
           // 监听socket错误
           tunnelSocket.on('error', (error) => {
-            console.error('❌ 隧道socket错误:', error.message)
+            logger.error('❌ 隧道socket错误:', error.message)
             reject(new Error(`隧道连接错误: ${error.message}`))
           })
           
@@ -489,7 +648,7 @@ class FacebookMarketingAPI {
           // 使用setImmediate确保在下一个事件循环中执行
           setImmediate(() => {
             try {
-              console.log('🔐 开始建立TLS连接...')
+              logger.info('🔐 开始建立TLS连接...')
               
               // 在原始socket上建立TLS连接
               const tlsSocket = tls.connect({
@@ -498,7 +657,7 @@ class FacebookMarketingAPI {
                 servername: targetHost,
                 rejectUnauthorized: false
               }, () => {
-                console.log('✅ TLS连接建立成功，开始发送HTTP请求...')
+                logger.info('✅ TLS连接建立成功，开始发送HTTP请求...')
                 
                 // TLS连接建立后，发送HTTP请求
                 const headers = {
@@ -521,8 +680,8 @@ class FacebookMarketingAPI {
                   .join('')
                 const httpRequest = requestLine + headerLines + '\r\n'
                 
-                console.log(`📤 发送HTTP请求: ${method} ${path}`)
-                console.log(`📤 请求头大小: ${httpRequest.length} 字节`)
+                logger.info(`📤 发送HTTP请求: ${method} ${path}`)
+                logger.info(`📤 请求头大小: ${httpRequest.length} 字节`)
                 
                 // 先发送请求头
                 tlsSocket.write(httpRequest)
@@ -530,14 +689,14 @@ class FacebookMarketingAPI {
                 // 如果是POST请求，发送body
                 if (method === 'POST' && body) {
                   const bodyStr = JSON.stringify(body)
-                  console.log(`📤 请求体大小: ${bodyStr.length} 字节`)
+                  logger.info(`📤 请求体大小: ${bodyStr.length} 字节`)
                   tlsSocket.write(bodyStr)
                 }
               })
               
               tlsSocket.on('error', (error) => {
-                console.error('❌ TLS连接错误:', error.message)
-                console.error('❌ 错误堆栈:', error.stack)
+                logger.error('❌ TLS连接错误:', error.message)
+                logger.error('❌ 错误堆栈:', error.stack)
                 
                 // 记录 TLS 错误（用于监控）
                 recordRequest(true)
@@ -571,7 +730,7 @@ class FacebookMarketingAPI {
                     if (statusMatch) {
                       const statusCode = parseInt(statusMatch[1])
                       const statusMessage = statusMatch[2]
-                      console.log(`📥 收到HTTP响应: ${statusCode} ${statusMessage}`)
+                      logger.info(`📥 收到HTTP响应: ${statusCode} ${statusMessage}`)
                     }
                     
                     // 解析其他响应头
@@ -609,77 +768,77 @@ class FacebookMarketingAPI {
               })
               
               tlsSocket.on('end', () => {
-                console.log(`✅ 响应接收完成，总大小: ${responseBuffer.length} 字节，响应体: ${responseBody.length} 字节`)
+                logger.info(`✅ 响应接收完成，总大小: ${responseBuffer.length} 字节，响应体: ${responseBody.length} 字节`)
                 try {
                   if (!responseBody) {
-                    console.error('❌ 收到空响应体')
+                    logger.error('❌ 收到空响应体')
                     reject(new Error('收到空响应'))
                     return
                   }
                   
                   // 尝试解析JSON
                   const jsonData = JSON.parse(responseBody)
-                  console.log('✅ JSON解析成功')
+                  logger.info('✅ JSON解析成功')
                   
                   // 记录成功请求（用于监控）
                   recordRequest(false)
                   
                   resolve(jsonData)
                 } catch (parseError) {
-                  console.error('❌ JSON解析失败:', parseError.message)
-                  console.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
+                  logger.error('❌ JSON解析失败:', parseError.message)
+                  logger.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
                   reject(new Error(`解析响应失败: ${parseError.message}`))
                 }
               })
               
               tlsSocket.setTimeout(60000, () => {
-                console.error('❌ TLS连接超时（60秒）')
+                logger.error('❌ TLS连接超时（60秒）')
                 tlsSocket.destroy()
                 tunnelSocket.destroy()
                 reject(new Error('TLS连接超时'))
               })
             } catch (error) {
-              console.error('❌ 建立TLS连接时出错:', error.message)
+              logger.error('❌ 建立TLS连接时出错:', error.message)
               reject(error)
             }
           })
         })
         
         proxyReq.on('error', (error) => {
-          console.error('❌ 代理请求错误:', error.message)
-          console.error('❌ 错误代码:', error.code)
-          console.error('❌ 错误堆栈:', error.stack)
+          logger.error('❌ 代理请求错误:', error.message)
+          logger.error('❌ 错误代码:', error.code)
+          logger.error('❌ 错误堆栈:', error.stack)
           reject(new Error(`代理连接错误: ${error.message} (${error.code})`))
         })
         
         proxyReq.on('timeout', () => {
-          console.error('❌ 代理连接超时（10秒）- timeout事件触发')
+          logger.error('❌ 代理连接超时（10秒）- timeout事件触发')
           proxyReq.destroy()
           reject(new Error('代理连接超时'))
         })
         
         // 添加socket连接事件监听
         proxyReq.on('socket', (socket) => {
-          console.log('🔌 Socket已分配')
+          logger.info('🔌 Socket已分配')
           socket.on('connect', () => {
-            console.log('✅ Socket已连接到代理服务器')
+            logger.info('✅ Socket已连接到代理服务器')
           })
           socket.on('error', (error) => {
-            console.error('❌ Socket错误:', error.message)
+            logger.error('❌ Socket错误:', error.message)
           })
           socket.on('timeout', () => {
-            console.error('❌ Socket超时')
+            logger.error('❌ Socket超时')
           })
         })
         
         proxyReq.setTimeout(10000, () => {
-          console.error('❌ 代理连接超时（setTimeout触发）- 10秒内未收到响应')
+          logger.error('❌ 代理连接超时（setTimeout触发）- 10秒内未收到响应')
           proxyReq.destroy()
           reject(new Error('代理连接超时：10秒内未收到代理服务器响应'))
         })
         
-        console.log(`📤 发送CONNECT请求到代理: ${targetHost}:${targetPort}`)
-        console.log(`📤 CONNECT请求路径: ${targetHost}:${targetPort}`)
+        logger.info(`📤 发送CONNECT请求到代理: ${targetHost}:${targetPort}`)
+        logger.info(`📤 CONNECT请求路径: ${targetHost}:${targetPort}`)
         proxyReq.end()
       } catch (error) {
         reject(error)
@@ -693,13 +852,21 @@ class FacebookMarketingAPI {
       const params = {
         // 增加层级/状态字段，前端可展示更完整的广告详情
         fields: 'id,name,status,effective_status,configured_status,adset_id,campaign_id,creative{id,name}',
+        // 关键：显式提高 limit，并做分页，避免默认 25 条
+        limit: 500,
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'GET')
-      if (data.error) {
-        throw new Error(`Facebook API Error: ${data.error.message}`)
+      const all = []
+      let currentUrl = url
+      let currentParams = params
+      while (currentUrl) {
+        const data = await this.makeRequest(currentUrl, currentParams, 'GET')
+        if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
+        all.push(...(data.data || []))
+        currentUrl = data?.paging?.next || null
+        currentParams = { access_token: this.accessToken }
       }
-      return data.data || []
+      return all
     } catch (error) {
       if (error.message.includes('Facebook API Error')) {
         throw error
@@ -709,78 +876,82 @@ class FacebookMarketingAPI {
   }
 
   async getAdInsights(adAccountId, timeRange = null, options = {}) {
-    try {
-      const url = `${FACEBOOK_API_BASE}/${adAccountId}/insights`
-      // 支持动态层级：ad / adset / campaign（默认 ad）
-      const level = options?.level || 'ad'
+    const url = `${FACEBOOK_API_BASE}/${adAccountId}/insights`
+    const level = options?.level || 'ad'
+    // P0：Route1（账户级 GET）必须返回 ROI 核心字段，避免 purchase_value/roas 因字段缺失而整体失真
+    const fullFields = 'campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,impressions,clicks,spend,ctr,cpc,cpm,inline_link_clicks,unique_inline_link_clicks,actions,action_values,unique_actions,cost_per_action_type,purchase_roas,website_purchase_roas'
+    // 兼容降级：去掉非核心展示字段，但保留 ROI 核心字段（actions/action_values/purchase_roas）
+    const fallbackFields = 'campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,impressions,clicks,spend,inline_link_clicks,unique_inline_link_clicks,actions,action_values,unique_actions,cost_per_action_type,purchase_roas,website_purchase_roas'
+
+    const buildParams = (fields) => {
       const params = {
-        // 增加 campaign / adset 层级信息，做到"广告层级广告详情"监控
-        // 注意：这里保持"轻量字段"，避免超时；购买/漏斗等深度指标走 /api/roi
-        fields: 'campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,impressions,clicks,spend,ctr,cpc,cpm',
-        // 关键：默认 Graph API insights 返回的是 account 级别汇总；必须指定 level 才会返回对应层级数据
-        level: level,
-        // 优化性能：每页最多 200 条（Facebook API 允许的最大值），减少分页请求次数
-        limit: 200,
+        fields,
+        level,
+        limit: Number.isFinite(Number(options?.limit)) ? Number(options.limit) : 200,
         access_token: this.accessToken
       }
-      
       if (timeRange?.since && timeRange?.until) {
-        params.time_range = JSON.stringify({
-          since: timeRange.since,
-          until: timeRange.until
-        })
+        params.time_range = JSON.stringify({ since: timeRange.since, until: timeRange.until })
       } else if (timeRange?.preset) {
-        // 与广告管理工具口径更接近的预设时间范围（today / yesterday / last_7d / last_30d 等）
         params.date_preset = timeRange.preset
       } else {
-        // 默认使用 today，避免“最近24小时”与 Ads Manager（通常按天）口径不一致
         params.date_preset = 'today'
       }
-
-      // 对齐 Ads Manager 归因口径
-      if (options?.useAccountAttributionSetting) {
-        params.use_account_attribution_setting = true
-      }
+      if (options?.useAccountAttributionSetting) params.use_account_attribution_setting = true
       if (Array.isArray(options?.actionAttributionWindows) && options.actionAttributionWindows.length > 0) {
         params.action_attribution_windows = options.actionAttributionWindows
       }
+      return params
+    }
 
-      // 处理分页：Facebook Insights API 可能返回多页数据
-      // 为什么需要分页？账户下可能有大量广告，单次请求可能只返回部分数据
+    const mapItem = (item) => ({
+      campaign_id: item.campaign_id,
+      campaign_name: item.campaign_name,
+      adset_id: item.adset_id,
+      adset_name: item.adset_name,
+      ad_id: item.ad_id,
+      ad_name: item.ad_name,
+      impressions: parseInt(item.impressions || '0'),
+      clicks: parseInt(item.clicks || '0'),
+      spend: parseFloat(item.spend || '0'),
+      ctr: parseFloat(item.ctr || '0'),
+      cpc: parseFloat(item.cpc || '0'),
+      cpm: parseFloat(item.cpm || '0'),
+      inline_link_clicks: item.inline_link_clicks,
+      unique_inline_link_clicks: item.unique_inline_link_clicks,
+      actions: item.actions,
+      action_values: item.action_values,
+      unique_actions: item.unique_actions,
+      cost_per_action_type: item.cost_per_action_type,
+      purchase_roas: item.purchase_roas,
+      website_purchase_roas: item.website_purchase_roas,
+      date_start: item.date_start,
+      date_stop: item.date_stop
+    })
+
+    try {
+      let currentParams = buildParams(fullFields)
       const allInsights = []
       let currentUrl = url
-      let currentParams = params
-      
-      while (currentUrl) {
-        const data = await this.makeRequest(currentUrl, currentParams, 'GET')
-        
-        if (data.error) {
-          throw new Error(`Facebook API Error: ${data.error.message}`)
-        }
 
-        // 添加当前页的数据
-        const pageInsights = (data.data || []).map((item) => ({
-          campaign_id: item.campaign_id,
-          campaign_name: item.campaign_name,
-          adset_id: item.adset_id,
-          adset_name: item.adset_name,
-          ad_id: item.ad_id,
-          ad_name: item.ad_name,
-          impressions: parseInt(item.impressions || '0'),
-          clicks: parseInt(item.clicks || '0'),
-          spend: parseFloat(item.spend || '0'),
-          ctr: parseFloat(item.ctr || '0'),
-          cpc: parseFloat(item.cpc || '0'),
-          cpm: parseFloat(item.cpm || '0'),
-          date_start: item.date_start,
-          date_stop: item.date_stop
-        }))
-        
+      while (currentUrl) {
+        let data
+        try {
+          data = await this.makeRequest(currentUrl, currentParams, 'GET')
+        } catch (e) {
+          if (this.isInvalidFieldError(e) && currentParams.fields === fullFields) {
+            currentParams = buildParams(fallbackFields)
+            currentUrl = url
+            continue
+          }
+          throw e
+        }
+        if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
+
+        const pageInsights = (data.data || []).map(mapItem)
         allInsights.push(...pageInsights)
-        
-        // 检查是否有下一页
+
         currentUrl = data.paging?.next || null
-        // 下一页是完整 URL，后续请求不用 params（next 已带 token），但为了安全仍带 token
         currentParams = { access_token: this.accessToken }
       }
 
@@ -976,13 +1147,19 @@ class FacebookMarketingAPI {
   }
 
   isInvalidFieldError(e) {
-    const msg = String(e?.message || '')
+    const msg = String(
+      e?.response?.data?.error?.message ||
+      e?.error?.message ||
+      e?.message ||
+      ''
+    )
+    const lower = msg.toLowerCase()
     return (
-      msg.toLowerCase().includes('nonexisting summary field') ||
-      msg.toLowerCase().includes('unknown') ||
-      msg.toLowerCase().includes('invalid') ||
-      msg.toLowerCase().includes('unsupported') ||
-      msg.toLowerCase().includes('field') && msg.toLowerCase().includes('does not exist')
+      lower.includes('nonexisting summary field') ||
+      lower.includes('unknown') ||
+      lower.includes('invalid') ||
+      lower.includes('unsupported') ||
+      (lower.includes('field') && lower.includes('does not exist'))
     )
   }
 
@@ -1219,7 +1396,22 @@ class FacebookMarketingAPI {
     }
   }
 
+  /**
+   * 获取广告组预算（M4 3.5：对上游暴露「分」）
+   * FB API 的 daily_budget 读写均为账户最小货币单位（USD=分），GET 返回的已是分，不要乘 100
+   * @returns {number} 预算（美分，整数）
+   */
   async getAdsetBudget(adsetId) {
+    const detail = await this.getAdsetBudgetDetail(adsetId)
+    const raw = detail.daily_budget > 0 ? detail.daily_budget : detail.lifetime_budget
+    return Math.round(Number(raw))
+  }
+
+  /**
+   * 获取广告组预算明细（用于 ABO/CBO 判断：有则调 AdSet，无则向上调 Campaign）
+   * @returns {{ daily_budget: number, lifetime_budget: number }} 美分，整数
+   */
+  async getAdsetBudgetDetail(adsetId) {
     try {
       const url = `${FACEBOOK_API_BASE}/${adsetId}`
       const params = {
@@ -1230,7 +1422,10 @@ class FacebookMarketingAPI {
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
-      return parseFloat(data.daily_budget || data.lifetime_budget || '0')
+      return {
+        daily_budget: Math.round(Number(data.daily_budget ?? 0)),
+        lifetime_budget: Math.round(Number(data.lifetime_budget ?? 0))
+      }
     } catch (error) {
       if (error.message.includes('Facebook API Error')) {
         throw error
@@ -1239,15 +1434,21 @@ class FacebookMarketingAPI {
     }
   }
 
-  async updateAdsetBudget(adsetId, newBudget, isDaily = true) {
+  /**
+   * 更新广告组预算（M4 3.5：上游约定「分」；FB API 的 daily_budget 也要求「分」即最小货币单位）
+   * FB API 要求 POST 参数放在 Body 中，不能放在 URL Query，否则返回 400。
+   * @param {number} newBudgetCents - 预算（美分，整数）
+   */
+  async updateAdsetBudget(adsetId, newBudgetCents, isDaily = true) {
     try {
       const url = `${FACEBOOK_API_BASE}/${adsetId}`
       const field = isDaily ? 'daily_budget' : 'lifetime_budget'
-      const params = {
-        [field]: newBudget,
+      // 参数放 Body，避免 400；makeRequest 收到 body 时以 JSON 发送
+      const body = {
+        [field]: Math.round(newBudgetCents),
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'POST', null)
+      const data = await this.makeRequest(url, {}, 'POST', body)
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1257,6 +1458,69 @@ class FacebookMarketingAPI {
         throw error
       }
       throw new Error(`更新广告组预算失败: ${error.message}`)
+    }
+  }
+
+  /**
+   * 获取广告系列预算（CBO/优势+系列预算时预算在 Campaign 上）
+   * FB API 的 daily_budget/lifetime_budget 为账户最小货币单位（USD=分）
+   * @returns {number} 预算（美分，整数），无则 0
+   */
+  async getCampaignBudget(campaignId) {
+    const detail = await this.getCampaignBudgetDetail(campaignId)
+    const raw = detail.daily_budget > 0 ? detail.daily_budget : detail.lifetime_budget
+    return Math.round(Number(raw))
+  }
+
+  /**
+   * 获取广告系列预算明细（用于 CBO 时决定用 daily 还是 lifetime 更新）
+   * @returns {{ daily_budget: number, lifetime_budget: number }} 美分，整数
+   */
+  async getCampaignBudgetDetail(campaignId) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${campaignId}`
+      const params = {
+        fields: 'daily_budget,lifetime_budget,budget_remaining',
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, params, 'GET')
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return {
+        daily_budget: Math.round(Number(data.daily_budget ?? 0)),
+        lifetime_budget: Math.round(Number(data.lifetime_budget ?? 0))
+      }
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`获取广告系列预算失败: ${error.message}`)
+    }
+  }
+
+  /**
+   * 更新广告系列预算（CBO 时用；参数放 Body，与 updateAdsetBudget 一致）
+   * @param {number} newBudgetCents - 预算（美分，整数）
+   */
+  async updateCampaignBudget(campaignId, newBudgetCents, isDaily = true) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${campaignId}`
+      const field = isDaily ? 'daily_budget' : 'lifetime_budget'
+      const body = {
+        [field]: Math.round(newBudgetCents),
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, {}, 'POST', body)
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return !data.error
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`更新广告系列预算失败: ${error.message}`)
     }
   }
 }
@@ -1308,58 +1572,66 @@ class RuleEngine {
     }
 
     // 第4-5行：获取账户时区（用于时间窗口计算）
-    // 如果规则中指定了 timezone_name，使用规则的时区；否则从数据库查询
-    const timezoneName = rule.timezone_name || await getAccountTimezone(accountId)
+    // 统一用 account_mappings.timezone_name，忽略 rules.timezone_name（历史 UTC 不影响）
+    const timezoneName = await getAccountTimezone(accountId)
 
-    // 第6-20行：根据 target_level 和 target_ids 筛选目标广告ID
-    // target_level: 'ad' | 'adset' | 'campaign'
-    // target_ids: JSON 数组，存放目标 ID 列表
-    let targetAdIds = []
-    
-    if (rule.target_level && rule.target_ids && Array.isArray(rule.target_ids) && rule.target_ids.length > 0) {
-      // 如果指定了 target_level 和 target_ids，使用指定的目标
-      if (rule.target_level === 'ad') {
-        // 目标层级是广告，直接使用 target_ids
-        targetAdIds = rule.target_ids.map(id => String(id))
+    // 第6-20行：根据 targetLevel 和 targetIds 筛选目标广告ID（多账户规则：仅取当前 accountId 下的目标）
+    const ruleTargetLevel = rule.targetLevel || rule.target_level
+    const targetByAccount = rule.targetByAccount ?? rule.target_by_account
+    let ruleTargetIds = []
+    if (targetByAccount && typeof targetByAccount === 'object' && accountId in targetByAccount) {
+      const arr = targetByAccount[accountId]
+      ruleTargetIds = Array.isArray(arr) ? arr.map(id => String(id)).filter(Boolean) : []
+    } else if (targetByAccount && typeof targetByAccount === 'object') {
+      // 多账户规则下该账户未在 target_by_account 中，本账户无目标（仅对有选中的账户有目标）
+      ruleTargetIds = []
+    } else {
+      const raw = rule.targetIds || rule.target_ids || []
+      const withAccount = raw.filter(id => String(id).trim().startsWith(accountId + ':'))
+      if (withAccount.length > 0) {
+        ruleTargetIds = withAccount.map(s => String(s).slice(String(s).indexOf(':') + 1)).filter(Boolean)
       } else {
-        // 目标层级是广告组或广告系列，需要查询对应的广告ID
-        // TODO: 实现从 adset_id 或 campaign_id 查询 ad_id 的逻辑
-        // 暂时使用兼容方案：如果提供了 ads 参数，从中筛选
-        if (ads && Array.isArray(ads)) {
-          targetAdIds = ads
-            .filter(ad => {
-              if (rule.target_level === 'adset') {
-                return rule.target_ids.includes(String(ad.adset_id || ''))
-              } else if (rule.target_level === 'campaign') {
-                return rule.target_ids.includes(String(ad.campaign_id || ''))
-              }
-              return false
-            })
-            .map(ad => String(ad.id || ad.ad_id || ''))
-            .filter(id => id)
+        ruleTargetIds = raw.map(id => String(id)).filter(Boolean)
+      }
+    }
+    let targetAdIds = []
+
+    if (ruleTargetLevel && ruleTargetIds.length > 0) {
+      if (ruleTargetLevel === 'ad') {
+        targetAdIds = ruleTargetIds
+        logger.info(`    🎯 规则限定目标广告: ${targetAdIds.length} 个 (${targetAdIds.slice(0, 3).join(', ')}${targetAdIds.length > 3 ? '...' : ''})`)
+      } else {
+        try {
+          const filterColumn = ruleTargetLevel === 'adset' ? 'adset_id' : 'campaign_id'
+          const placeholders = ruleTargetIds.map(() => '?').join(',')
+          const [rows] = await pool.execute(`
+            SELECT DISTINCT ad_id
+            FROM structure_ads
+            WHERE account_id = ?
+              AND ${filterColumn} IN (${placeholders})
+          `, [accountId, ...ruleTargetIds.map(id => String(id))])
+          targetAdIds = rows.map(row => String(row.ad_id || '')).filter(id => id)
+          logger.info(`    🎯 规则限定目标${ruleTargetLevel === 'adset' ? '广告组' : '广告系列'}: ${ruleTargetIds.length} 个，包含广告: ${targetAdIds.length} 个`)
+        } catch (error) {
+          logger.error(`    ❌ 查询 ${ruleTargetLevel} 下的广告ID失败:`, error.message)
+          targetAdIds = []
         }
       }
-    } else {
-      // 如果没有指定 target_ids，查询账户下所有广告（从数据库）
-      // 从 ad_snapshots 表查询该账户下的所有广告ID（取最新的快照）
+    } else if (ruleTargetLevel && ruleTargetIds.length === 0 && targetByAccount && accountId in targetByAccount) {
+      targetAdIds = []
+    } else if (targetByAccount && typeof targetByAccount === 'object' && !(accountId in targetByAccount)) {
+      // 多账户规则：该账户不在 target_by_account 中，本账户无目标，不查全量
+      targetAdIds = []
+    } else if (!ruleTargetLevel || ruleTargetIds.length === 0) {
+      // 未指定 target 时从 structure_ads 取账户下全部 ad_id，与 campaign/adset 口径一致（含 spend=0 广告）
       try {
-        // 使用 GROUP BY 获取每个广告的最新快照（兼容所有 MySQL 版本）
         const [rows] = await pool.execute(`
-          SELECT s.ad_id
-          FROM ad_snapshots s
-          INNER JOIN (
-            SELECT ad_id, MAX(synced_at) as max_synced_at
-            FROM ad_snapshots
-            WHERE account_id = ?
-            GROUP BY ad_id
-          ) t
-          ON s.ad_id = t.ad_id AND s.synced_at = t.max_synced_at
-          WHERE s.account_id = ?
-        `, [accountId, accountId])
+          SELECT DISTINCT ad_id FROM structure_ads WHERE account_id = ?
+        `, [accountId])
         
         targetAdIds = rows.map(row => String(row.ad_id || '')).filter(id => id)
       } catch (error) {
-        console.error(`❌ 查询账户下所有广告ID失败 (accountId: ${accountId}):`, error.message)
+        logger.error(`❌ 查询账户下所有广告ID失败 (accountId: ${accountId}):`, error.message)
         // 如果查询失败，返回空数组（不抛错，保证系统可用性）
         return []
       }
@@ -1373,17 +1645,21 @@ class RuleEngine {
     // 第21-35行：从数据库查询数据（使用 ruleDataService）
     // 注意：每个条件可能有不同的 time_window，需要分别查询
     // 为了简化，我们使用第一个条件的 time_window（如果所有条件都有 time_window）
-    const timeWindow = this.getTimeWindowFromConditions(rule.conditions) || 'today'
-    
+    const logicOp = rule.logicOperator ?? rule.logic_operator ?? 'AND'
+    const timeWindow = this.getTimeWindowFromConditions(rule.conditions, logicOp) || 'today'
+    const customRange = timeWindow === 'custom_range' ? this.getCustomRangeFromConditions(rule.conditions, logicOp) : null
+
     let ruleData = []
     try {
+      logger.info(`    📊 开始查询规则数据 (time_window=${timeWindow}, 广告数=${targetAdIds.length})...`)
       // 使用 ruleDataService 查询数据（完全离线，不调用 Facebook API）
       // 阶段A修复：queryRuleData 现在返回 { data, warnings }，需要解构
-      const result = await queryRuleData(accountId, targetAdIds, timeWindow, timezoneName)
+      const result = await queryRuleData(accountId, targetAdIds, timeWindow, timezoneName, customRange)
       ruleData = result.data || result  // 兼容旧格式（如果返回的是数组）
+      logger.info(`    📊 规则数据查询完成，共 ${Array.isArray(ruleData) ? ruleData.length : 0} 条`)
     } catch (error) {
       // 如果数据库查询失败，记录错误并返回空数组（不抛错，保证系统可用性）
-      console.error(`❌ 规则数据查询失败 (accountId: ${accountId}, rule: ${rule.ruleName || rule.id}):`, error.message)
+      logger.error(`❌ 规则数据查询失败 (accountId: ${accountId}, rule: ${rule.ruleName || rule.id}):`, error.message)
       return []
     }
     
@@ -1396,27 +1672,79 @@ class RuleEngine {
     
     for (const adData of dataArray) {
       // 评估条件（支持 AND/OR 逻辑）
-      const conditionsMet = this.evaluateConditions(rule.conditions, adData, rule.logic_operator || 'AND')
+      const conditionsMet = this.evaluateConditions(rule.conditions, adData, rule.logicOperator ?? rule.logic_operator ?? 'AND')
       
       if (conditionsMet) {
         // 如果满足条件，添加到匹配列表
+        // 🔧 修复：使用扁平结构，与 actionExecutorService 期望的结构一致
         matchedAds.push({
           ad_id: adData.ad_id,
           ad_name: adData.ad_name,
           ad_set_id: adData.ad_set_id,  // 用于预算调整动作
-          metrics: {
-            spend: adData.spend,
-            purchases: adData.purchases,
-            cpc: adData.cpc,
-            roas: adData.roas,
-            cpa: adData.cpa,
-            // ... 其他指标
-          }
+          campaign_id: adData.campaign_id ?? null,  // CBO 时向上调系列预算
+          status: adData.status,        // M4 Pre-Flight：用于 pause/activate 目标已达成判断
+          mute_until: adData.mute_until,  // M4 Smart Mute：挂起截止时间
+          mute_reason: adData.mute_reason, // M4 Smart Mute：挂起原因
+          // 直接复制指标到顶层（扁平结构）
+          spend: adData.spend,
+          purchases: adData.purchases,
+          cpc: adData.cpc,
+          ucpc: adData.ucpc,
+          roas: adData.roas,
+          cpa: adData.cpa,
+          add_to_cart_cost: adData.add_to_cart_cost,
+          checkout_cost: adData.checkout_cost,
+          payment_cost: adData.payment_cost,
+          // 原始计数（用于高级分析）
+          link_clicks: adData.link_clicks,
+          unique_link_clicks: adData.unique_link_clicks,
+          purchase_value: adData.purchase_value
         })
       }
     }
 
     // 第51行：返回匹配的广告列表
+    logger.info(`    ✅ 评估完成，匹配 ${matchedAds.length} 个广告`)
+    return matchedAds
+  }
+
+  /**
+   * 使用已拉取的规则数据评估规则（无 DB 调用，供 RuleEngineDispatcher 合并读使用）
+   * @param {Object} rule - 规则对象（含 conditions, logicOperator/logic_operator, actions, enabled）
+   * @param {Array<Object>} ruleDataArray - 已查询的广告数据数组（与 queryRuleData 返回格式一致）
+   * @returns {Array<Object>} 匹配的广告列表（与 evaluateRule 返回的 matchedAds 结构一致）
+   */
+  evaluateRuleWithData(rule, ruleDataArray) {
+    if (!rule.enabled) return []
+    const logicOp = rule.logicOperator ?? rule.logic_operator ?? 'AND'
+    const dataArray = Array.isArray(ruleDataArray) ? ruleDataArray : []
+    const matchedAds = []
+    for (const adData of dataArray) {
+      const conditionsMet = this.evaluateConditions(rule.conditions, adData, logicOp)
+      if (conditionsMet) {
+        matchedAds.push({
+          ad_id: adData.ad_id,
+          ad_name: adData.ad_name,
+          ad_set_id: adData.ad_set_id,
+          campaign_id: adData.campaign_id ?? null,
+          status: adData.status,
+          mute_until: adData.mute_until,
+          mute_reason: adData.mute_reason,
+          spend: adData.spend,
+          purchases: adData.purchases,
+          cpc: adData.cpc,
+          ucpc: adData.ucpc,
+          roas: adData.roas,
+          cpa: adData.cpa,
+          add_to_cart_cost: adData.add_to_cart_cost,
+          checkout_cost: adData.checkout_cost,
+          payment_cost: adData.payment_cost,
+          link_clicks: adData.link_clicks,
+          unique_link_clicks: adData.unique_link_clicks,
+          purchase_value: adData.purchase_value
+        })
+      }
+    }
     return matchedAds
   }
 
@@ -1473,67 +1801,66 @@ class RuleEngine {
             break
         }
       } catch (error) {
-        console.error(`执行操作失败: ${action.type}`, error)
+        logger.error(`执行操作失败: ${action.type}`, error)
       }
     }
   }
 
   /**
-   * 从条件数组中提取时间窗口（用于数据查询）
-   * @param {Array} conditions - 条件数组
-   * @returns {string} 时间窗口类型（'today' | 'yesterday' | 'last_3_days' | 'last_7_days' | 'lifetime'）
-   * 
-   * 【为什么需要这个方法？】
-   * - 每个条件可能有不同的 time_window
-   * - 为了简化，我们使用第一个条件的 time_window（如果所有条件都有 time_window）
-   * - 如果条件没有 time_window，默认使用 'today'
+   * 从条件中提取时间窗口（支持 v1 array / v2 object）
+   * 同规则内 time_window 须一致，不一致则抛错
+   * @param {Array|Object} conditions - v1 数组或 v2 对象
+   * @param {string} logicOperator - v1 的 logicOperator
+   * @returns {string} 时间窗口类型
    */
-  getTimeWindowFromConditions(conditions) {
-    // 第1-2行：如果条件数组为空，返回默认值 'today'
-    if (!conditions || conditions.length === 0) {
-      return 'today'
-    }
+  getTimeWindowFromConditions(conditions, logicOperator = 'AND') {
+    const v2 = normalizeConditionsToV2(conditions, logicOperator)
+    const all = getAllConditionsFromV2(v2)
+    if (all.length === 0) return 'today'
 
-    // 第3-4行：查找第一个有 time_window 的条件
-    // 如果所有条件都有 time_window，使用第一个条件的 time_window
-    for (const condition of conditions) {
-      if (condition.time_window) {
-        return condition.time_window
-      }
-    }
+    const ok = validateTimeWindowConsistency(v2)
+    if (!ok.valid) throw new Error(ok.error)
 
-    // 第5行：如果所有条件都没有 time_window，返回默认值 'today'
+    for (const c of all) {
+      if (c.time_window) return c.time_window
+    }
     return 'today'
   }
 
   /**
-   * 评估所有条件（支持 AND/OR 逻辑）
-   * @param {Array} conditions - 条件数组
-   * @param {Object} adData - 广告数据（来自数据库查询）
-   * @param {string} logicOperator - 逻辑运算符：'AND' | 'OR'（默认 'AND'）
-   * @returns {boolean} 是否满足所有条件（AND）或至少一个条件（OR）
-   * 
-   * 【为什么需要这个方法？】
-   * - 支持 AND 逻辑：所有条件都必须满足（使用 Array.every()）
-   * - 支持 OR 逻辑：至少一个条件满足（使用 Array.some()）
-   * - 规则配置中增加 logic_operator 字段（'AND' | 'OR'）
+   * 从条件中提取 custom_range（支持 v1/v2，仅当 time_window='custom_range' 时使用）
+   * 同规则内 custom_range 须一致，不一致则抛错
+   */
+  getCustomRangeFromConditions(conditions, logicOperator = 'AND') {
+    const v2 = normalizeConditionsToV2(conditions, logicOperator)
+    const all = getAllConditionsFromV2(v2)
+    if (all.length === 0) return null
+
+    const ok = validateTimeWindowConsistency(v2)
+    if (!ok.valid) throw new Error(ok.error)
+
+    for (const c of all) {
+      if (c.time_window === 'custom_range' && c.custom_range?.since && c.custom_range?.until) {
+        return { since: c.custom_range.since, until: c.custom_range.until }
+      }
+    }
+    return null
+  }
+
+  /**
+   * 评估所有条件（DNF：OR of AND groups）
+   * 支持 v1 与 v2，先归一化再评估
+   * @param {Array|Object} conditions - v1 数组或 v2 对象
+   * @param {Object} adData - 广告数据
+   * @param {string} logicOperator - v1 的 logicOperator
+   * @returns {boolean} 是否满足至少一个 AND 组
    */
   evaluateConditions(conditions, adData, logicOperator = 'AND') {
-    // 第1-2行：如果条件数组为空，返回 true（没有条件，视为满足）
-    if (!conditions || conditions.length === 0) {
-      return true
-    }
-
-    // 第3-10行：根据 logic_operator 选择不同的评估方法
-    // AND：所有条件都必须满足（使用 Array.every()）
-    // OR：至少一个条件满足（使用 Array.some()）
-    if (logicOperator === 'OR') {
-      // OR 逻辑：至少一个条件满足
-      return conditions.some(condition => this.evaluateCondition(condition, adData))
-    } else {
-      // AND 逻辑（默认）：所有条件都必须满足
-      return conditions.every(condition => this.evaluateCondition(condition, adData))
-    }
+    const v2 = normalizeConditionsToV2(conditions, logicOperator)
+    if (!v2.groups?.length) return true
+    return v2.groups.some(g =>
+      (g.conditions || []).every(c => this.evaluateCondition(c, adData))
+    )
   }
 
   /**
@@ -1567,7 +1894,7 @@ class RuleEngine {
         return metricValue <= condition.value
       default:
         // 如果操作符不支持，返回 false（保守策略）
-        console.warn(`⚠️  不支持的操作符: ${condition.operator}`)
+        logger.warn(`⚠️  不支持的操作符: ${condition.operator}`)
         return false
     }
   }
@@ -1631,7 +1958,7 @@ class RuleEngine {
       
       default:
         // 如果指标不支持，返回 0（保守策略，避免 NaN 传播）
-        console.warn(`⚠️  不支持的指标: ${metric}`)
+        logger.warn(`⚠️  不支持的指标: ${metric}`)
         return 0
     }
   }
@@ -1661,7 +1988,7 @@ class RuleEngine {
       try {
         // 第6-7行：如果是 Dry Run 模式，只记录日志，不执行真实动作
         if (isSimulation) {
-          console.log(`[Dry Run] 广告 ${matchedAd.ad_id} 将执行动作: ${action.type}`, action)
+          logger.info(`[Dry Run] 广告 ${matchedAd.ad_id} 将执行动作: ${action.type}`, action)
           results.push({ action, status: 'simulated', success: true })
           continue
         }
@@ -1689,19 +2016,19 @@ class RuleEngine {
               results.push({ action, status: 'executed', success: true })
             } else {
               // 如果 ad_set_id 不存在，记录错误
-              console.error(`❌ 无法调整预算：广告 ${matchedAd.ad_id} 没有 ad_set_id`)
+              logger.error(`❌ 无法调整预算：广告 ${matchedAd.ad_id} 没有 ad_set_id`)
               results.push({ action, status: 'failed', success: false, error: 'ad_set_id 不存在' })
             }
             break
           
           default:
             // 如果动作类型不支持，记录警告
-            console.warn(`⚠️  不支持的动作类型: ${action.type}`)
+            logger.warn(`⚠️  不支持的动作类型: ${action.type}`)
             results.push({ action, status: 'skipped', success: false, error: '不支持的动作类型' })
         }
       } catch (error) {
         // 第21-22行：如果动作执行失败，记录错误但不中断其他动作
-        console.error(`❌ 执行动作失败: ${action.type} (广告: ${matchedAd.ad_id})`, error.message)
+        logger.error(`❌ 执行动作失败: ${action.type} (广告: ${matchedAd.ad_id})`, error.message)
         results.push({ action, status: 'failed', success: false, error: error.message })
       }
     }
@@ -1722,35 +2049,22 @@ class RuleEngine {
    * - 支持预算上限护栏（max_daily_budget）
    */
   async adjustBudget(adsetId, action) {
-    // 第1行：获取当前预算（需要调用 Facebook API）
-    const currentBudget = await this.api.getAdsetBudget(adsetId)
-    
-    // 第2行：初始化新预算
-    let newBudget
-
-    // 第3-10行：根据动作类型和 value 计算新预算
+    const currentBudgetCents = await this.api.getAdsetBudget(adsetId)
+    let newBudgetCents
     if (action.value !== undefined) {
-      // 如果指定了 value，按百分比调整
       if (action.type === 'increase_budget') {
-        newBudget = currentBudget * (1 + action.value / 100) // 百分比增加
+        newBudgetCents = currentBudgetCents * (1 + action.value / 100)
       } else {
-        newBudget = currentBudget * (1 - action.value / 100) // 百分比减少
+        newBudgetCents = currentBudgetCents * (1 - action.value / 100)
       }
     } else {
-      // 如果没有指定 value，默认调整 10%
-      newBudget = action.type === 'increase_budget' 
-        ? currentBudget * 1.1 
-        : currentBudget * 0.9
+      newBudgetCents = action.type === 'increase_budget' ? currentBudgetCents * 1.1 : currentBudgetCents * 0.9
     }
-
-    // 第11-13行：预算上限护栏（如果规则中指定了 max_daily_budget）
-    // 确保新预算不超过上限
-    if (action.max_daily_budget !== undefined) {
-      newBudget = Math.min(newBudget, action.max_daily_budget)
+    newBudgetCents = Math.max(100, Math.round(newBudgetCents))
+    if (action.max_daily_budget != null) {
+      newBudgetCents = Math.min(newBudgetCents, Math.round(Number(action.max_daily_budget)))
     }
-
-    // 第14行：更新预算（保留两位小数）
-    await this.api.updateAdsetBudget(adsetId, Math.round(newBudget * 100) / 100)
+    await this.api.updateAdsetBudget(adsetId, newBudgetCents)
   }
 }
 
@@ -1758,63 +2072,46 @@ class RuleEngine {
 // 注意：这些路由只在 app 对象存在时注册（避免测试时的循环依赖问题）
 if (app) {
 // 获取广告账户列表（按登录用户隔离）
+// 优化：默认从数据库读取，避免频繁调用 FB API 导致限流
+// 支持 ?force=1 参数，管理员可强制从 FB 刷新
 app.get('/api/accounts', requireAuth, requireActive, async (req, res) => {
   const startTime = Date.now()
   try {
-    console.log('')
-    console.log('='.repeat(50))
-    console.log('📥 收到请求: GET /api/accounts')
-    console.log('👤 当前用户:', req.user.username, '| 角色:', req.user.role, '| 负责人:', req.user.owner_name || '无')
-    console.log('⏰ 时间:', new Date().toLocaleString('zh-CN'))
+    logger.info('')
+    logger.info('='.repeat(50))
+    logger.info('📥 收到请求: GET /api/accounts')
+    logger.info('👤 当前用户:', req.user.username, '| 角色:', req.user.role, '| 负责人:', req.user.owner_name || '无')
+    logger.info('⏰ 时间:', new Date().toLocaleString('zh-CN'))
     
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) {
-      console.error('❌ FACEBOOK_ACCESS_TOKEN 未配置')
-      return res.status(401).json({ error: 'Facebook访问令牌未配置，请检查.env文件' })
-    }
-
-    console.log('✅ Token已配置')
-    console.log('🔑 Token前10位:', token.substring(0, 10) + '...')
-    console.log('🔑 Token长度:', token.length)
+    // 检查是否强制从 FB 刷新（仅管理员可用）
+    const forceRefresh = req.query.force === '1' || req.query.force === 'true'
     
-    console.log('🔍 开始获取广告账户列表...')
-    const api = new FacebookMarketingAPI(token)
-    const allAccounts = await api.getAdAccounts()
-
-    let filteredAccounts = allAccounts
-    if (req.user.role === 'admin') {
-      // 管理员看全部
-      filteredAccounts = allAccounts
-    } else if (req.user.owner_id) {
-      const [rows] = await pool.execute(
-        `SELECT fb_account_id FROM account_mappings WHERE owner_id = ? AND is_active = 1`,
-        [req.user.owner_id]
-      )
-
-      const normalize = (id) => String(id || '').toLowerCase().trim().replace(/^act_/, '')
-      const allowed = new Set(rows.map(r => normalize(r.fb_account_id)))
-      filteredAccounts = allAccounts.filter(acc => allowed.has(normalize(acc.id || acc.account_id)))
-    } else {
-      filteredAccounts = []
+    if (forceRefresh && req.user.role === 'admin') {
+      logger.info('🔄 管理员触发强制刷新，从 Facebook API 同步账户...')
+      await syncAccountsFromFacebook()
     }
+    
+    // 从数据库读取账户列表（不调用 FB API）
+    logger.info('🔍 从数据库获取账户列表...')
+    const accounts = await getAccountsFromDatabase(req.user)
     
     const duration = Date.now() - startTime
-    console.log(`✅ 成功返回 ${filteredAccounts.length} 个账户 (耗时: ${duration}ms)`)
-    console.log('📋 账户列表:')
-    filteredAccounts.forEach((acc, index) => {
-      console.log(`   ${index + 1}. ${acc.name} (${acc.id})`)
+    logger.info(`✅ 成功返回 ${accounts.length} 个账户 (耗时: ${duration}ms)`)
+    logger.info('📋 账户列表:')
+    accounts.forEach((acc, index) => {
+      logger.info(`   ${index + 1}. ${acc.name} (${acc.id})`)
     })
-    console.log('='.repeat(50))
-    console.log('')
+    logger.info('='.repeat(50))
+    logger.info('')
     
-    res.json({ accounts: filteredAccounts })
+    res.json({ accounts })
   } catch (error) {
     const duration = Date.now() - startTime
-    console.error('❌ 获取账户列表失败 (耗时: ' + duration + 'ms)')
-    console.error('❌ 错误消息:', error.message)
-    console.error('❌ 错误堆栈:', error.stack)
-    console.log('='.repeat(50))
-    console.log('')
+    logger.error('❌ 获取账户列表失败 (耗时: ' + duration + 'ms)')
+    logger.error('❌ 错误消息:', error.message)
+    logger.error('❌ 错误堆栈:', error.stack)
+    logger.info('='.repeat(50))
+    logger.info('')
     
     res.status(500).json({ 
       error: error.message,
@@ -1823,160 +2120,641 @@ app.get('/api/accounts', requireAuth, requireActive, async (req, res) => {
   }
 })
 
-// 获取广告列表
+// 解析目标ID为可展示信息（用于回显/失效提示）
+// GET /api/structure/resolve?ids=1,2,3
+// 【2.2 resolve 回显查库】优先从 structure_campaigns / structure_adsets / structure_ads 三表查，DB miss 返回 missing，不穿透 FB
+// 注意：静态路由必须放在动态路由 /:level 前面，否则会被 /:level 捕获
+app.get('/api/structure/resolve', requireAuth, requireActive, async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '').trim()
+    if (!ids) return res.json({ items: [] })
+
+    const idList = ids.split(',').map(s => s.trim()).filter(Boolean)
+    const items = await resolveStructureByIds(idList)
+    res.json({ items })
+  } catch (e) {
+    logger.error('解析对象ID失败:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// 强制同步该账户广告结构到 structure_ads（顺序2 阶段 2.4）
+// POST /api/sync/structure  body: { account_id: "act_xxx" } 或 query: account_id=act_xxx
+app.post('/api/sync/structure', requireAuth, requireActive, async (req, res) => {
+  try {
+    const accountId = (req.body?.account_id || req.query?.account_id || '').trim()
+    if (!accountId) return res.status(400).json({ error: '缺少 account_id（body 或 query）' })
+    if (!(await assertAccountAccess(req, res, accountId))) return
+
+    const token = process.env.FACEBOOK_ACCESS_TOKEN
+    if (!token) return res.status(401).json({ error: 'Facebook访问令牌未配置' })
+
+    const api = new FacebookMarketingAPI(token)
+    const result = await syncAccountStructureAds(accountId, api)
+
+    if (result.ok) {
+      return res.json({
+        ok: true,
+        account_id: accountId,
+        synced_count: result.synced_count,
+        synced_campaigns: result.synced_campaigns,
+        synced_adsets: result.synced_adsets,
+        duration_ms: result.duration_ms
+      })
+    }
+    if (result.reason === 'cooldown') {
+      return res.status(429).json({
+        ok: false,
+        reason: 'cooldown',
+        retry_after_sec: result.retry_after_sec
+      })
+    }
+    if (result.reason === 'quota_high') {
+      return res.status(429).json({
+        ok: false,
+        reason: 'quota_high',
+        retry_after_sec: result.retry_after_sec
+      })
+    }
+    if (result.reason === 'lock_busy') {
+      return res.status(409).json({ ok: false, reason: 'lock_busy' })
+    }
+    return res.status(500).json({ ok: false, error: 'unknown' })
+  } catch (e) {
+    const msg = e?.message ? String(e.message) : String(e)
+    // FB 常见“用户级限流”会以 400 返回：User request limit reached
+    if (/user request limit reached/i.test(msg) || /rate limit/i.test(msg) || /rate limiting/i.test(msg)) {
+      logger.warn(`同步结构触发 FB 限流: ${msg}`)
+      return res.status(429).json({
+        ok: false,
+        reason: 'fb_rate_limited',
+        retry_after_sec: 3600,
+        error: msg
+      })
+    }
+    logger.error('同步结构失败:', e)
+    res.status(500).json({ error: msg })
+  }
+})
+
+// 统一结构入口（方案 B：服务层聚合）— 须在 :level 之前注册，否则 /structure/objects 会被 :level 匹配成 level=objects 导致 400
+// GET /api/structure/objects?account_id=act_xxx&type=campaign|adset|ad&q=&limit=&after=&include_paused=
+app.get('/api/structure/objects', requireAuth, requireActive, async (req, res) => {
+  try {
+    const account_id = (req.query.account_id || '').trim()
+    const type = (req.query.type || '').toLowerCase()
+    const after = req.query.after != null ? String(req.query.after) : null
+    const q = req.query.q != null ? String(req.query.q) : ''
+    const rawLimit = Number(req.query.limit || 50)
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
+    const include_paused = req.query.include_paused
+
+    if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数' })
+    if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
+    if (!(await assertAccountAccess(req, res, account_id))) return
+
+    const result = await listStructureObjectsFromDb(account_id, { type, q, limit, after, include_paused })
+    const sourceTable = result._source || (type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads')
+    logger.info('[2.2] GET /api/structure/objects', { account_id, type, count: result.items.length, has_next: !!result.paging?.after })
+    return res.json({
+      items: result.items,
+      paging: result.paging ? { after: result.paging.after } : {},
+      meta: { type, limit, q: q ? String(q).trim() : null, source: sourceTable }
+    })
+  } catch (e) {
+    logger.error('统一结构列表失败:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// 多账户结构列表（规则页多选账户用）— 须在 :level 之前注册
+// GET /api/structure/objects/multi?account_ids=act_1,act_2&type=ad|adset|campaign&q=&limit=50&after=&include_paused=
+app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, res) => {
+  try {
+    const accountIdsRaw = (req.query.account_ids || '').trim()
+    const type = (req.query.type || '').toLowerCase()
+    const q = req.query.q != null ? String(req.query.q) : ''
+    const rawLimit = Number(req.query.limit || 50)
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
+    const include_paused = req.query.include_paused
+
+    if (!accountIdsRaw) return res.status(400).json({ error: '缺少 account_ids 参数' })
+    if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
+
+    const requestedIds = [...new Set(accountIdsRaw.split(',').map(s => s.trim()).filter(Boolean))]
+    if (requestedIds.length === 0) return res.status(400).json({ error: 'account_ids 至少包含一个有效账户 ID' })
+
+    const allowedIds = []
+    for (const id of requestedIds) {
+      if (await hasAccountAccess(req, id)) allowedIds.push(id)
+    }
+    if (allowedIds.length === 0) {
+      return res.status(403).json({ error: '无权访问所请求的任一广告账户', code: 'ACCOUNT_FORBIDDEN' })
+    }
+
+    // 简化分页：每账户各取一页，合并后截断；after 暂不实现
+    const perAccountLimit = Math.max(1, Math.ceil(limit / allowedIds.length))
+    const allItems = []
+    const seen = new Set()
+    for (const accountId of allowedIds) {
+      const result = await listStructureObjectsFromDb(accountId, { type, q, limit: perAccountLimit, after: null, include_paused })
+      for (const item of result.items) {
+        const key = `${item.account_id}:${item.id}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        allItems.push(item)
+      }
+    }
+    const items = allItems.slice(0, limit)
+    const hasMore = allItems.length > limit
+    const sourceTable = type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads'
+    logger.info('[2.2] GET /api/structure/objects/multi', { requested: requestedIds.length, allowed: allowedIds.length, type, count: items.length })
+    return res.json({
+      items,
+      paging: { after: undefined, has_more: hasMore },
+      meta: {
+        type,
+        source: sourceTable,
+        accounts: allowedIds.length,
+        requested_accounts: requestedIds.length,
+        allowed_accounts: allowedIds.length,
+        per_account_limit: perAccountLimit,
+        has_more: hasMore
+      }
+    })
+  } catch (e) {
+    logger.error('多账户结构列表失败:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// 结构化对象列表（替代 /api/insights 用于"选择列表"）
+// GET /api/structure/:level?account_id=act_xxx&limit=50&after=...&q=keyword&include_paused=1
+// level: campaigns | adsets | ads
+// 【2.2】三层均查库，0 FB 列表调用
+app.get('/api/structure/:level', requireAuth, requireActive, async (req, res) => {
+  try {
+    const { level } = req.params
+    const account_id = (req.query.account_id || '').trim()
+    const after = req.query.after != null ? String(req.query.after) : null
+    const q = req.query.q != null ? String(req.query.q) : ''
+    const rawLimit = Number(req.query.limit || 50)
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
+    if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数' })
+    if (!(await assertAccountAccess(req, res, account_id))) return
+
+    const edgeMap = { campaigns: 'campaigns', adsets: 'adsets', ads: 'ads' }
+    const edge = edgeMap[String(level || '').toLowerCase()]
+    if (!edge) return res.status(400).json({ error: 'level 参数无效（campaigns/adsets/ads）' })
+
+    const include_paused = req.query.include_paused
+    const opts = { q, limit, after, include_paused }
+
+    if (edge === 'ads') {
+      const result = await listStructureAdsFromDb(account_id, opts)
+      logger.info('[2.2] GET /api/structure/ads from structure_ads only, no FB request', {
+        account_id,
+        q: q || null,
+        limit,
+        count: result.items.length,
+        has_next: !!result.paging.after
+      })
+      return res.json({
+        items: result.items,
+        paging: result.paging,
+        meta: { level: 'ads', limit, q: q ? String(q).trim() : null, source: 'structure_ads' }
+      })
+    }
+
+    if (edge === 'campaigns') {
+      const result = await listStructureCampaignsFromDb(account_id, opts)
+      logger.info('[2.2] GET /api/structure/campaigns from structure_campaigns only, no FB request', {
+        account_id,
+        q: q || null,
+        limit,
+        count: result.items.length,
+        has_next: !!result.paging.after
+      })
+      return res.json({
+        items: result.items,
+        paging: result.paging,
+        meta: { level: 'campaigns', limit, q: q ? String(q).trim() : null, source: 'structure_campaigns' }
+      })
+    }
+
+    if (edge === 'adsets') {
+      const result = await listStructureAdsetsFromDb(account_id, opts)
+      logger.info('[2.2] GET /api/structure/adsets from structure_adsets only, no FB request', {
+        account_id,
+        q: q || null,
+        limit,
+        count: result.items.length,
+        has_next: !!result.paging.after
+      })
+      return res.json({
+        items: result.items,
+        paging: result.paging,
+        meta: { level: 'adsets', limit, q: q ? String(q).trim() : null, source: 'structure_adsets' }
+      })
+    }
+  } catch (e) {
+    logger.error('获取结构化对象列表失败:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// 获取广告列表 - 从数据库快照表读取（高性能，不消耗 API 配额）
+// 【重要修改】：原来直接调用 Facebook API，现在改为从 ad_snapshots 表读取
+// 好处：毫秒级响应、不触发限流、多人同时使用无压力
 app.get('/api/ads', requireAuth, requireActive, async (req, res) => {
+  const startTime = Date.now()
   try {
     const { account_id } = req.query
     if (!account_id) {
       return res.status(400).json({ error: '缺少account_id参数' })
     }
+    if (!(await assertAccountAccess(req, res, account_id))) return
 
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) {
-      return res.status(401).json({ error: 'Facebook访问令牌未配置' })
-    }
+    // 从 ad_snapshots 表读取广告列表（毫秒级响应）
+    const [rows] = await pool.execute(`
+      SELECT 
+        ad_id as id,
+        ad_name as name,
+        status,
+        status as effective_status,
+        ad_set_id as adset_id,
+        synced_at
+      FROM ad_snapshots
+      WHERE account_id = ?
+      ORDER BY ad_name
+    `, [account_id])
 
-    const api = new FacebookMarketingAPI(token)
-    const ads = await api.getAds(account_id)
-    res.json({ ads })
+    // 转换为前端期望的格式
+    const ads = rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      status: row.status,
+      effective_status: row.effective_status,
+      adset_id: row.adset_id
+    }))
+
+    const duration = Date.now() - startTime
+    logger.info(`✅ /api/ads 从数据库读取 ${ads.length} 个广告 (耗时: ${duration}ms)`)
+
+    res.json({ 
+      ads, 
+      meta: { 
+        source: 'database',
+        synced_at: rows[0]?.synced_at || null,
+        count: ads.length,
+        duration_ms: duration
+      }
+    })
   } catch (error) {
-    console.error('获取广告列表失败:', error)
+    logger.error('获取广告列表失败:', error)
     res.status(500).json({ error: error.message })
   }
 })
 
-// 获取广告洞察数据
+// 获取广告洞察数据 - 从数据库快照表读取（高性能，不消耗 API 配额）
+// 【重要修改】：原来直接调用 Facebook API，现在改为从数据库读取
+// - today/默认：从 ad_snapshots 表读取
+// - 历史日期范围：从 daily_stats 表聚合
 app.get('/api/insights', requireAuth, requireActive, async (req, res) => {
+  const startTime = Date.now()
   try {
-    const { account_id, since, until, preset, use_account_attribution_setting, action_attribution_windows } = req.query
+    const { account_id, since, until, preset } = req.query
     if (!account_id) {
       return res.status(400).json({ error: '缺少account_id参数' })
     }
+    if (!(await assertAccountAccess(req, res, account_id))) return
 
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) {
-      return res.status(401).json({ error: 'Facebook访问令牌未配置' })
+    // 解析时间范围；preset 需转成 since/until（用账户时区），否则 yesterday 等会误走 today
+    const timezoneName = await getAccountTimezone(account_id)
+    const presetVal = preset || 'today'
+    const presetMap = { last_7d: 'last_7_days', last_30d: 'last_30_days' }
+    const timeWindowForCalc = presetMap[presetVal] || presetVal
+
+    let timeRange = {}
+    if (since && until) {
+      timeRange = { since, until }
+    } else if (presetVal === 'today') {
+      timeRange = { preset: 'today' }
+    } else {
+      // preset 非 today：用 calculateTimeWindow 算出 since/until（账户时区自然日）
+      try {
+        const { start, end } = calculateTimeWindow(
+          presetVal === 'this_month' ? 'today' : timeWindowForCalc,
+          timezoneName
+        )
+        if (presetVal === 'this_month') {
+          const now = start  // start 已是 today 的 start
+          const firstOfMonth = now.startOf('month')
+          timeRange = { since: firstOfMonth.toFormat('yyyy-MM-dd'), until: now.toFormat('yyyy-MM-dd') }
+        } else {
+          timeRange = { since: start.toFormat('yyyy-MM-dd'), until: end.toFormat('yyyy-MM-dd') }
+        }
+      } catch (e) {
+        return res.status(400).json({ error: `时间范围解析失败: ${e.message}` })
+      }
     }
 
-    const api = new FacebookMarketingAPI(token)
-    const timeRange = (since && until) ? { since, until } : (preset ? { preset } : null)
-    const opts = {
-      // 你已移除前端“对齐 Ads Manager”开关：这里默认开启对齐（未显式传参时按 true）
-      useAccountAttributionSetting: (use_account_attribution_setting == null || String(use_account_attribution_setting).trim() === '')
-        ? true
-        : String(use_account_attribution_setting || '').toLowerCase() === 'true',
-      actionAttributionWindows: typeof action_attribution_windows === 'string' && action_attribution_windows.trim()
-        ? action_attribution_windows.split(',').map(s => s.trim()).filter(Boolean)
-        : undefined
+    const isToday = presetVal === 'today' || (timeRange.preset === 'today')
+    const todayDateStr = isToday ? calculateTimeWindow('today', timezoneName).start.toFormat('yyyy-MM-dd') : null
+
+    let insights = []
+    let dataSource = 'ad_snapshots'
+
+    if (isToday) {
+      // 今日数据：从 ad_snapshots 表读取；按 data_date 过滤（避免多天快照混入）
+      const [rows] = await pool.execute(`
+        SELECT 
+          ad_id,
+          ad_name,
+          spend,
+          purchases,
+          link_clicks,
+          unique_link_clicks,
+          purchase_value,
+          add_to_cart_count,
+          initiate_checkout_count,
+          add_payment_info_count,
+          actions,
+          synced_at
+        FROM ad_snapshots
+        WHERE account_id = ? AND data_date = ?
+      `, [account_id, todayDateStr])
+      
+      insights = rows.map(row => {
+        const spend = parseFloat(row.spend || 0)
+        const linkClicks = parseInt(row.link_clicks || 0)
+        const uniqueLinkClicks = parseInt(row.unique_link_clicks || 0)
+        const purchases = parseInt(row.purchases || 0)
+        const purchaseValue = parseFloat(row.purchase_value || 0)
+        const addToCart = parseInt(row.add_to_cart_count || 0)
+        const initCheckout = parseInt(row.initiate_checkout_count || 0)
+        const addPayment = parseInt(row.add_payment_info_count || 0)
+        return {
+          ad_id: row.ad_id,
+          ad_name: row.ad_name,
+          spend,
+          cpc: linkClicks > 0 ? spend / linkClicks : 0,
+          ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : 0,
+          purchase_roas: spend > 0 ? purchaseValue / spend : 0,
+          cpa: purchases > 0 ? spend / purchases : 0,
+          purchases,
+          inline_link_clicks: linkClicks,
+          unique_link_clicks: uniqueLinkClicks,
+          cp_atc: addToCart > 0 ? spend / addToCart : 0,
+          cp_ic: initCheckout > 0 ? spend / initCheckout : 0,
+          cp_api: addPayment > 0 ? spend / addPayment : 0,
+          add_to_cart: addToCart,
+          initiate_checkout: initCheckout,
+          add_payment_info: addPayment,
+          actions: row.actions
+        }
+      })
+    } else {
+      // 历史数据：从 daily_stats 表聚合；按 SUM 分子/分母 计算（避免 AVG 口径飘）
+      dataSource = 'daily_stats'
+      const [rows] = await pool.execute(`
+        SELECT 
+          ad_id,
+          MAX(ad_name) as ad_name,
+          SUM(spend) as spend,
+          SUM(purchase_value) as purchase_value,
+          SUM(purchases) as purchases,
+          SUM(link_clicks) as link_clicks,
+          SUM(unique_link_clicks) as unique_link_clicks,
+          MAX(updated_at) as synced_at
+        FROM daily_stats
+        WHERE account_id = ?
+          AND date BETWEEN ? AND ?
+        GROUP BY ad_id
+      `, [account_id, timeRange.since, timeRange.until])
+      
+      insights = rows.map(row => {
+        const spend = parseFloat(row.spend || 0)
+        const linkClicks = parseInt(row.link_clicks || 0)
+        const uniqueLinkClicks = parseInt(row.unique_link_clicks || 0)
+        const purchases = parseInt(row.purchases || 0)
+        const purchaseValue = parseFloat(row.purchase_value || 0)
+        return {
+          ad_id: row.ad_id,
+          ad_name: row.ad_name,
+          spend,
+          cpc: linkClicks > 0 ? spend / linkClicks : 0,
+          ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : 0,
+          purchase_roas: spend > 0 ? purchaseValue / spend : 0,
+          cpa: purchases > 0 ? spend / purchases : 0,
+          purchases,
+          inline_link_clicks: linkClicks,
+          unique_link_clicks: uniqueLinkClicks
+        }
+      })
     }
-    // 兼容旧版：如果 FacebookMarketingAPI.getAdInsights 还不支持 opts，也不会报错（多余参数会被忽略）
-    const insights = await api.getAdInsights(account_id, timeRange, opts)
-    res.json({ insights, meta: { timeRange: timeRange || { preset: 'today' }, attribution: opts } })
+
+    const duration = Date.now() - startTime
+    logger.info(`✅ /api/insights 从 ${dataSource} 读取 ${insights.length} 条数据 (耗时: ${duration}ms)`)
+
+    res.json({ 
+      insights, 
+      meta: { 
+        source: dataSource,
+        timeRange: timeRange,
+        count: insights.length,
+        duration_ms: duration
+      }
+    })
   } catch (error) {
-    console.error('获取洞察数据失败:', error)
+    logger.error('获取洞察数据失败:', error)
     res.status(500).json({ error: error.message })
   }
 })
 
-// ROI 深度指标接口（购买/加购/结账/支付/独立点击）- 支持 sync/async
+// ROI 深度指标接口（购买/加购/结账/支付/独立点击）- 从数据库读取
+// 【重要修改】：改为从 ad_snapshots / daily_stats 读取，不消耗 API 额度
+// 好处：毫秒级响应、不触发限流、多人同时使用无压力
 const ROI_JOB_TTL_MS = 5 * 60 * 1000
 const roiJobCache = new Map() // key -> { createdAt, resultByAdId?, reportRunId? }
 
 app.get('/api/roi', requireAuth, requireActive, async (req, res) => {
+  const startTime = Date.now()
   try {
-    const { account_id, preset, since, until, force, level, use_account_attribution_setting, action_attribution_windows } = req.query
+    const { account_id, preset, since, until, level } = req.query
     if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数', code: 'MISSING_PARAM' })
+    if (!(await assertAccountAccess(req, res, account_id))) return
 
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) return res.status(401).json({ error: 'Facebook访问令牌未配置', code: 'TOKEN_MISSING' })
+    // 解析时间范围（与 /api/insights 一致，preset 转 since/until）
+    const timezoneName = await getAccountTimezone(account_id)
+    const presetVal = preset || 'today'
+    const presetMap = { last_7d: 'last_7_days', last_30d: 'last_30_days' }
+    const timeWindowForCalc = presetMap[presetVal] || presetVal
 
-    const api = new FacebookMarketingAPI(token)
-    const timeRange = (since && until) ? { since, until } : (preset ? { preset } : { preset: 'today' })
-    // 层级参数：ad / adset / campaign（默认 ad）
+    let timeRange = {}
+    if (since && until) {
+      timeRange = { since, until }
+    } else if (presetVal === 'today') {
+      timeRange = { preset: 'today' }
+    } else {
+      try {
+        const { start, end } = calculateTimeWindow(
+          presetVal === 'this_month' ? 'today' : timeWindowForCalc,
+          timezoneName
+        )
+        if (presetVal === 'this_month') {
+          const now = start
+          timeRange = { since: now.startOf('month').toFormat('yyyy-MM-dd'), until: now.toFormat('yyyy-MM-dd') }
+        } else {
+          timeRange = { since: start.toFormat('yyyy-MM-dd'), until: end.toFormat('yyyy-MM-dd') }
+        }
+      } catch (e) {
+        return res.status(400).json({ error: `时间范围解析失败: ${e.message}` })
+      }
+    }
+
+    const isToday = presetVal === 'today' || timeRange.preset === 'today'
+    const todayDateStr = isToday ? calculateTimeWindow('today', timezoneName).start.toFormat('yyyy-MM-dd') : null
+
     const validLevels = ['ad', 'adset', 'campaign']
     const requestLevel = validLevels.includes(level) ? level : 'ad'
-    const opts = {
-      level: requestLevel,
-      // 你已移除前端“对齐 Ads Manager”开关：这里默认开启对齐（未显式传参时按 true）
-      useAccountAttributionSetting: (use_account_attribution_setting == null || String(use_account_attribution_setting).trim() === '')
-        ? true
-        : String(use_account_attribution_setting || '').toLowerCase() === 'true',
-      actionAttributionWindows: typeof action_attribution_windows === 'string' && action_attribution_windows.trim()
-        ? action_attribution_windows.split(',').map(s => s.trim()).filter(Boolean)
-        : undefined
-    }
+    let rows = []
+    let dataSource = 'ad_snapshots'
 
-    const forceLatest = String(force || '') === '1'
-    const key = `roi|${String(account_id)}|${requestLevel}|${timeRange.preset || ''}|${timeRange.since || ''}|${timeRange.until || ''}|${opts.useAccountAttributionSetting ? 'acct' : ''}|${(opts.actionAttributionWindows || []).join('.')}`
-    const now = Date.now()
-    const cached = roiJobCache.get(key)
-
-    if (!forceLatest && cached && (now - cached.createdAt) < ROI_JOB_TTL_MS) {
-      if (cached.resultByAdId) return res.json({ roiByAdId: cached.resultByAdId, cached: true, mode: 'cache' })
-      if (cached.reportRunId) return res.status(202).json({ report_run_id: cached.reportRunId, status: 'RUNNING', percent: 0, cached: true, mode: 'async' })
-    }
-
-    // 先尝试同步
-    try {
-      const rows = await api.getAdInsightsWithROI(String(account_id), timeRange, opts)
-      const roiById = {}
-      const idKey = requestLevel === 'adset' ? 'adset_id' : (requestLevel === 'campaign' ? 'campaign_id' : 'ad_id')
-      for (const r of rows) {
-        const id = String(r[idKey] || '')
-        if (id) roiById[id] = r
+    const computeMetrics = (r) => {
+      const spend = parseFloat(r.spend || 0)
+      const linkClicks = parseInt(r.link_clicks || r.inline_link_clicks || 0)
+      const uniqueLinkClicks = parseInt(r.unique_link_clicks || r.unique_inline_link_clicks || 0)
+      const purchases = parseInt(r.purchases || 0)
+      const purchaseValue = parseFloat(r.purchase_value || 0)
+      const addToCart = parseInt(r.add_to_cart_count || r.add_to_cart || 0)
+      const initCheckout = parseInt(r.initiate_checkout_count || r.initiate_checkout || 0)
+      const addPayment = parseInt(r.add_payment_info_count || r.add_payment_info || 0)
+      return {
+        ...r,
+        cpa: purchases > 0 ? spend / purchases : 0,
+        ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : 0,
+        cp_atc: addToCart > 0 ? spend / addToCart : 0,
+        cp_ic: initCheckout > 0 ? spend / initCheckout : 0,
+        cp_api: addPayment > 0 ? spend / addPayment : 0,
+        purchase_roas: spend > 0 ? purchaseValue / spend : 0,
+        inline_link_clicks: linkClicks,
+        unique_inline_link_clicks: uniqueLinkClicks,
+        unique_link_clicks: uniqueLinkClicks,
+        add_to_cart: addToCart,
+        initiate_checkout: initCheckout,
+        add_payment_info: addPayment
       }
-      roiJobCache.set(key, { createdAt: now, resultByAdId: roiById, reportRunId: null })
-      return res.json({ roiByAdId: roiById, mode: 'sync' })
-    } catch (e) {
-      // 同步失败：降级异步
-      const runId = await api.startRoiAsyncJob(String(account_id), timeRange, opts)
-      roiJobCache.set(key, { createdAt: now, resultByAdId: null, reportRunId: runId })
-      return res.status(202).json({ report_run_id: runId, status: 'RUNNING', percent: 0, mode: 'async' })
     }
+
+    if (isToday) {
+      if (requestLevel === 'ad') {
+        const [result] = await pool.execute(`
+          SELECT ad_id, ad_name, ad_set_id as adset_id, spend, purchases,
+            link_clicks, unique_link_clicks, purchase_value,
+            add_to_cart_count, initiate_checkout_count, add_payment_info_count,
+            synced_at
+          FROM ad_snapshots
+          WHERE account_id = ? AND data_date = ?
+        `, [account_id, todayDateStr])
+        rows = result.map(computeMetrics)
+      } else {
+        const groupField = requestLevel === 'adset' ? 'ad_set_id' : 'account_id'
+        const idField = requestLevel === 'adset' ? 'adset_id' : 'campaign_id'
+        const [result] = await pool.execute(`
+          SELECT ${groupField} as ${idField},
+            SUM(spend) as spend, SUM(purchases) as purchases,
+            SUM(link_clicks) as link_clicks, SUM(unique_link_clicks) as unique_link_clicks,
+            SUM(purchase_value) as purchase_value,
+            SUM(add_to_cart_count) as add_to_cart_count,
+            SUM(initiate_checkout_count) as initiate_checkout_count,
+            SUM(add_payment_info_count) as add_payment_info_count,
+            MAX(synced_at) as synced_at
+          FROM ad_snapshots
+          WHERE account_id = ? AND data_date = ?
+          GROUP BY ${groupField}
+        `, [account_id, todayDateStr])
+        rows = result.map(computeMetrics)
+      }
+    } else {
+      dataSource = 'daily_stats'
+      if (requestLevel === 'ad') {
+        const [result] = await pool.execute(`
+          SELECT ad_id, MAX(ad_name) as ad_name, ad_set_id as adset_id,
+            SUM(spend) as spend, SUM(purchases) as purchases,
+            SUM(link_clicks) as link_clicks, SUM(unique_link_clicks) as unique_link_clicks,
+            SUM(purchase_value) as purchase_value,
+            SUM(add_to_cart_count) as add_to_cart_count,
+            SUM(initiate_checkout_count) as initiate_checkout_count,
+            SUM(add_payment_info_count) as add_payment_info_count,
+            MAX(updated_at) as synced_at
+          FROM daily_stats
+          WHERE account_id = ? AND date BETWEEN ? AND ?
+          GROUP BY ad_id, ad_set_id
+        `, [account_id, timeRange.since, timeRange.until])
+        rows = result.map(computeMetrics)
+      } else {
+        const groupField = requestLevel === 'adset' ? 'ad_set_id' : 'account_id'
+        const idField = requestLevel === 'adset' ? 'adset_id' : 'campaign_id'
+        const [result] = await pool.execute(`
+          SELECT ${groupField} as ${idField},
+            SUM(spend) as spend, SUM(purchases) as purchases,
+            SUM(link_clicks) as link_clicks, SUM(unique_link_clicks) as unique_link_clicks,
+            SUM(purchase_value) as purchase_value,
+            SUM(add_to_cart_count) as add_to_cart_count,
+            SUM(initiate_checkout_count) as initiate_checkout_count,
+            SUM(add_payment_info_count) as add_payment_info_count,
+            MAX(updated_at) as synced_at
+          FROM daily_stats
+          WHERE account_id = ? AND date BETWEEN ? AND ?
+          GROUP BY ${groupField}
+        `, [account_id, timeRange.since, timeRange.until])
+        rows = result.map(computeMetrics)
+      }
+    }
+
+    // 转换为前端期望的格式（roiByAdId）
+    const roiById = {}
+    const idKey = requestLevel === 'adset' ? 'adset_id' : (requestLevel === 'campaign' ? 'campaign_id' : 'ad_id')
+    for (const r of rows) {
+      const id = String(r[idKey] || '')
+      if (id) roiById[id] = r
+    }
+
+    const duration = Date.now() - startTime
+    logger.info(`✅ /api/roi 从 ${dataSource} 读取 ${rows.length} 条数据 (耗时: ${duration}ms)`)
+
+    return res.json({ 
+      roiByAdId: roiById, 
+      mode: 'database',
+      meta: {
+        source: dataSource,
+        level: requestLevel,
+        count: rows.length,
+        duration_ms: duration
+      }
+    })
   } catch (e) {
-    console.error('获取 ROI 数据失败:', e)
+    logger.error('获取 ROI 数据失败:', e)
     res.status(500).json({ error: e.message, code: 'ROI_ERROR' })
   }
 })
 
+// /api/roi/result - 【已废弃】
+// 原因：/api/roi 已改为从数据库读取，不再使用异步报告模式
+// 保留此接口仅为兼容性
 app.get('/api/roi/result', requireAuth, requireActive, async (req, res) => {
-  try {
-    const { report_run_id } = req.query
-    if (!report_run_id) return res.status(400).json({ error: '缺少 report_run_id 参数', code: 'MISSING_PARAM' })
-
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) return res.status(401).json({ error: 'Facebook访问令牌未配置', code: 'TOKEN_MISSING' })
-
-    const api = new FacebookMarketingAPI(token)
-    const st = await api.getReportRunStatus(String(report_run_id))
-    // FB 这里的 async_status 有时是 "Job Completed" / "Job Running" 等文本，
-    // 即使 percent=100，也可能短暂未就绪；统一用 “包含 completed” 判定更稳。
-    const statusText = String(st.status || '')
-    const isCompleted = statusText.toLowerCase().includes('completed')
-    if (st.percent < 100 || !isCompleted) {
-      return res.status(202).json({ report_run_id, status: st.status, percent: st.percent })
+  logger.warn('⚠️ 废弃接口被调用: GET /api/roi/result')
+  logger.warn('   /api/roi 已改为从数据库读取，不再需要异步轮询')
+  
+  return res.status(410).json({ 
+    error: '此接口已废弃，/api/roi 已改为从数据库直接读取数据',
+    code: 'DEPRECATED_ENDPOINT',
+    migration: {
+      reason: '/api/roi 现在从数据库读取数据，响应时间为毫秒级，不再需要异步轮询',
+      new_behavior: '直接调用 /api/roi 即可获取数据，无需等待 report_run_id'
     }
-
-    try {
-      // 从请求参数获取 level（如果 report_run_id 对应的任务有记录 level）
-      const { level: reportLevel } = req.query
-      const validLevels = ['ad', 'adset', 'campaign']
-      const requestLevel = validLevels.includes(reportLevel) ? reportLevel : 'ad'
-      const rows = await api.getReportRunInsightsAll(String(report_run_id))
-      const roiByAdId = api.extractRoiFromInsights(rows, requestLevel)
-      return res.json({ report_run_id, status: 'COMPLETED', percent: 100, roiByAdId })
-    } catch (e) {
-      // 常见：报告还没完全可读，Graph 会返回 “not completed yet” 或类似信息
-      const msg = String(e?.message || '')
-      if (msg.toLowerCase().includes('not completed') || msg.toLowerCase().includes('not completed yet')) {
-        return res.status(202).json({ report_run_id, status: st.status, percent: st.percent })
-      }
-      throw e
-    }
-  } catch (e) {
-    console.error('获取 ROI 异步结果失败:', e)
-    res.status(500).json({ error: e.message, code: 'ROI_RESULT_ERROR' })
-  }
+  })
 })
 
 // 优先级2任务：查询离线数据（从数据库查询，返回 meta 字段）
@@ -1988,6 +2766,7 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
     if (!account_id) {
       return res.status(400).json({ error: '缺少 account_id 参数' })
     }
+    if (!(await assertAccountAccess(req, res, account_id))) return
     
     // 解析 ad_ids（支持逗号分隔的字符串或单个字符串）
     let adIds = null
@@ -2022,7 +2801,7 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
       try {
         dataTimezoneUsed = await getDataTimezone(account_id, adIds, accountTimezone)
       } catch (error) {
-        console.warn(`⚠️  获取数据时区失败，使用账户时区 ${accountTimezone}:`, error.message)
+        logger.warn(`⚠️  获取数据时区失败，使用账户时区 ${accountTimezone}:`, error.message)
         dataTimezoneUsed = accountTimezone
       }
     }
@@ -2063,60 +2842,33 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
     
     res.json({ data, meta })
   } catch (error) {
-    console.error('查询规则数据失败:', error)
+    logger.error('查询规则数据失败:', error)
     res.status(500).json({ error: error.message })
   }
 })
 
-// 执行自动规则
+// 执行自动规则 - 【已废弃】
+// 原因：这个接口直接调用 Facebook API 获取数据，会触发限流
+// 替代方案：使用 /api/rules/execute-all（从数据库读取数据，不消耗 API 额度）
+// 保留此接口仅为兼容性，返回错误提示使用新接口
 app.post('/api/execute-rules', async (req, res) => {
-  try {
-    const { account_id, rules } = req.body
-    
-    if (!account_id) {
-      return res.status(400).json({ error: '缺少account_id参数' })
+  logger.warn('⚠️ 废弃接口被调用: POST /api/execute-rules')
+  logger.warn('   请使用新接口: POST /api/rules/execute-all')
+  
+  return res.status(410).json({ 
+    error: '此接口已废弃，请使用 POST /api/rules/execute-all',
+    code: 'DEPRECATED_ENDPOINT',
+    migration: {
+      old_endpoint: 'POST /api/execute-rules',
+      new_endpoint: 'POST /api/rules/execute-all',
+      reason: '旧接口直接调用 Facebook API，会触发限流；新接口从数据库读取数据，不消耗 API 额度',
+      benefits: [
+        '毫秒级响应（原来需要 2-5 秒）',
+        '不消耗 Facebook API 额度',
+        '支持多人同时使用'
+      ]
     }
-
-    const token = process.env.FACEBOOK_ACCESS_TOKEN
-    if (!token) {
-      return res.status(401).json({ error: 'Facebook访问令牌未配置' })
-    }
-
-    const api = new FacebookMarketingAPI(token)
-    
-    // 获取当前数据
-    const insights = await api.getAdInsights(account_id)
-    const ads = await api.getAds(account_id)
-
-    // 关键：规则中的 conversions 需要与“购买口径”一致
-    // 这里用 ROI 深度接口拿 purchases，并写回 insight.conversions，避免 /api/insights 过重（actions 超时）
-    try {
-      const roiRows = await api.getAdInsightsWithROI(String(account_id), { preset: 'today' })
-      const purchasesByAdId = new Map(roiRows.map(r => [String(r.ad_id), Number(r.purchases || 0)]))
-      for (const it of insights) {
-        const adId = String(it.ad_id || '')
-        if (!adId) continue
-        it.conversions = purchasesByAdId.get(adId) ?? 0
-      }
-    } catch (e) {
-      console.warn('⚠️ 规则执行：ROI 补齐失败，将使用 conversions=0 继续评估:', e?.message || e)
-      for (const it of insights) it.conversions = it.conversions ?? 0
-    }
-
-    // 执行规则
-    const ruleEngine = new RuleEngine(api)
-    const results = []
-    
-    for (const rule of rules || []) {
-      const executed = await ruleEngine.evaluateRule(rule, insights, ads)
-      results.push({ rule_id: rule.id, executed })
-    }
-
-    res.json({ results })
-  } catch (error) {
-    console.error('执行规则失败:', error)
-    res.status(500).json({ error: error.message })
-  }
+  })
 })
 
 // 健康检查
@@ -2125,8 +2877,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok', 
     message: '服务器运行正常',
     timestamp: new Date().toISOString(),
-    token_configured: !!process.env.FACEBOOK_ACCESS_TOKEN,
-    token_length: process.env.FACEBOOK_ACCESS_TOKEN ? process.env.FACEBOOK_ACCESS_TOKEN.length : 0
+    token_configured: !!process.env.FACEBOOK_ACCESS_TOKEN
   })
 })
 
@@ -2144,50 +2895,39 @@ app.get('/api/test-proxy', async (req, res) => {
       })
     }
     
-    // 解析代理URL
-    let proxyHost = '127.0.0.1'
-    let proxyPort = 10809
-    let socks5Url = proxyUrl
-    
-    if (proxyUrl.startsWith('http://') || proxyUrl.startsWith('https://')) {
-      const urlObj = new URL(proxyUrl)
-      proxyHost = urlObj.hostname
-      proxyPort = parseInt(urlObj.port) || 10809
-      socks5Url = `socks5://${proxyHost}:${proxyPort}`
-    } else if (proxyUrl.includes(':')) {
-      const parts = proxyUrl.split(':')
-      proxyHost = parts[0]
-      proxyPort = parseInt(parts[1]) || 10809
-      socks5Url = `socks5://${proxyHost}:${proxyPort}`
+    // 使用统一解析工具（与 makeRequest / socks5 一致）
+    const info = parseProxyUrl(proxyUrl)
+    if (!info) {
+      return res.json({ success: false, message: '代理解析失败，跳过代理', proxy: null })
     }
+    const proxyHost = info.host
+    const proxyPort = info.port
+    const scheme = info.scheme
+    const raw = info.raw
+    // socks5Url 仅在 SOCKS 代理时返回，HTTP 代理不伪装
+    const socks5Url = isSocksProxy(proxyUrl) ? raw : null
+    const proxyPayload = { scheme, raw, host: proxyHost, port: proxyPort }
+    if (socks5Url != null) proxyPayload.socks5Url = socks5Url
     
     // 测试TCP连接
     return new Promise((resolve) => {
       const socket = net.createConnection(proxyPort, proxyHost, () => {
-        console.log(`✅ 成功连接到代理服务器 ${proxyHost}:${proxyPort}`)
+        logger.info(`✅ 成功连接到代理服务器 ${proxyHost}:${proxyPort}`)
         socket.destroy()
         resolve(res.json({
           success: true,
           message: '代理服务器连接成功',
-          proxy: {
-            host: proxyHost,
-            port: proxyPort,
-            socks5Url: socks5Url
-          }
+          proxy: proxyPayload
         }))
       })
       
       socket.on('error', (error) => {
-        console.error(`❌ 代理服务器连接失败: ${error.message}`)
+        logger.error(`❌ 代理服务器连接失败: ${error.message}`)
         resolve(res.json({
           success: false,
           message: `代理服务器连接失败: ${error.message}`,
           error: error.code,
-          proxy: {
-            host: proxyHost,
-            port: proxyPort,
-            socks5Url: socks5Url
-          }
+          proxy: proxyPayload
         }))
       })
       
@@ -2196,11 +2936,7 @@ app.get('/api/test-proxy', async (req, res) => {
         resolve(res.json({
           success: false,
           message: '代理服务器连接超时（5秒）',
-          proxy: {
-            host: proxyHost,
-            port: proxyPort,
-            socks5Url: socks5Url
-          }
+          proxy: proxyPayload
         }))
       })
     })
@@ -2219,23 +2955,21 @@ app.get('/api/debug', async (req, res) => {
     const debugInfo = {
       server: {
         status: 'running',
-        port: PORT,
+        port: Number(process.env.PORT || 3001),
         timestamp: new Date().toISOString()
       },
       token: {
-        configured: !!token,
-        length: token ? token.length : 0,
-        preview: token ? token.substring(0, 10) + '...' : 'not set'
+        configured: !!token
       },
       test: null
     }
 
     if (token) {
       try {
-        // 测试Token是否有效
-        const testUrl = `${FACEBOOK_API_BASE}/me?access_token=${token}`
-        const response = await axios.get(testUrl, { timeout: 30000 })
-        const data = response.data
+        // 测试Token是否有效（复用 makeRequest，支持 SOCKS 代理，避免 protocol mismatch）
+        const api = new FacebookMarketingAPI(token)
+        const testUrl = `${FACEBOOK_API_BASE}/me`
+        const data = await api.makeRequest(testUrl, { access_token: token }, 'GET', null, { timeout: 30000 })
         
         if (data.error) {
           debugInfo.test = {

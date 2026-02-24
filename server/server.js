@@ -3,46 +3,132 @@
 import dotenv from 'dotenv'
 dotenv.config()
 
-// 配置全局代理环境变量（让Node.js自动使用）
-if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY) {
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY
-  // 设置Node.js标准代理环境变量
-  process.env.http_proxy = proxyUrl
-  process.env.https_proxy = proxyUrl
-  process.env.HTTP_PROXY = proxyUrl
-  process.env.HTTPS_PROXY = proxyUrl
-  console.log('🌐 已设置全局代理环境变量')
+// 配置全局代理环境变量（分别回填 lowercase，不覆盖已有值，不强制合并 HTTP/HTTPS）
+if (process.env.HTTP_PROXY && !process.env.http_proxy) {
+  process.env.http_proxy = process.env.HTTP_PROXY
+}
+if (process.env.HTTPS_PROXY && !process.env.https_proxy) {
+  process.env.https_proxy = process.env.HTTPS_PROXY
+}
+import logger from './utils/logger.js'
+
+if (process.env.http_proxy || process.env.https_proxy) {
+  logger.info('已设置全局代理环境变量')
 }
 
 // 引入 Express 应用配置（不包含启动逻辑）
 // 注意：需要先导入 index.js 以注册 API 路由
 import './index.js'  // 导入以注册 API 路由
 import app from './app.js'
-import { startCronJob } from './services/cronService.js'
+import { startCronJob, stopCronJob } from './services/cronService.js'
+import { getWriteQueueStats, processWriteQueue } from './services/ingestorService.js'
 
 // 获取端口号（从环境变量或使用默认值）
 const PORT = process.env.PORT || 3001
 
-// 启动服务器
-app.listen(PORT, () => {
-  console.log(`🚀 服务器运行在 http://localhost:${PORT}`)
-  console.log(`📡 API端点: http://localhost:${PORT}/api`)
-  console.log(`🏥 健康检查: http://localhost:${PORT}/api/health`)
-  console.log('')
-  
+// 启动服务器（监听所有网卡，允许局域网访问）
+app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`服务器运行在 http://0.0.0.0:${PORT}`)
+  logger.info(`API端点: http://0.0.0.0:${PORT}/api`)
+  logger.info(`健康检查: http://0.0.0.0:${PORT}/api/health`)
+  logger.info('局域网访问: http://<你的IP>:' + PORT)
   const token = process.env.FACEBOOK_ACCESS_TOKEN
   if (!token) {
-    console.warn('⚠️  警告: FACEBOOK_ACCESS_TOKEN 未配置，请在 .env 文件中设置')
+    logger.warn('FACEBOOK_ACCESS_TOKEN 未配置，请在 .env 文件中设置')
   } else {
-    console.log('✅ FACEBOOK_ACCESS_TOKEN 已配置')
-    console.log('🔑 Token前10位:', token.substring(0, 10) + '...')
-    console.log('')
+    logger.info('FACEBOOK_ACCESS_TOKEN 已配置')
+    logger.info('Token前10位: ' + token.substring(0, 10) + '...')
   }
-  
-  console.log('💡 提示: 查看控制台日志以获取详细的API调用信息')
-  console.log('')
-  
+  logger.info('查看控制台/日志以获取详细的API调用信息')
   // 启动定时任务（每 15 分钟自动执行规则）
   startCronJob()
 })
 
+// ============================================
+// 优雅退出处理（AdsPolar 手段1）
+// ============================================
+// 【手段1：优雅退出】解决 95% 的问题
+// 大多数"进程崩溃"其实是重启（比如发版更新代码，或者 PM2 自动重启）
+// 我们可以告诉 Node.js："死之前，先把肚子里的数据吐干净"
+//
+// 【手段2：自愈性】数据的"自愈性"（Self-Healing）
+// 如果是代码 Bug 导致进程直接崩溃（Crash），或者内存溢出（OOM），
+// Graceful Shutdown 来不及执行怎么办？
+// 答案：丢了就丢了，下一轮会自动补回来。
+// - 10:15 的热数据采集下来了，但在写入前进程崩了
+// - 10:30 的任务启动，会去拉取 today 的数据
+// - FB 返回的是"截止 10:30 的累计花费"，写入后数据直接跳到最新状态
+// - 中间丢失的 10:15 那一帧，对于业务规则（止损/扩量）来说，影响微乎其微
+
+let isShuttingDown = false
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    logger.warn('正在关闭中，请勿重复触发')
+    return
+  }
+  isShuttingDown = true
+  logger.info('收到信号，开始优雅退出', { signal })
+  try {
+    logger.info('[1/3] 停止定时任务...')
+    await stopCronJob()
+    logger.info('定时任务已停止')
+    const queueStats = getWriteQueueStats()
+    logger.info('[2/3] 检查写入队列状态', {
+      queueLength: queueStats.queueLength,
+      isWriting: queueStats.isWriting,
+      totalQueued: queueStats.stats.totalQueued,
+      totalWritten: queueStats.stats.totalWritten,
+      totalErrors: queueStats.stats.totalErrors,
+    })
+    if (queueStats.queueLength > 0) {
+      logger.info('[3/3] 紧急写入剩余数据', { count: queueStats.queueLength })
+      const timeout = 30000
+      const startTime = Date.now()
+      await Promise.race([
+        processWriteQueue(true),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('写入超时')), timeout)
+        ),
+      ]).catch((error) => {
+        if (error.message === '写入超时') {
+          logger.warn('写入超时，剩余数据将在下一轮同步补回', {
+            timeoutMs: timeout,
+            remaining: getWriteQueueStats().queueLength,
+          })
+        } else {
+          logger.error('紧急写入失败', { message: error.message })
+        }
+      })
+      const elapsed = Date.now() - startTime
+      const finalStats = getWriteQueueStats()
+      logger.info('紧急写入完成', { elapsedMs: elapsed, remaining: finalStats.queueLength })
+    } else {
+      logger.info('[3/3] 写入队列为空，无需处理')
+    }
+    logger.info('数据清理完毕，再见')
+    setTimeout(() => process.exit(0), 100)
+  } catch (error) {
+    logger.error('优雅退出失败', { message: error.message, stack: error.stack })
+    setTimeout(() => process.exit(1), 100)
+  }
+}
+
+// 监听 PM2 的重启/停止信号
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+
+// 监听未捕获的异常（集中记录到 logger，生产环境会同时写入 exceptions 文件）
+process.on('uncaughtException', (error) => {
+  logger.error('未捕获的异常（可能导致进程崩溃）', {
+    message: error.message,
+    stack: error.stack,
+  })
+  logger.info('进程可能即将退出，队列数据下一轮同步将自动补回')
+  gracefulShutdown('uncaughtException').catch(() => process.exit(1))
+})
+
+// 监听未处理的 Promise 拒绝（集中记录到 logger，生产环境会同时写入 rejections 文件）
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('未处理的 Promise 拒绝', { reason: String(reason) })
+})

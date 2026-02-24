@@ -86,5 +86,121 @@ describe('RuleEngine', () => {
     
     expect(result).toBe(1.5)
   })
+
+  // ─── DNF 条件组（阶段 1 后端）────────────────────────────────────────────
+  // (spend>0.8 AND link_clicks=0) OR (cpc>0.8)
+  describe('DNF 语义 (spend>0.8 AND link_clicks=0) OR (cpc>0.8)', () => {
+    const dnfConditions = {
+      version: 2,
+      groups: [
+        {
+          operator: 'AND',
+          conditions: [
+            { metric: 'spend', operator: 'gt', value: 0.8 },
+            { metric: 'link_clicks', operator: 'eq', value: 0 }
+          ]
+        },
+        {
+          operator: 'AND',
+          conditions: [
+            { metric: 'cpc', operator: 'gt', value: 0.8 }
+          ]
+        }
+      ]
+    }
+
+    it('组1满足：spend>0.8 且 link_clicks=0 应匹配', () => {
+      const adData = { spend: 1, link_clicks: 0, cpc: 0.5 }
+      const result = ruleEngine.evaluateConditions(dnfConditions, adData, 'AND')
+      expect(result).toBe(true)
+    })
+
+    it('组2满足：cpc>0.8 应匹配', () => {
+      const adData = { spend: 0.5, link_clicks: 5, cpc: 1.0 }
+      const result = ruleEngine.evaluateConditions(dnfConditions, adData, 'AND')
+      expect(result).toBe(true)
+    })
+
+    it('两组都不满足应不匹配', () => {
+      const adData = { spend: 0.5, link_clicks: 5, cpc: 0.5 }
+      const result = ruleEngine.evaluateConditions(dnfConditions, adData, 'AND')
+      expect(result).toBe(false)
+    })
+  })
+
+  // v1 OR 兼容：确保 v1 OR 不会被误算成 AND
+  describe('v1 OR 兼容', () => {
+    it('v1 OR：满足任一条件应匹配（spend>0.8 OR cpc>0.8）', () => {
+      const v1OrConditions = [
+        { metric: 'spend', operator: 'gt', value: 0.8 },
+        { metric: 'cpc', operator: 'gt', value: 0.8 }
+      ]
+      // 只满足 cpc>0.8，不满足 spend>0.8；若误算成 AND 则 false
+      const adData = { spend: 0.5, cpc: 1.0 }
+      const result = ruleEngine.evaluateConditions(v1OrConditions, adData, 'OR')
+      expect(result).toBe(true)
+    })
+
+    it('v1 OR：都不满足应不匹配', () => {
+      const v1OrConditions = [
+        { metric: 'spend', operator: 'gt', value: 0.8 },
+        { metric: 'cpc', operator: 'gt', value: 0.8 }
+      ]
+      const adData = { spend: 0.5, cpc: 0.5 }
+      const result = ruleEngine.evaluateConditions(v1OrConditions, adData, 'OR')
+      expect(result).toBe(false)
+    })
+  })
+
+  // getTimeWindowFromConditions / getCustomRangeFromConditions（v2 + 一致性防御）
+  describe('getTimeWindowFromConditions / getCustomRangeFromConditions', () => {
+    it('v2 一致 time_window 应正确提取', () => {
+      const v2 = {
+        version: 2,
+        groups: [
+          { operator: 'AND', conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'yesterday' }] }
+        ]
+      }
+      expect(ruleEngine.getTimeWindowFromConditions(v2, 'AND')).toBe('yesterday')
+    })
+
+    it('v2 time_window 不一致应抛错', () => {
+      const v2 = {
+        version: 2,
+        groups: [
+          { operator: 'AND', conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }] },
+          { operator: 'AND', conditions: [{ metric: 'cpc', operator: 'gt', value: 0, time_window: 'yesterday' }] }
+        ]
+      }
+      expect(() => ruleEngine.getTimeWindowFromConditions(v2, 'AND')).toThrow(/time_window 须一致/)
+    })
+
+    it('v2 custom_range 一致应正确提取', () => {
+      const v2 = {
+        version: 2,
+        groups: [
+          {
+            operator: 'AND',
+            conditions: [
+              { metric: 'spend', operator: 'gt', value: 0, time_window: 'custom_range', custom_range: { since: '2025-01-01', until: '2025-01-31' } }
+            ]
+          }
+        ]
+      }
+      const range = ruleEngine.getCustomRangeFromConditions(v2, 'AND')
+      expect(range).toEqual({ since: '2025-01-01', until: '2025-01-31' })
+    })
+
+    it('v2 custom_range 不一致应抛错', () => {
+      const v2 = {
+        version: 2,
+        groups: [
+          { operator: 'AND', conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'custom_range', custom_range: { since: '2025-01-01', until: '2025-01-15' } }] },
+          { operator: 'AND', conditions: [{ metric: 'cpc', operator: 'gt', value: 0, time_window: 'custom_range', custom_range: { since: '2025-01-01', until: '2025-01-31' } }] }
+        ]
+      }
+      expect(() => ruleEngine.getCustomRangeFromConditions(v2, 'AND')).toThrow(/custom_range 须一致/)
+    })
+  })
 })
 

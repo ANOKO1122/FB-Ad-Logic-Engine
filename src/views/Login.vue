@@ -32,6 +32,7 @@
 <script>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { setStoredToken } from '../utils/authFetch.js'
 
 export default {
   name: 'Login',
@@ -57,6 +58,7 @@ export default {
           error.value = data.error || '登录失败'
           return
         }
+        if (data.token) setStoredToken(data.token)
         if (data.user.status === 'pending') router.push('/pending')
         else router.push('/monitor')
       } catch (e) {

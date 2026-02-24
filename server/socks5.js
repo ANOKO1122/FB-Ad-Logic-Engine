@@ -1,7 +1,9 @@
 // 原生SOCKS5协议实现
 import net from 'net'
 import tls from 'tls'
+import logger from './utils/logger.js'
 import { recordRequest } from './utils/tlsErrorMonitor.js'
+import { parseProxyUrl } from './utils/proxyUtils.js'
 
 export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
@@ -19,21 +21,21 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
         reject(e)
       }
 
-      // 解析SOCKS5代理URL
-      const urlObj = new URL(socks5Url)
-      const proxyHost = urlObj.hostname
-      const proxyPort = parseInt(urlObj.port) || 10809
+      // 解析SOCKS5代理URL（使用统一工具，确保 socks5h 等协议解析正确）
+      const info = parseProxyUrl(socks5Url)
+      const proxyHost = info?.host || '127.0.0.1'
+      const proxyPort = (info?.port && !Number.isNaN(info.port) && info.port >= 1 && info.port <= 65535) ? info.port : 10809
       
       // 解析目标URL
       const targetUrlObj = new URL(targetUrl)
       const targetHost = targetUrlObj.hostname
       const targetPort = parseInt(targetUrlObj.port) || 443
       
-      console.log(`🔗 通过SOCKS5代理连接: ${proxyHost}:${proxyPort} -> ${targetHost}:${targetPort}`)
+      logger.info(`🔗 通过SOCKS5代理连接: ${proxyHost}:${proxyPort} -> ${targetHost}:${targetPort}`)
       
       // 连接到SOCKS5代理服务器
       const socket = net.createConnection(proxyPort, proxyHost, () => {
-        console.log('✅ 已连接到SOCKS5代理服务器')
+        logger.info('✅ 已连接到SOCKS5代理服务器')
         
         // SOCKS5握手：发送认证方法
         // 版本5，1个方法，无认证（0x00）
@@ -49,8 +51,8 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
         try {
           // 将新数据追加到缓冲区
           dataBuffer = Buffer.concat([dataBuffer, data])
-          console.log(`📥 收到SOCKS5数据: ${data.length} 字节, 缓冲区总大小: ${dataBuffer.length} 字节`)
-          console.log(`📥 数据十六进制: ${dataBuffer.toString('hex').substring(0, 100)}`)
+          logger.info(`📥 收到SOCKS5数据: ${data.length} 字节, 缓冲区总大小: ${dataBuffer.length} 字节`)
+          logger.info(`📥 数据十六进制: ${dataBuffer.toString('hex').substring(0, 100)}`)
           
           if (!authComplete) {
             // 认证响应应该是2字节；不够就继续等待
@@ -62,8 +64,8 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
             // 处理认证响应: VER=0x05, METHOD=0x00(无认证)
             if (responseData[0] !== 0x05) {
               const errorMsg = `SOCKS5认证响应格式错误: 期望版本5，收到 ${responseData[0]}`
-              console.error(`❌ ${errorMsg}`)
-              console.error(`❌ 响应数据: ${responseData.toString('hex')}`)
+              logger.error(`❌ ${errorMsg}`)
+              logger.error(`❌ 响应数据: ${responseData.toString('hex')}`)
               reject(new Error(errorMsg))
               socket.destroy()
               return
@@ -71,14 +73,14 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
 
             if (responseData[1] !== 0x00) {
               const errorMsg = `SOCKS5认证失败: 服务器返回方法 ${responseData[1]} (0x00=无认证, 0x02=用户名密码)`
-              console.error(`❌ ${errorMsg}`)
-              console.error(`❌ 响应数据: ${responseData.toString('hex')}`)
+              logger.error(`❌ ${errorMsg}`)
+              logger.error(`❌ 响应数据: ${responseData.toString('hex')}`)
               reject(new Error(errorMsg))
               socket.destroy()
               return
             }
 
-            console.log('✅ SOCKS5认证成功')
+            logger.info('✅ SOCKS5认证成功')
             authComplete = true
 
             // 发送连接请求（ATYP=0x03 域名）
@@ -92,8 +94,8 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
             hostBytes.copy(connectRequest, 5)
             connectRequest.writeUInt16BE(targetPort, 5 + hostBytes.length)
 
-            console.log(`📤 发送SOCKS5连接请求: ${targetHost}:${targetPort}`)
-            console.log(`📤 连接请求数据: ${connectRequest.toString('hex')}`)
+            logger.info(`📤 发送SOCKS5连接请求: ${targetHost}:${targetPort}`)
+            logger.info(`📤 连接请求数据: ${connectRequest.toString('hex')}`)
             socket.write(connectRequest)
             return
           } else if (!connectionComplete) {
@@ -122,7 +124,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
             
             // 如果响应数据不完整，等待更多数据
             if (dataBuffer.length < responseLength) {
-              console.log(`⏳ 等待更多SOCKS5响应数据: 当前 ${dataBuffer.length} 字节，需要 ${responseLength} 字节`)
+              logger.info(`⏳ 等待更多SOCKS5响应数据: 当前 ${dataBuffer.length} 字节，需要 ${responseLength} 字节`)
               return
             }
             
@@ -130,7 +132,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
             dataBuffer = dataBuffer.subarray(responseLength) // 移除已处理的数据
             
             if (responseData[1] === 0x00) {
-              console.log('✅ SOCKS5连接建立成功')
+              logger.info('✅ SOCKS5连接建立成功')
               connectionComplete = true
 
               // 关键：SOCKS5 CONNECT 成功后，停止用原始 socket 的 data 监听去“消费”后续数据，
@@ -144,7 +146,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
               socket.setTimeout(0)
               
               if (leftover.length > 0) {
-                console.log(`⚠️ SOCKS5响应后检测到 ${leftover.length} 字节后续数据，将交给TLS处理`)
+                logger.info(`⚠️ SOCKS5响应后检测到 ${leftover.length} 字节后续数据，将交给TLS处理`)
               }
               
               // 在SOCKS5隧道上建立TLS连接
@@ -158,7 +160,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                   servername: targetHost,
                   rejectUnauthorized: false
                 }, () => {
-                  console.log('✅ TLS连接建立成功，开始发送HTTP请求...')
+                  logger.info('✅ TLS连接建立成功，开始发送HTTP请求...')
                   try { tlsSocket.resume() } catch {}
                   
                   // 构建路径：优先使用 targetUrl 自带的 query（例如 paging.next / access_token），避免被 params 覆盖丢失
@@ -195,12 +197,12 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                   
                   // 打码 access_token，避免日志泄露
                   const safePath = path.replace(/access_token=[^&]+/g, 'access_token=***')
-                  console.log(`📤 发送HTTP请求: ${method} ${safePath}`)
+                  logger.info(`📤 发送HTTP请求: ${method} ${safePath}`)
                   tlsSocket.write(httpRequest)
                   
                   if (method === 'POST' && body) {
                     const bodyStr = JSON.stringify(body)
-                    console.log(`📤 请求体大小: ${bodyStr.length} 字节`)
+                    logger.info(`📤 请求体大小: ${bodyStr.length} 字节`)
                     tlsSocket.write(bodyStr)
                   }
                 })
@@ -245,12 +247,12 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                   try {
                     const bodyForJson = normalizeBodyForJson(responseBody)
                     const jsonData = JSON.parse(bodyForJson)
-                    console.log('✅ JSON解析成功（由TLS错误回退路径完成）')
+                    logger.info('✅ JSON解析成功（由TLS错误回退路径完成）')
                     safeResolve(jsonData)
                     return true
                   } catch (parseError) {
-                    console.error('❌ JSON解析失败（TLS错误回退路径）:', parseError.message)
-                    console.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
+                    logger.error('❌ JSON解析失败（TLS错误回退路径）:', parseError.message)
+                    logger.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
                     safeReject(new Error(`解析响应失败: ${parseError.message}`))
                     return true
                   }
@@ -259,7 +261,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                 tlsSocket.on('error', (error) => {
                   // 某些代理/链路会在响应已接收后触发 TLS record 错误（常见：bad record mac）。
                   // 只要我们已经拿到了 HTTP 头/Body，就优先返回数据，避免整条请求被判失败。
-                  console.error('❌ TLS连接错误:', error.message)
+                  logger.error('❌ TLS连接错误:', error.message)
                   
                   // 记录 TLS 错误（用于监控）
                   recordRequest(true)
@@ -296,7 +298,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                       if (statusMatch) {
                         const statusCode = parseInt(statusMatch[1])
                         const statusMessage = statusMatch[2]
-                        console.log(`📥 收到HTTP响应: ${statusCode} ${statusMessage}`)
+                        logger.info(`📥 收到HTTP响应: ${statusCode} ${statusMessage}`)
                       }
                       
                       for (let i = 1; i < lines.length; i++) {
@@ -329,7 +331,7 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                 })
                 
                 tlsSocket.on('end', () => {
-                  console.log(`✅ 响应接收完成，总大小: ${responseBuffer.length} 字节`)
+                  logger.info(`✅ 响应接收完成，总大小: ${responseBuffer.length} 字节`)
                   try {
                     if (!responseBody) {
                       safeReject(new Error('收到空响应'))
@@ -337,20 +339,20 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
                     }
                     const bodyForJson = normalizeBodyForJson(responseBody)
                     const jsonData = JSON.parse(bodyForJson)
-                    console.log('✅ JSON解析成功')
+                    logger.info('✅ JSON解析成功')
                     
                     // 记录成功请求（用于监控）
                     recordRequest(false)
                     
                     safeResolve(jsonData)
                   } catch (parseError) {
-                    console.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
+                    logger.error('❌ 响应数据（前1000字符）:', responseBody.substring(0, 1000))
                     safeReject(new Error(`解析响应失败: ${parseError.message}`))
                   }
                 })
                 
                 tlsSocket.setTimeout(60000, () => {
-                  console.error('❌ TLS连接超时（60秒）')
+                  logger.error('❌ TLS连接超时（60秒）')
                   tlsSocket.destroy()
                   socket.destroy()
                   safeReject(new Error('TLS连接超时'))
@@ -369,43 +371,43 @@ export async function requestViaSocks5(targetUrl, params, socks5Url, method = 'G
               }
               const errorCode = data[1]
               const errorMsg = errorCodes[errorCode] || `未知错误 (0x${errorCode.toString(16)})`
-              console.error(`❌ SOCKS5连接失败: ${errorMsg}`)
-              console.error(`❌ 响应数据: ${data.toString('hex')}`)
+              logger.error(`❌ SOCKS5连接失败: ${errorMsg}`)
+              logger.error(`❌ 响应数据: ${data.toString('hex')}`)
               safeReject(new Error(`SOCKS5连接失败: ${errorMsg} (错误代码: 0x${errorCode.toString(16)})`))
               socket.destroy()
             }
           } else {
             const errorMsg = `SOCKS5连接响应格式错误: 期望版本5，收到 ${data[0]}`
-            console.error(`❌ ${errorMsg}`)
-            console.error(`❌ 响应数据: ${data.toString('hex')}`)
+            logger.error(`❌ ${errorMsg}`)
+            logger.error(`❌ 响应数据: ${data.toString('hex')}`)
             safeReject(new Error(errorMsg))
             socket.destroy()
           }
         }
         } catch (error) {
-          console.error('❌ 处理SOCKS5数据时出错:', error.message)
-          console.error('❌ 错误堆栈:', error.stack)
+          logger.error('❌ 处理SOCKS5数据时出错:', error.message)
+          logger.error('❌ 错误堆栈:', error.stack)
           safeReject(new Error(`处理SOCKS5数据失败: ${error.message}`))
           socket.destroy()
         }
       })
       
       socket.on('error', (error) => {
-        console.error('❌ SOCKS5 socket错误:', error.message)
-        console.error('❌ 错误代码:', error.code)
-        console.error('❌ 错误堆栈:', error.stack)
+        logger.error('❌ SOCKS5 socket错误:', error.message)
+        logger.error('❌ 错误代码:', error.code)
+        logger.error('❌ 错误堆栈:', error.stack)
         safeReject(new Error(`SOCKS5连接错误: ${error.message} (${error.code})`))
       })
       
       socket.on('close', (hadError) => {
         if (hadError && !authComplete && !connectionComplete) {
-          console.error('❌ SOCKS5连接意外关闭')
+          logger.error('❌ SOCKS5连接意外关闭')
           safeReject(new Error('SOCKS5连接意外关闭'))
         }
       })
       
       socket.setTimeout(10000, () => {
-        console.error('❌ SOCKS5连接超时（10秒）- 未收到代理服务器响应')
+        logger.error('❌ SOCKS5连接超时（10秒）- 未收到代理服务器响应')
         socket.destroy()
         safeReject(new Error('SOCKS5连接超时：10秒内未收到代理服务器响应'))
       })

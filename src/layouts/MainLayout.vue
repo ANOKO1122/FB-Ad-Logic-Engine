@@ -16,12 +16,24 @@
           <span class="text">规则管理</span>
         </router-link>
 
+        <router-link to="/logs" class="nav-item" active-class="active">
+          <span class="text">执行日志</span>
+        </router-link>
+
         <div class="divider"></div>
 
         <!-- 仅管理员可见 -->
         <template v-if="user && user.role === 'admin'">
+          <router-link to="/system" class="nav-item" active-class="active">
+            <span class="text">系统状态</span>
+          </router-link>
+
           <router-link to="/admin/account-mapping" class="nav-item" active-class="active">
             <span class="text">账户设置</span>
+          </router-link>
+
+          <router-link to="/admin/templates" class="nav-item" active-class="active">
+            <span class="text">模板管理</span>
           </router-link>
           
           <router-link to="/admin/review" class="nav-item" active-class="active">
@@ -59,6 +71,7 @@
 <script>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { authFetch, setStoredToken } from '../utils/authFetch.js'
 
 export default {
   name: 'MainLayout',
@@ -69,7 +82,7 @@ export default {
 
     const fetchUser = async () => {
       try {
-        const res = await fetch('/api/me', { credentials: 'include' })
+        const res = await authFetch('/api/me')
         if (res.ok) {
           const data = await res.json()
           user.value = data.user
@@ -87,7 +100,7 @@ export default {
 
     const fetchPendingCount = async () => {
       try {
-        const res = await fetch('/api/admin/users', { credentials: 'include' })
+        const res = await authFetch('/api/admin/users')
         if (res.ok) {
           const data = await res.json()
           // 统计 status 为 pending 的用户
@@ -101,7 +114,8 @@ export default {
     const handleLogout = async () => {
       if (!confirm('确定要退出登录吗？')) return
       try {
-        await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+        await authFetch('/api/auth/logout', { method: 'POST' })
+        setStoredToken(null)
         router.push('/login')
       } catch (e) {
         console.error('退出失败', e)

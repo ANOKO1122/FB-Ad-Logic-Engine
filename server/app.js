@@ -7,6 +7,7 @@ import { requireAuth, requireActive } from './middleware/authJwt.js'
 import authRoutes from './routes/auth.js'
 import adminRoutes from './routes/admin.js'
 import rulesRoutes from './routes/rules.js'
+import systemRoutes from './routes/system.js'
 
 // 导入 Facebook API 客户端类和规则引擎类（暂时从 index.js 导入，后续可以移到单独文件）
 // 注意：这里需要导入 index.js 中定义的类和函数
@@ -35,10 +36,11 @@ app.use((err, req, res, next) => {
 })
 app.use(cookieParser())
 
-// 路由（认证/管理员/规则）
+// 路由（认证/管理员/规则/系统）
 app.use('/api', authRoutes)          // /api/me, /api/owners, /api/auth/*
 app.use('/api/admin', adminRoutes)   // /api/admin/*
 app.use('/api', rulesRoutes)         // /api/rules/* (规则管理，使用 Drizzle ORM)
+app.use('/api', systemRoutes)        // /api/automation-logs/*, /api/system/*
 
 // 健康检查路由（测试需要）
 app.get('/api/health', (req, res) => {

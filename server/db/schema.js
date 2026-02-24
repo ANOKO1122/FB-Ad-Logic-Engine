@@ -22,12 +22,18 @@ export const rules = mysqlTable('rules', {
   // 用户 ID：关联到 users 表的 owner_id（外键关系，但 Drizzle 不强制外键约束）
   userId: int('user_id').notNull(),
   
+  // 广告账户 ID：规则作用的目标账户（限定规则只作用于此账户）
+  // ✅ 方案三：必须绑定账户（NOT NULL），防止反向索引退化
+  accountId: varchar('account_id', { length: 50 }).notNull(),
+  
   // 规则名称
   ruleName: varchar('rule_name', { length: 255 }).notNull(),
   
   // 目标范围（M3 新增）
   targetLevel: varchar('target_level', { length: 20 }).default('ad'),  // 目标层级：ad/adset/campaign
-  targetIds: json('target_ids').default([]),                            // 目标ID列表（JSON数组）
+  targetIds: json('target_ids').default([]),                            // 目标ID列表（JSON数组，兼容旧数据）
+  targetAccountIds: json('target_account_ids'),                           // 多选账户：规则作用的账户ID列表（JSON数组）
+  targetByAccount: json('target_by_account'),                            // 方案B：按账户分组的目标ID { "act_1": ["id1","id2"], "act_2": ["id3"] }
   
   // 规则条件：JSON 格式存储
   // 新格式示例：[{ metric: 'spend', operator: 'gt', value: 20, time_window: 'today' }]
@@ -43,6 +49,7 @@ export const rules = mysqlTable('rules', {
   
   // 执行操作：JSON 格式存储
   // 示例：[{ type: 'pause_ad' }] 或 [{ type: 'increase_budget', value: 20 }]
+  // M4 3.5：max_daily_budget 单位为「分」(int)，前端展示时除以 100
   actions: json('actions').notNull(),
   
   // 是否启用
@@ -52,7 +59,10 @@ export const rules = mysqlTable('rules', {
   createdAt: timestamp('created_at').notNull().defaultNow(),
   
   // 更新时间
-  updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow()
+  updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
+  
+  // 上次执行时间（用于冷却期机制）
+  lastExecutedAt: timestamp('last_executed_at')
 })
 
 // ============================================
@@ -88,6 +98,7 @@ export const adSnapshots = mysqlTable('ad_snapshots', {
   syncSessionId: varchar('sync_session_id', { length: 100 }).notNull(),      // 同步会话ID
   syncedAt: timestamp('synced_at').notNull(),                                  // 同步时间
   timezoneName: varchar('timezone_name', { length: 50 }).default('UTC'),     // 账户时区
+  dataDate: date('data_date').notNull(),                                       // 数据日期（账户本地时区的自然日，用于分层落盘和真空期兜底）
   
   // 自动化相关
   muteUntil: timestamp('mute_until'),                                         // 手动挂起截止时间
@@ -126,11 +137,35 @@ export const dailyStats = mysqlTable('daily_stats', {
   updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow()
 })
 
+// daily_archive_status 表（归档状态注册表）
+// 记录每个账户每个日期的归档状态，支持滑动窗口归档和补跑机制
+export const dailyArchiveStatus = mysqlTable('daily_archive_status', {
+  // 主键
+  id: int('id').primaryKey().autoincrement(),
+  
+  // 账户和日期（唯一标识）
+  accountId: varchar('account_id', { length: 50 }).notNull(),                 // Facebook 账户ID
+  targetDate: date('target_date').notNull(),                                   // 目标归档日期（账户本地时区的自然日）
+  
+  // 状态字段
+  status: mysqlEnum('status', ['PENDING', 'ARCHIVED', 'FINALIZED']).notNull().default('PENDING'),  // 归档状态
+  
+  // 时间戳
+  updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),     // 最后更新时间
+  
+  // 错误信息（可选）
+  lastError: text('last_error')                                                // 最后一次归档失败的错误信息
+})
+
 // automation_logs 表（审计日志）
 // 记录每次规则执行的详细信息，用于审计和问题排查
+// M4：增加 run_id，同一 run 下同一 ad_id 仅一条执行记录（验收用）
 export const automationLogs = mysqlTable('automation_logs', {
   // 主键
   id: int('id').primaryKey().autoincrement(),
+  
+  // M4 运行批次（与 rule_execution_summaries.run_id 一致；验收：同一 run_id + ad_id 最多 1 条）
+  runId: varchar('run_id', { length: 100 }),
   
   // 关联信息
   accountId: varchar('account_id', { length: 50 }).notNull(),

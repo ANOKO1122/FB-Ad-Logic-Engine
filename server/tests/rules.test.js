@@ -8,34 +8,49 @@ import pool from '../db/connection.js'
 import { signToken } from '../middleware/authJwt.js'
 import bcrypt from 'bcryptjs'
 
-// 测试用的用户信息
+// 测试用的用户信息（M3 后创建规则需 accountId，且 accountId 须属于用户的 owner）
+const TEST_ACCOUNT_ID = 'act_test_rules'
+const TEST_OWNER_KEY = 'test_rules_owner'
 let authToken = null
 let testUserId = null
+let testOwnerId = null
 
 describe('规则 API 测试', () => {
-  // 在测试前，创建一个测试用户并生成 token
+  // 在测试前：创建 owner → 创建用户(绑定 owner_id) → 创建 account_mapping → 生成 token
   beforeAll(async () => {
-    // 创建测试用户（使用 bcrypt 加密密码）
+    const [ownerResult] = await pool.execute(
+      'INSERT INTO owners (owner_key, owner_name, is_active) VALUES (?, ?, 1)',
+      [TEST_OWNER_KEY, '测试规则负责人']
+    )
+    testOwnerId = ownerResult.insertId
+
     const passwordHash = await bcrypt.hash('test123456', 10)
     const [result] = await pool.execute(
-      'INSERT INTO users (username, password_hash, role, status) VALUES (?, ?, ?, ?)',
-      ['test_rules_user', passwordHash, 'staff', 'active']
+      'INSERT INTO users (username, password_hash, role, status, owner_id) VALUES (?, ?, ?, ?, ?)',
+      ['test_rules_user', passwordHash, 'staff', 'active', testOwnerId]
     )
     testUserId = result.insertId
 
-    // 使用 signToken 生成 JWT token（模拟登录）
+    await pool.execute(
+      'INSERT INTO account_mappings (fb_account_id, owner_id, is_active, timezone_name) VALUES (?, ?, 1, ?)',
+      [TEST_ACCOUNT_ID, testOwnerId, 'UTC']
+    )
+
     authToken = signToken(testUserId)
   })
 
-  // 测试后清理测试数据
+  // 测试后清理测试数据（顺序：规则 → account_mapping → 用户 owner_id 置空 → 用户 → owner）
   afterAll(async () => {
-    // 删除测试用户创建的规则
     if (testUserId) {
       await pool.execute('DELETE FROM rules WHERE user_id = ?', [testUserId])
     }
-    // 删除测试用户
+    await pool.execute('DELETE FROM account_mappings WHERE fb_account_id = ?', [TEST_ACCOUNT_ID])
     if (testUserId) {
+      await pool.execute('UPDATE users SET owner_id = NULL WHERE id = ?', [testUserId])
       await pool.execute('DELETE FROM users WHERE id = ?', [testUserId])
+    }
+    if (testOwnerId) {
+      await pool.execute('DELETE FROM owners WHERE id = ?', [testOwnerId])
     }
   })
 
@@ -43,6 +58,7 @@ describe('规则 API 测试', () => {
     it('应该创建规则并返回 201', async () => {
       const ruleData = {
         ruleName: '测试规则',
+        accountId: TEST_ACCOUNT_ID,
         conditions: [
           { metric: 'ctr', operator: 'lt', value: 0.8 }
         ],
@@ -75,7 +91,8 @@ describe('规则 API 测试', () => {
         .post('/api/rules')
         .set('Cookie', `token=${authToken}`)
         .send({
-          ruleName: '测试规则'
+          ruleName: '测试规则',
+          accountId: TEST_ACCOUNT_ID
           // 缺少 conditions 和 actions
         })
 
@@ -87,6 +104,7 @@ describe('规则 API 测试', () => {
     it('应该创建规则并使用新字段（M3 扩展）', async () => {
       const ruleData = {
         ruleName: '测试规则（新字段）',
+        accountId: TEST_ACCOUNT_ID,
         targetLevel: 'adset',
         targetIds: ['adset_123', 'adset_456'],
         conditions: [
@@ -137,6 +155,7 @@ describe('规则 API 测试', () => {
     it('应该使用新字段的默认值（如果不提供）', async () => {
       const ruleData = {
         ruleName: '测试规则（默认值）',
+        accountId: TEST_ACCOUNT_ID,
         conditions: [
           { metric: 'ctr', operator: 'lt', value: 0.8 }
         ],
@@ -167,6 +186,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '测试规则',
+          accountId: TEST_ACCOUNT_ID,
           targetLevel: 'invalid_level', // 无效值
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
@@ -177,12 +197,51 @@ describe('规则 API 测试', () => {
       expect(res.body.code).toBe('INVALID_TARGET_LEVEL')
     })
 
+    it('应该拒绝 v2 含空 conditions 的规则', async () => {
+      const res = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: 'v2 空组',
+          accountId: TEST_ACCOUNT_ID,
+          conditions: {
+            version: 2,
+            groups: [{ operator: 'AND', conditions: [] }]
+          },
+          actions: [{ type: 'pause_ad' }]
+        })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/非空 conditions/)
+    })
+
+    it('应该接受 v2 conditions 并创建规则', async () => {
+      const v2Conditions = {
+        version: 2,
+        groups: [
+          { operator: 'AND', conditions: [{ metric: 'spend', operator: 'gt', value: 0.8 }] },
+          { operator: 'AND', conditions: [{ metric: 'cpc', operator: 'gt', value: 0.8 }] }
+        ]
+      }
+      const res = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: 'v2 规则',
+          accountId: TEST_ACCOUNT_ID,
+          conditions: v2Conditions,
+          actions: [{ type: 'pause_ad' }]
+        })
+      expect(res.status).toBe(201)
+      expect(res.body.rule.conditions).toEqual(v2Conditions)
+    })
+
     it('应该拒绝无效的 logicOperator', async () => {
       const res = await request(app)
         .post('/api/rules')
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '测试规则',
+          accountId: TEST_ACCOUNT_ID,
           logicOperator: 'XOR', // 无效值
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
@@ -213,6 +272,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '测试规则列表（新字段）',
+          accountId: TEST_ACCOUNT_ID,
           targetLevel: 'campaign',
           targetIds: ['campaign_999'],
           logicOperator: 'OR',
@@ -251,6 +311,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '测试规则详情',
+          accountId: TEST_ACCOUNT_ID,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })
@@ -275,6 +336,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '测试规则详情（新字段）',
+          accountId: TEST_ACCOUNT_ID,
           targetLevel: 'adset',
           targetIds: ['adset_111', 'adset_222'],
           conditions: [
@@ -313,6 +375,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '原始规则名称',
+          accountId: TEST_ACCOUNT_ID,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })
@@ -339,6 +402,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '原始规则',
+          accountId: TEST_ACCOUNT_ID,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })
@@ -383,6 +447,7 @@ describe('规则 API 测试', () => {
         .set('Cookie', `token=${authToken}`)
         .send({
           ruleName: '待删除的规则',
+          accountId: TEST_ACCOUNT_ID,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })

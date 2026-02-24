@@ -2,17 +2,268 @@
 // 按照 DEV_PLAN.md M2 的要求实现
 // 负责从 Facebook API 拉取广告数据并存入数据库
 
+import logger from '../utils/logger.js'
 import { FacebookMarketingAPI } from '../index.js'
 import { db } from '../db/drizzle.js'
 import { adSnapshots } from '../db/schema.js'
 import pool from '../db/connection.js'
 import { eq, and, gte } from 'drizzle-orm'
 import { DateTime } from 'luxon'
+import pLimit from 'p-limit'
 import { 
   parseUsageHeader, 
   sleepBasedOnUsage,
   getCircuitBreakerStatus
 } from './rateLimitService.js'
+import { piggybackStructureFromToday, runPseudoIncrementForAccount } from './structureSyncService.js'
+
+// ============================================
+// 受控并发配置（M2 阶段：并发度 = 6）
+// 依据：TASKS.md 1.3 + DEV_PLAN.md 4.3
+// ============================================
+// 限制同一时刻并发运行的账户任务数量为 6（降低代理瞬时压力，缓解 TLS early disconnect）
+// 适用于：Today 热同步、冷路径双窗口归档、last_7d / last_14d 回补等所有账户级任务
+// 注意：如果出现 429 限流错误，可再降到 4；若代理稳定，可提高到 8
+const CONCURRENT_LIMIT = 6
+const accountTaskLimiter = pLimit(CONCURRENT_LIMIT)
+
+// ============================================
+// 写入时兜底：从 structure_ads 补齐 campaign_id / adset_id
+// 结构镜像表为关系真相源，事实表需可靠维度键，避免按 campaign 解析目标为 0
+// ============================================
+/**
+ * 从 structure_ads 补齐 items 中缺失的 campaign_id / adset_id（不增加 FB API 调用）
+ * 注意：补齐到 item.adset_id / item.campaign_id，写入层会用 insight.adset_id → DB 列 ad_set_id。
+ * @param {string} accountId
+ * @param {Array<{ ad_id: string, campaign_id?: string, adset_id?: string }>} items - 会被原地修改
+ */
+const STRUCTURE_FILL_BATCH_SIZE = 500
+
+async function fillCampaignAdsetFromStructure(accountId, items) {
+  if (!items?.length) return
+  const needFill = items.filter(
+    i => (i.campaign_id == null || i.campaign_id === '') || (i.adset_id == null || i.adset_id === '')
+  )
+  if (needFill.length === 0) return
+  const adIds = [...new Set(needFill.map(i => String(i.ad_id || '')).filter(Boolean))]
+  if (adIds.length === 0) return
+  try {
+    const map = new Map()
+    for (let i = 0; i < adIds.length; i += STRUCTURE_FILL_BATCH_SIZE) {
+      const batch = adIds.slice(i, i + STRUCTURE_FILL_BATCH_SIZE)
+      const placeholders = batch.map(() => '?').join(',')
+      const [rows] = await pool.execute(
+        `SELECT ad_id, adset_id, campaign_id FROM structure_ads WHERE account_id = ? AND ad_id IN (${placeholders})`,
+        [accountId, ...batch]
+      )
+      for (const r of rows) {
+        map.set(String(r.ad_id), { adset_id: r.adset_id ?? null, campaign_id: r.campaign_id ?? null })
+      }
+    }
+    for (const item of needFill) {
+      const m = map.get(String(item.ad_id))
+      if (m) {
+        if (item.campaign_id == null || item.campaign_id === '') item.campaign_id = m.campaign_id
+        if (item.adset_id == null || item.adset_id === '') item.adset_id = m.adset_id
+      }
+    }
+    if (map.size > 0) {
+      logger.debug(`[structure_ads 兜底] 补齐 ${map.size} 条 campaign_id/adset_id (account=${accountId})`)
+    }
+  } catch (err) {
+    logger.warn('fillCampaignAdsetFromStructure 查询 structure_ads 失败，跳过补齐:', err.message)
+  }
+}
+
+// ============================================
+// 写入队列（AdsPolar 解耦架构实现）
+// 解决数据库死锁问题：多采集，单写入
+// ============================================
+// 【AdsPolar 策略】
+// 1. 采集器（Fetcher）：只负责从 Facebook API 拉数据，不写数据库
+// 2. 写入队列（Buffer Queue）：内存队列，临时存储待写入数据
+// 3. 写入器（Writer）：单线程串行写入，避免死锁
+//
+// 【优势】
+// ✅ 彻底解决死锁：同一时间只有一个数据库连接在执行写入
+// ✅ 提高性能：数据库喜欢"少次多量"的批量写入
+// ✅ 解耦采集和写入：采集不会被写入阻塞
+//
+// 【劣势】
+// ⚠️  进程崩溃会丢失队列数据（但采集可以重试）
+// ⚠️  需要额外的内存空间（但通常很小）
+const writeQueue = []
+let isWriting = false
+let writeStats = {
+  totalQueued: 0,
+  totalWritten: 0,
+  totalErrors: 0
+}
+
+/**
+ * 将数据推入写入队列（非阻塞）
+ * @param {string} type - 写入类型：'SNAPSHOT' 或 'STATS'
+ * @param {Array} data - 待写入的数据
+ * @param {Object} metadata - 元数据（accountId, ownerId, syncSessionId, syncedAt, timezoneName）
+ */
+function enqueueWrite(type, data, metadata = {}) {
+  if (!data || data.length === 0) {
+    return
+  }
+  
+  writeQueue.push({
+    type, // 'SNAPSHOT' 或 'STATS'
+    data,
+    metadata,
+    timestamp: Date.now()
+  })
+  
+  writeStats.totalQueued += data.length
+  
+  // 触发写入处理器（非阻塞）
+  processWriteQueue().catch(error => {
+    logger.error('❌ 写入队列处理失败:', error.message)
+    writeStats.totalErrors++
+  })
+}
+
+/**
+ * 写入处理器：串行消费队列，永不打架
+ * 使用单线程串行写入，彻底避免死锁
+ * 
+ * 【手段3：错误隔离】防止"一粒老鼠屎坏了一锅粥"
+ * - 每条数据错误都被捕获，不会导致整个队列卡死
+ * - 错误记录到日志，便于事后排查
+ * 
+ * @param {boolean} emergencyMode - 紧急模式（优雅退出时使用），忽略流控，强制写入
+ */
+async function processWriteQueue(emergencyMode = false) {
+  // 如果正在写，就等着，别插手（避免并发写入）
+  // 紧急模式除外：优雅退出时需要强制写入
+  if (isWriting && !emergencyMode) {
+    return
+  }
+  
+  isWriting = true
+  
+  try {
+    while (writeQueue.length > 0) {
+      const task = writeQueue.shift() // 取出一个任务（FIFO）
+      
+      try {
+        // 执行真正的数据库写入
+        if (task.type === 'SNAPSHOT') {
+          await saveSnapshotsToDbInternal(task.data, task.metadata)
+        } else if (task.type === 'STATS') {
+          // TODO: 实现 daily_stats 的队列写入
+          logger.warn('⚠️  daily_stats 队列写入尚未实现')
+        }
+        
+        writeStats.totalWritten += task.data.length
+      } catch (error) {
+        // 【手段3：错误隔离】捕获错误，不要让它抛出导致进程崩溃！
+        logger.error(`❌ 写入队列任务失败 (${task.type}):`, error.message)
+        writeStats.totalErrors++
+        
+        // 记录错误详情（便于事后排查）
+        // 注意：不打印完整数据，避免日志过大
+        const dataSample = task.data && task.data.length > 0 
+          ? { accountId: task.metadata?.accountId, adCount: task.data.length, firstAdId: task.data[0]?.ad_id }
+          : null
+        logger.error(`   错误详情:`, {
+          error: error.message,
+          type: task.type,
+          dataSample,
+          timestamp: new Date().toISOString()
+        })
+        
+        // 注意：这里不重新入队，避免无限循环
+        // 【手段2：自愈性】如果写入失败，采集器可以重试（下一轮同步会自动补回）
+      }
+      
+      // 紧急模式：不休息，快速写入（优雅退出时使用）
+      if (!emergencyMode) {
+        // 稍微休息一下，让出 CPU 给 API 请求（避免阻塞事件循环）
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    }
+  } catch (error) {
+    // 【手段3：错误隔离】外层错误也要捕获，防止进程崩溃
+    logger.error('❌ 写入队列处理出错:', error.message)
+    writeStats.totalErrors++
+  } finally {
+    isWriting = false // 释放锁
+  }
+}
+
+// ============================================
+// 重试机制配置
+// ============================================
+// 重试延迟配置（指数退避）
+const RETRY_DELAY_BASE_MS = 60000  // 基础延迟：60秒（Facebook限流通常需要1-2分钟恢复）
+const RETRY_MAX_ATTEMPTS = 2       // 最大重试次数：2次（总共尝试3次：初始1次 + 重试2次）
+
+// 账户级别限流保护（内存缓存）
+// 记录每个账户的最后调用时间，避免短时间内重复调用
+const accountLastCallTime = new Map()  // accountId -> timestamp
+const ACCOUNT_COOLDOWN_MS = 120000     // 账户冷却期：120秒（2分钟），避免同一账户在短时间内被多次调用
+
+/**
+ * 判断错误是否为可重试的错误（API限流）
+ * @param {Error|string} error - 错误对象或错误消息
+ * @returns {boolean} 是否为可重试的错误
+ */
+function isRetryableError(error) {
+  const errorMessage = error?.message || String(error || '').toLowerCase()
+  return (
+    errorMessage.includes('too many calls') ||
+    errorMessage.includes('rate limit') ||
+    errorMessage.includes('rate limiting') ||
+    errorMessage.includes('429') ||
+    errorMessage.includes('throttle')
+  )
+}
+
+/**
+ * 检查账户是否在冷却期内（账户级别限流保护）
+ * @param {string} accountId - 账户ID
+ * @returns {boolean} 是否在冷却期内
+ */
+function isAccountInCooldown(accountId) {
+  const lastCallTime = accountLastCallTime.get(accountId)
+  if (!lastCallTime) {
+    return false
+  }
+  const elapsed = Date.now() - lastCallTime
+  return elapsed < ACCOUNT_COOLDOWN_MS
+}
+
+/**
+ * 记录账户调用时间（账户级别限流保护）
+ * @param {string} accountId - 账户ID
+ */
+function recordAccountCall(accountId) {
+  accountLastCallTime.set(accountId, Date.now())
+  
+  // 定期清理过期记录（避免内存泄漏）
+  // 只保留最近1小时的记录
+  const oneHourAgo = Date.now() - 3600000
+  for (const [id, time] of accountLastCallTime.entries()) {
+    if (time < oneHourAgo) {
+      accountLastCallTime.delete(id)
+    }
+  }
+}
+
+/**
+ * 计算指数退避延迟时间
+ * @param {number} attempt - 重试次数（从1开始）
+ * @returns {number} 延迟时间（毫秒）
+ */
+function calculateBackoffDelay(attempt) {
+  // 指数退避：第1次重试60秒，第2次重试120秒
+  return RETRY_DELAY_BASE_MS * Math.pow(2, attempt - 1)
+}
 
 // ============================================
 // 核心功能：数据同步
@@ -30,140 +281,191 @@ import {
  * 2. 使用该时区计算 time_range 拉取 insights
  * 3. 写入时把 timezone_name 落库，便于后续"数据时区优先"查询
  */
-export async function syncAccountTodayStats(accountId, ownerId, timezoneName = null) {
-  console.log(`🔄 开始同步账户 ${accountId} 的今日数据...`)
-  
+/**
+ * @param {string} accountId
+ * @param {number} ownerId
+ * @param {string|null} timezoneName
+ * @param {import('../index.js').FacebookMarketingAPI|null} [facebookApi] - 可选，传入时复用（如心跳内同轮做 Piggyback 用同一实例）
+ */
+export async function syncAccountTodayStats(accountId, ownerId, timezoneName = null, facebookApi = null) {
+  // 记录账户调用时间（账户级别限流保护）
+  recordAccountCall(accountId)
+
+  logger.info(`🔄 开始同步账户 ${accountId} 的今日数据...`)
+
   // 检查 Token 熔断器状态
   const breakerStatus = getCircuitBreakerStatus()
   if (breakerStatus.isLocked) {
     throw new Error('Token 已失效，系统已自动锁定。请检查 Token 配置并手动重置熔断器。')
   }
-  
+
   try {
     // 1. 生成唯一的 sync_session_id（时间戳 + 随机串）
     const syncSessionId = generateSyncSessionId()
     const syncedAt = new Date()
-    
-    // 2. 创建 Facebook API 客户端实例
+
+    // 2. Facebook API 客户端（可选传入，同轮心跳可复用以便 Piggyback 不再新建）
     const accessToken = process.env.FACEBOOK_ACCESS_TOKEN
     if (!accessToken) {
       throw new Error('FACEBOOK_ACCESS_TOKEN 未配置，请在 .env 文件中设置')
     }
-    const facebookApi = new FacebookMarketingAPI(accessToken)
+    if (!facebookApi) {
+      facebookApi = new FacebookMarketingAPI(accessToken)
+    }
     
-    // 3. 两步拉取：先获取账户时区（流派2）
-    // 为什么需要这一步？
-    // - Facebook API 的账户时区是最可靠的来源（比数据库配置更准确）
-    // - 在拉取 insights 前先获取时区，确保 time_range 计算与账户时区对齐
-    // - 写入时把 timezone_name 落库，便于后续"数据时区优先"查询
-    // 【修复】无论是否传入 timezoneName，都从 Facebook API 获取最新时区，确保数据一致性
-    console.log(`📡 从 Facebook API 获取账户 ${accountId} 的时区...`)
+    // 3. 获取账户时区（AdsPolar策略：时区是静态数据，优先使用数据库缓存）
+    // 【优化】优先使用数据库中的时区，只有在数据库中没有时才去API查询
+    // 如果API查询失败，不更新数据库，保持原有时区（避免错误覆盖）
+    if (!timezoneName || timezoneName === 'UTC') {
+      // 如果数据库中没有时区，才去API查询
+      logger.info(`📡 数据库中没有时区配置，从 Facebook API 获取账户 ${accountId} 的时区...`)
+      try {
     const apiTimezone = await facebookApi.getAccountTimezone(accountId)
-    console.log(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
-    
-    // 如果 API 返回的时区与传入的时区不一致，更新数据库
-    if (timezoneName && timezoneName !== apiTimezone) {
-      console.log(`⚠️  时区不一致：数据库=${timezoneName}，API=${apiTimezone}，更新数据库...`)
+        if (apiTimezone && apiTimezone !== 'UTC') {
+    logger.info(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
+          // 更新数据库
       try {
         await pool.execute(
           `UPDATE account_mappings SET timezone_name = ? WHERE fb_account_id = ?`,
           [apiTimezone, accountId]
         )
-        console.log(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
+        logger.info(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
       } catch (updateError) {
-        console.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
+        logger.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
       }
-    } else if (!timezoneName) {
-      // 如果数据库中没有时区，也更新数据库
-      console.log(`📝 数据库中没有时区配置，更新为 ${apiTimezone}...`)
-      try {
-        await pool.execute(
-          `UPDATE account_mappings SET timezone_name = ? WHERE fb_account_id = ?`,
-          [apiTimezone, accountId]
-        )
-        console.log(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
-      } catch (updateError) {
-        console.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
+          timezoneName = apiTimezone
+        } else {
+          // API返回UTC或失败，使用默认值
+          timezoneName = apiTimezone || 'UTC'
+          logger.info(`⚠️  API返回时区为UTC或失败，使用默认值: ${timezoneName}`)
+        }
+      } catch (error) {
+        // API查询失败，不更新数据库，使用传入的时区或默认UTC
+        logger.warn(`⚠️  获取账户 ${accountId} 时区失败，使用数据库时区或默认UTC:`, error.message)
+        timezoneName = timezoneName || 'UTC'
+        // 不更新数据库，避免错误覆盖
       }
+    } else {
+      // 数据库中有时区，直接使用（AdsPolar策略：时区是静态数据，不需要每次查询）
+      logger.info(`✅ 使用数据库中的时区: ${timezoneName}`)
     }
     
-    // 使用从 API 获取的时区（最准确）
-    timezoneName = apiTimezone
-    
-    // 3. 获取账户下所有广告ID列表
-    console.log(`📋 获取账户 ${accountId} 的广告列表...`)
-    const ads = await facebookApi.getAds(accountId)
-    
-    if (!ads || ads.length === 0) {
-      console.log(`⚠️  账户 ${accountId} 没有广告，跳过同步`)
+    // 4. 【AdsPolar策略：Insights First - 标准实现】
+    // 第1步：API 嗅探（Discovery Phase）
+    // 直接向 Facebook 发起一次"广撒网"的 Insights 请求，不指定 ad_id
+    // 这样可以捕获所有今天花了钱的广告（包括新广告），避免"鸡生蛋"问题
+    logger.info(`📡 从 Facebook API 查询账户 ${accountId} 的 insights（Today，不指定 ad_id，Insights First策略）...`)
+
+    let insights = []
+    let activeAdIds = []
+    let structurePayload = {}
+    try {
+      // 直接从 API 查询 insights（不指定 ad_id），Facebook 会返回账户下所有广告的 insights
+      insights = await facebookApi.getAdInsights(accountId, {
+        preset: 'today'
+      }, {
+        level: 'ad',
+        useAccountAttributionSetting: true
+      })
+      
+      // 在客户端过滤：只保留 spend > 0 的广告
+      // 注意：Facebook API 可能不支持 filtering 参数，所以我们在客户端过滤
+      insights = insights.filter(insight => {
+        const spend = parseFloat(insight.spend || 0)
+        return spend > 0
+      })
+      
+      if (insights.length === 0) {
+        logger.info(`⚠️  账户 ${accountId} 没有 spend>0 的广告（API 查询结果），跳过同步`)
+        return {
+          success: true,
+          syncedCount: 0,
+          sessionId: syncSessionId,
+          activeAdIds: [],
+          structurePayload: {}
+        }
+      }
+
+      // 提取活跃广告 ID 列表（去重）
+      activeAdIds = [...new Set(insights.map(insight => String(insight.ad_id || '')).filter(id => id))]
+      logger.info(`✅ 从 API 查询到 ${insights.length} 条 spend>0 的广告数据，${activeAdIds.length} 个唯一广告ID`)
+
+      // 第2步：元数据补全（同一轮只调用一次 resolveObjectsByIds，供 status 落盘 + Piggyback 写 structure_ads 复用）
+      const STRUCTURE_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time'
+      const statusMap = new Map()
+
+      if (activeAdIds.length > 0) {
+        logger.info(`📋 批量解析活跃广告元数据（${activeAdIds.length} 个，同轮仅此一次 resolve）...`)
+        const allAdsWithStructure = await facebookApi.resolveObjectsByIds(activeAdIds, { fields: STRUCTURE_FIELDS })
+        allAdsWithStructure.forEach(ad => {
+          const adId = String(ad.id || '')
+          if (!adId) return
+          statusMap.set(adId, ad.effective_status || ad.status || null)
+          structurePayload[adId] = {
+            name: ad.name ?? '',
+            effective_status: ad.effective_status ?? null,
+            status: ad.status ?? null,
+            configured_status: ad.configured_status ?? null,
+            adset_id: ad.adset_id ?? null,
+            campaign_id: ad.campaign_id ?? null,
+            updated_time: ad.updated_time ?? null
+          }
+        })
+      }
+
+      // 合并广告状态与结构字段到 insights（供落盘 ad_snapshots 时带齐 campaign_id/adset_id）
+      // Insights API 有时不返回或丢失 campaign_id，用 resolve 结果兜底，确保「按广告系列」规则能匹配到广告
+      insights.forEach(insight => {
+        const adId = String(insight.ad_id || '')
+        if (statusMap.has(adId)) insight.status = statusMap.get(adId)
+        const payload = structurePayload[adId]
+        if (payload) {
+          if (payload.campaign_id != null) insight.campaign_id = payload.campaign_id
+          if (payload.adset_id != null) insight.adset_id = payload.adset_id
+        }
+      })
+      // 写入时兜底：若仍有 campaign_id/adset_id 为空，从 structure_ads 补齐（不增加 FB 调用）
+      await fillCampaignAdsetFromStructure(accountId, insights)
+    } catch (error) {
+      logger.error(`❌ API 嗅探失败: ${error.message}`)
       return {
-        success: true,
+        success: false,
         syncedCount: 0,
-        sessionId: syncSessionId
+        sessionId: syncSessionId,
+        error: error.message,
+        activeAdIds: [],
+        structurePayload: {}
       }
     }
     
-    // 提取广告ID列表
-    const adIds = ads.map(ad => String(ad.id || ad.ad_id || '')).filter(id => id)
+    // 第3步：数据落盘（AdsPolar 队列策略）
+    // 不直接写数据库，而是推入写入队列，由串行写入器统一处理
+    // 这样可以彻底避免死锁问题
+    logger.info(`📤 推入写入队列，共 ${insights.length} 条记录（全部为 spend>0）...`)
     
-    if (adIds.length === 0) {
-      console.log(`⚠️  账户 ${accountId} 的广告列表为空，跳过同步`)
-      return {
-        success: true,
-        syncedCount: 0,
-        sessionId: syncSessionId
-      }
-    }
-    
-    console.log(`📋 找到 ${adIds.length} 个广告，开始批量拉取数据...`)
-    
-    // 4. 获取广告状态（从 /ads API 获取）
-    console.log(`📋 获取账户 ${accountId} 的广告状态...`)
-    const adsWithStatus = await facebookApi.getAds(accountId)
-    
-    // 创建广告状态映射表（ad_id -> status），便于后续合并
-    const statusMap = new Map()
-    adsWithStatus.forEach(ad => {
-      const adId = String(ad.id || ad.ad_id || '')
-      // 优先使用 effective_status（实际生效状态），如果没有则使用 status
-      const status = ad.effective_status || ad.status || null
-      if (adId) {
-        statusMap.set(adId, status)
-      }
+    enqueueWrite('SNAPSHOT', insights, {
+      accountId,
+      ownerId,
+      syncSessionId,
+      syncedAt,
+      timezoneName
     })
     
-    // 5. 使用 20-Batch 聚合拉取数据
-    const insights = await fetchInsightsInBatches(accountId, adIds, facebookApi)
+    // 注意：队列写入是异步的，这里返回的是入队数量，不是实际写入数量
+    // 实际写入数量由队列写入器处理
+    const syncedCount = insights.length
     
-    if (!insights || insights.length === 0) {
-      console.log(`⚠️  账户 ${accountId} 没有拉取到数据，跳过写入`)
-      return {
-        success: true,
-        syncedCount: 0,
-        sessionId: syncSessionId
-      }
-    }
-    
-    // 6. 合并广告状态到 insights 数据中
-    insights.forEach(insight => {
-      const adId = String(insight.ad_id || '')
-      if (statusMap.has(adId)) {
-        insight.status = statusMap.get(adId)
-      }
-    })
-    
-    // 7. 批量写入 ad_snapshots 表
-    const syncedCount = await saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, syncedAt, timezoneName)
-    
-    console.log(`✅ 账户 ${accountId} 同步完成，会话ID: ${syncSessionId}，共同步 ${syncedCount} 条记录`)
-    
+    logger.info(`✅ 账户 ${accountId} 同步完成，会话ID: ${syncSessionId}，共同步 ${syncedCount} 条记录`)
+
     return {
       success: true,
       syncedCount: syncedCount,
-      sessionId: syncSessionId
+      sessionId: syncSessionId,
+      activeAdIds: activeAdIds || [],
+      structurePayload: structurePayload || {}
     }
   } catch (error) {
-    console.error(`❌ 同步账户 ${accountId} 失败:`, error.message)
+    logger.error(`❌ 同步账户 ${accountId} 失败:`, error.message)
     throw error
   }
 }
@@ -179,23 +481,25 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
  * @returns {Promise<Array>} 按日数据数组，每个元素包含 date 字段
  */
 async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, untilDate) {
-  console.log(`📅 按日拉取数据: ${sinceDate} ~ ${untilDate}，共 ${adIds.length} 个广告`)
+  logger.info(`📅 按日拉取数据: ${sinceDate} ~ ${untilDate}，共 ${adIds.length} 个广告`)
   
   if (!adIds || adIds.length === 0) {
     return []
   }
   
-  const BATCH_SIZE = 20
+  const BATCH_SIZE = 50  // Facebook Batch API 最多支持 50 个子请求/批
   const adIdChunks = chunkArray(adIds, BATCH_SIZE)
   const allDailyInsights = []
   
-  const fields = 'ad_id,ad_name,adset_id,spend,cpc,actions,action_values,cost_per_action_type,cost_per_unique_link_click,cost_per_unique_inline_link_click,inline_link_clicks,unique_inline_link_clicks,purchase_roas'
+  // 写库语义（方案A）：不持久化派生值（如 cpc/roas 本地计算）；roas 仅存 API 兜底字段
+  // 因此 fields 中不再请求 cpc，且同时请求 purchase_roas + website_purchase_roas 作为兜底来源
+  const fields = 'ad_id,ad_name,adset_id,spend,actions,action_values,unique_actions,cost_per_action_type,cost_per_unique_link_click,cost_per_unique_inline_link_click,inline_link_clicks,unique_inline_link_clicks,purchase_roas,website_purchase_roas'
   const useAccountAttributionSetting = 'true'
   
   // 遍历每个批次
   for (let i = 0; i < adIdChunks.length; i++) {
     const chunk = adIdChunks[i]
-    console.log(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
+    logger.info(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
     
     try {
       // 构造 Batch API 请求
@@ -225,7 +529,7 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
         : {}
       
       if (responseData.error) {
-        console.error(`❌ Batch API 请求失败:`, responseData.error)
+        logger.error(`❌ Batch API 请求失败:`, responseData.error)
         continue
       }
       
@@ -249,7 +553,7 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
             const bodyData = JSON.parse(item.body)
             
             if (bodyData.error) {
-              console.warn(`⚠️  广告 ${adId} 拉取失败:`, bodyData.error.message)
+              logger.warn(`⚠️  广告 ${adId} 拉取失败:`, bodyData.error.message)
               return
             }
             
@@ -267,16 +571,16 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
             })
           }
         } catch (parseError) {
-          console.error(`❌ 解析广告 ${chunk[index]} 的响应失败:`, parseError.message)
+          logger.error(`❌ 解析广告 ${chunk[index]} 的响应失败:`, parseError.message)
         }
       })
     } catch (error) {
-      console.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
+      logger.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
       continue
     }
   }
   
-  console.log(`✅ 按日拉取完成，共获取 ${allDailyInsights.length} 条按日数据`)
+  logger.info(`✅ 按日拉取完成，共获取 ${allDailyInsights.length} 条按日数据`)
   return allDailyInsights
 }
 
@@ -292,8 +596,10 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
   if (!dailyInsights || dailyInsights.length === 0) {
     return 0
   }
-  
-  console.log(`💾 开始更新 daily_stats 表，共 ${dailyInsights.length} 条按日数据`)
+  // 写入时兜底：若 API 未带 campaign_id/adset_id，从 structure_ads 补齐
+  await fillCampaignAdsetFromStructure(accountId, dailyInsights)
+
+  logger.info(`💾 开始更新 daily_stats 表，共 ${dailyInsights.length} 条按日数据`)
   
   const values = dailyInsights.map(insight => {
     // 解析 actions 和 action_values
@@ -308,9 +614,13 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       'purchase'
     ])
     
-    // 提取原始计数字段
-    const linkClicks = parseInt(insight.inline_link_clicks || 0)
-    const uniqueLinkClicks = parseInt(insight.unique_inline_link_clicks || 0)
+    // P0：口径正确。link_clicks 仅用 inline_link_clicks / actions，绝不 fallback 到 clicks（全部点击）
+    const rawLink = (insight.inline_link_clicks != null && insight.inline_link_clicks !== '') ? parseInt(insight.inline_link_clicks) : NaN
+    const fromActions = extractActionCount(actions, ['link_click', 'inline_link_click'])
+    const linkClicks = !Number.isNaN(rawLink) ? rawLink : (fromActions > 0 ? fromActions : 0)
+    const rawUnique = (insight.unique_inline_link_clicks != null && insight.unique_inline_link_clicks !== '') ? parseInt(insight.unique_inline_link_clicks) : NaN
+    const uniqueFromActions = extractActionCount(insight.unique_actions || [], ['link_click', 'inline_link_click'])
+    const uniqueLinkClicks = !Number.isNaN(rawUnique) ? rawUnique : (uniqueFromActions > 0 ? uniqueFromActions : 0)
     const addToCartCount = extractActionCount(actions, [
       'offsite_conversion.fb_pixel_add_to_cart',
       'add_to_cart'
@@ -324,17 +634,17 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       'add_payment_info'
     ])
     
-    // 计算 CPC 和 ROAS
+    // 方案A写库语义对齐：不持久化派生平均值（cpc/roas 本地计算），只存 API 兜底 roas 或 null
     const spend = parseFloat(insight.spend || 0)
-    const cpc = insight.cpc != null ? parseFloat(insight.cpc) : (linkClicks > 0 ? spend / linkClicks : null)
-    const roas = extractRoas(insight, spend, purchaseValue)
+    const cpc = null
+    const roas = extractApiRoas(insight)
     
     return [
       accountId,
       String(insight.ad_id || ''),
       insight.ad_name || null,
       ownerId,
-      insight.date || insight.date_start,  // 使用 date_start 作为自然日
+      insight.date_start || insight.date,  // 优先事件自然日 date_start，统一口径
       timezoneName,
       spend,
       cpc,
@@ -348,12 +658,13 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       addToCartCount,
       initiateCheckoutCount,
       addPaymentInfoCount,
-      insight.adset_id ? String(insight.adset_id) : null
+      insight.adset_id ? String(insight.adset_id) : null,
+      insight.campaign_id ? String(insight.campaign_id) : null
     ]
   })
   
   // 使用 ON DUPLICATE KEY UPDATE 更新 daily_stats
-  const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+  const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
   
   const sql = `
     INSERT INTO daily_stats (
@@ -361,7 +672,7 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       spend, cpc, roas, purchases, add_to_cart, actions,
       link_clicks, unique_link_clicks, purchase_value,
       add_to_cart_count, initiate_checkout_count, add_payment_info_count,
-      ad_set_id
+      ad_set_id, campaign_id
     ) VALUES ${placeholders}
     ON DUPLICATE KEY UPDATE
       ad_name = VALUES(ad_name),
@@ -378,6 +689,7 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       initiate_checkout_count = VALUES(initiate_checkout_count),
       add_payment_info_count = VALUES(add_payment_info_count),
       ad_set_id = VALUES(ad_set_id),
+      campaign_id = VALUES(campaign_id),
       updated_at = NOW()
   `
   
@@ -385,22 +697,23 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
   const [result] = await pool.execute(sql, params)
   const updatedCount = result.affectedRows || 0
   
-  console.log(`✅ 成功更新 ${updatedCount} 条记录到 daily_stats 表`)
+  logger.info(`✅ 成功更新 ${updatedCount} 条记录到 daily_stats 表`)
   return updatedCount
 }
 
 /**
- * 筛选近 N 天内有花费或转化的广告（用于优化 API 配额）
+ * 筛选近 N 天内有 spend>0 的广告（AdsPolar策略：Insights First）
+ * 【AdsPolar策略】直接从数据库查询活跃广告ID，不依赖传入的 adIds 列表
+ * 这样可以避免先调用 /ads 接口拉取所有广告（包括废弃的），大幅减少API配额消耗
  * @param {string} accountId - 账户ID
- * @param {Array<string>} adIds - 所有广告ID列表
+ * @param {Array<string>} adIds - 所有广告ID列表（已废弃，不再使用，保留参数以兼容旧代码）
  * @param {string} timezoneName - 账户时区
  * @param {number} daysBack - 回溯天数（默认 7 天）
- * @returns {Promise<Array<string>>} 筛选后的广告ID列表
+ * @returns {Promise<Array<string>>} 筛选后的广告ID列表（只包含 spend>0 的广告）
  */
 async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
-  if (!adIds || adIds.length === 0) {
-    return []
-  }
+  // 【AdsPolar策略】不再依赖传入的 adIds，直接从数据库查询活跃广告
+  // 这样可以避免先调用 /ads 接口拉取所有广告（包括废弃的）
   
   try {
     // 计算日期范围（账户时区）
@@ -408,7 +721,8 @@ async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
     const sinceDate = now.minus({ days: daysBack }).toFormat('yyyy-MM-dd')
     const untilDate = now.toFormat('yyyy-MM-dd')  // 包含今天
     
-    // 查询 daily_stats 和 ad_snapshots，找出近 N 天内有花费或转化的广告
+    // 查询 daily_stats 和 ad_snapshots，找出近 N 天内有 spend>0 的广告
+    // 【严格筛选】只筛选 spend>0，不包含其他条件
     const [rows] = await pool.query(`
       SELECT DISTINCT ad_id
       FROM (
@@ -416,32 +730,36 @@ async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
         WHERE account_id = ? 
           AND date >= ? 
           AND date <= ?
-          AND (spend > 0 OR purchases > 0 OR link_clicks > 0)
+          AND spend > 0
         
         UNION
         
         SELECT ad_id FROM ad_snapshots
         WHERE account_id = ?
-          AND DATE(synced_at) >= ?
-          AND DATE(synced_at) <= ?
-          AND (spend > 0 OR purchases > 0 OR link_clicks > 0)
+          AND data_date >= ?
+          AND data_date <= ?
+          AND spend > 0
       ) AS active_ads
     `, [accountId, sinceDate, untilDate, accountId, sinceDate, untilDate])
     
     const activeAdIds = rows.map(row => String(row.ad_id))
     
-    // 如果查询到的活跃广告数量较少，说明大部分广告都没有数据
-    // 返回筛选后的列表；如果筛选后数量仍然很多，说明大部分广告都有数据，返回原列表
-    if (activeAdIds.length > 0 && activeAdIds.length < adIds.length * 0.5) {
-      console.log(`📊 筛选活跃广告: ${adIds.length} → ${activeAdIds.length} (近 ${daysBack} 天内有数据)`)
+    // 【AdsPolar策略】严格模式：只返回活跃广告，无论数量多少
+    // 如果查询到活跃广告，就返回活跃广告列表（即使数量很多，也只拉取这些）
+    // 如果没有活跃广告，返回空列表（不拉取任何广告）
+    if (activeAdIds.length > 0) {
+      logger.info(`📊 从数据库查询到 ${activeAdIds.length} 个活跃广告（近 ${daysBack} 天内有 spend>0）`)
       return activeAdIds
+    } else {
+      // 没有活跃广告，返回空列表（不拉取任何广告）
+      logger.info(`📊 数据库中没有活跃广告（近 ${daysBack} 天内无 spend>0），跳过拉取`)
+      return []
     }
-    
-    // 如果大部分广告都有数据，或者查询失败，返回原列表
-    return adIds
   } catch (error) {
-    console.warn(`⚠️  筛选活跃广告失败，使用全部广告:`, error.message)
-    return adIds
+    // 查询失败时，为了安全起见，返回空列表（不拉取任何广告）
+    // 避免因为查询失败而拉取所有广告，导致 API 配额浪费
+    logger.warn(`⚠️  筛选活跃广告失败，返回空列表（安全策略）:`, error.message)
+    return []
   }
 }
 
@@ -453,7 +771,7 @@ async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
  * @returns {Promise<Object>} 刷新结果 { success: boolean, updatedCount: number }
  */
 export async function refreshAccountTimezoneHistory(accountId, timezoneName = null) {
-  console.log(`🔄 开始刷新账户 ${accountId} 的历史时区...`)
+  logger.info(`🔄 开始刷新账户 ${accountId} 的历史时区...`)
   
   try {
     // 1. 获取账户时区
@@ -471,7 +789,7 @@ export async function refreshAccountTimezoneHistory(accountId, timezoneName = nu
       timezoneName = rows[0].timezone_name || 'UTC'
     }
     
-    console.log(`📋 目标时区: ${timezoneName}`)
+    logger.info(`📋 目标时区: ${timezoneName}`)
     
     // 2. 统计需要更新的记录数
     const [countRows] = await pool.query(`
@@ -483,14 +801,14 @@ export async function refreshAccountTimezoneHistory(accountId, timezoneName = nu
     const needUpdateCount = countRows[0]?.cnt || 0
     
     if (needUpdateCount === 0) {
-      console.log(`✅ 账户 ${accountId} 的历史时区已一致，无需更新`)
+      logger.info(`✅ 账户 ${accountId} 的历史时区已一致，无需更新`)
       return {
         success: true,
         updatedCount: 0
       }
     }
     
-    console.log(`📊 需要更新 ${needUpdateCount} 条记录`)
+    logger.info(`📊 需要更新 ${needUpdateCount} 条记录`)
     
     // 3. 批量更新 timezone_name
     const [result] = await pool.execute(`
@@ -501,32 +819,38 @@ export async function refreshAccountTimezoneHistory(accountId, timezoneName = nu
     
     const updatedCount = result.affectedRows || 0
     
-    console.log(`✅ 账户 ${accountId} 的历史时区刷新完成，共更新 ${updatedCount} 条记录`)
+    logger.info(`✅ 账户 ${accountId} 的历史时区刷新完成，共更新 ${updatedCount} 条记录`)
     
     return {
       success: true,
       updatedCount: updatedCount
     }
   } catch (error) {
-    console.error(`❌ 刷新账户 ${accountId} 历史时区失败:`, error.message)
+    logger.error(`❌ 刷新账户 ${accountId} 历史时区失败:`, error.message)
     throw error
   }
 }
 
 /**
- * 同步单个账户的滑动窗口数据（修复归因延迟）
+ * 同步单个账户的滑动窗口数据（AdsPolar策略：Insights First）
  * 【核心改进】严格按自然日语义：
  * - today 数据写入 ad_snapshots（实时快照）
  * - 过去 N 天的按日数据更新到 daily_stats（修复迟到归因）
+ * 
+ * 【AdsPolar策略优化】
+ * 1. 时区获取：优先使用数据库中的时区，只有在数据库中没有时才去API查询
+ * 2. 广告筛选：直接从数据库查询活跃广告ID，不先调用 /ads 接口
+ * 3. Insights First：只拉取活跃广告的 insights，不拉取废弃广告
+ * 
  * @param {string} accountId - Facebook 账户ID（字符串格式）
  * @param {number} ownerId - 负责人ID（用于数据隔离）
- * @param {string} timezoneName - 账户时区（如 'Asia/Shanghai'）
+ * @param {string} timezoneName - 账户时区（如 'Asia/Shanghai'，优先使用数据库中的时区）
  * @param {number} daysBack - 回溯天数（默认 7 天）
- * @param {boolean} optimizeQuota - 是否优化配额（只拉取有数据的广告，默认 false）
+ * @param {boolean} optimizeQuota - 是否优化配额（已废弃，现在总是启用，保留参数以兼容旧代码）
  * @returns {Promise<Object>} 同步结果 { success: boolean, todayCount: number, dailyStatsCount: number, sessionId: string }
  */
 export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName = 'UTC', daysBack = 7, optimizeQuota = false) {
-  console.log(`🔄 开始同步账户 ${accountId} 的滑动窗口数据（修复归因延迟）...`)
+  logger.info(`🔄 开始同步账户 ${accountId} 的滑动窗口数据（修复归因延迟）...`)
   
   // 检查 Token 熔断器状态
   const breakerStatus = getCircuitBreakerStatus()
@@ -546,86 +870,68 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     }
     const facebookApi = new FacebookMarketingAPI(accessToken)
     
-    // 3. 从 Facebook API 获取账户时区
-    console.log(`📡 从 Facebook API 获取账户 ${accountId} 的时区...`)
+    // 3. 获取账户时区（AdsPolar策略：时区是静态数据，优先使用数据库缓存）
+    // 【优化】优先使用数据库中的时区，只有在数据库中没有时才去API查询
+    // 如果API查询失败，不更新数据库，保持原有时区（避免错误覆盖）
+    if (!timezoneName || timezoneName === 'UTC') {
+      // 如果数据库中没有时区，才去API查询
+      logger.info(`📡 数据库中没有时区配置，从 Facebook API 获取账户 ${accountId} 的时区...`)
+      try {
     const apiTimezone = await facebookApi.getAccountTimezone(accountId)
-    console.log(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
-    
-    // 更新数据库时区（如果不一致）
-    if (timezoneName && timezoneName !== apiTimezone) {
-      console.log(`⚠️  时区不一致：数据库=${timezoneName}，API=${apiTimezone}，更新数据库...`)
+        if (apiTimezone && apiTimezone !== 'UTC') {
+    logger.info(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
+          // 更新数据库
       try {
         await pool.execute(
           `UPDATE account_mappings SET timezone_name = ? WHERE fb_account_id = ?`,
           [apiTimezone, accountId]
         )
-        console.log(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
+        logger.info(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
       } catch (updateError) {
-        console.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
+        logger.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
       }
-    } else if (!timezoneName || timezoneName === 'UTC') {
-      console.log(`📝 数据库时区为默认值，更新为 ${apiTimezone}...`)
-      try {
-        await pool.execute(
-          `UPDATE account_mappings SET timezone_name = ? WHERE fb_account_id = ?`,
-          [apiTimezone, accountId]
-        )
-        console.log(`✅ 已更新 account_mappings.timezone_name = ${apiTimezone}`)
-      } catch (updateError) {
-        console.warn(`⚠️  更新 account_mappings.timezone_name 失败:`, updateError.message)
-      }
-    }
-    
     timezoneName = apiTimezone
-    
-    // 4. 获取账户下所有广告ID列表
-    console.log(`📋 获取账户 ${accountId} 的广告列表...`)
-    const ads = await facebookApi.getAds(accountId)
-    
-    if (!ads || ads.length === 0) {
-      console.log(`⚠️  账户 ${accountId} 没有广告，跳过同步`)
-      return {
-        success: true,
-        todayCount: 0,
-        dailyStatsCount: 0,
-        sessionId: syncSessionId
+        } else {
+          // API返回UTC或失败，使用默认值
+          timezoneName = apiTimezone || 'UTC'
+          logger.info(`⚠️  API返回时区为UTC或失败，使用默认值: ${timezoneName}`)
+        }
+      } catch (error) {
+        // API查询失败，不更新数据库，使用传入的时区或默认UTC
+        logger.warn(`⚠️  获取账户 ${accountId} 时区失败，使用数据库时区或默认UTC:`, error.message)
+        timezoneName = timezoneName || 'UTC'
+        // 不更新数据库，避免错误覆盖
       }
+    } else {
+      // 数据库中有时区，直接使用（AdsPolar策略：时区是静态数据，不需要每次查询）
+      logger.info(`✅ 使用数据库中的时区: ${timezoneName}`)
     }
     
-    const adIds = ads.map(ad => String(ad.id || ad.ad_id || '')).filter(id => id)
+    // 4. 【AdsPolar策略：Insights First】直接从数据库查询活跃广告ID，不先调用 /ads 接口
+    logger.info(`📋 从数据库查询活跃广告ID（近 ${daysBack} 天内有 spend>0）...`)
+    let targetAdIds = await filterActiveAds(accountId, [], timezoneName, daysBack)
     
-    if (adIds.length === 0) {
-      console.log(`⚠️  账户 ${accountId} 的广告列表为空，跳过同步`)
-      return {
-        success: true,
-        todayCount: 0,
-        dailyStatsCount: 0,
-        sessionId: syncSessionId
-      }
-    }
-    
-    console.log(`📋 找到 ${adIds.length} 个广告，开始滑动窗口同步...`)
-    
-    // 5. 配额优化：如果启用，只拉取近 N 天内有数据的广告
-    let targetAdIds = adIds
-    if (optimizeQuota) {
-      targetAdIds = await filterActiveAds(accountId, adIds, timezoneName, daysBack)
       if (targetAdIds.length === 0) {
-        console.log(`⚠️  没有找到活跃广告，跳过滑动窗口同步`)
+        logger.info(`⚠️  没有找到活跃广告，跳过滑动窗口同步`)
         return {
           success: true,
           todayCount: 0,
           dailyStatsCount: 0,
           sessionId: syncSessionId
         }
-      }
     }
     
-    // 6. 获取广告状态
-    const adsWithStatus = await facebookApi.getAds(accountId)
+    logger.info(`📊 从数据库查询到 ${targetAdIds.length} 个活跃广告（近 ${daysBack} 天内有 spend>0）`)
+    
+    // 6. 获取广告状态（优化：只获取目标广告的状态，使用批量查询 API）
+    logger.info(`📋 获取账户 ${accountId} 的目标广告状态（批量查询，${targetAdIds.length} 个）...`)
+    // 使用 resolveObjectsByIds 批量查询，避免拉取所有广告（包括废弃的）
+    const adsWithStatus = await facebookApi.resolveObjectsByIds(targetAdIds, {
+      fields: 'id,name,effective_status,status,configured_status'
+    })
     const statusMap = new Map()
     adsWithStatus.forEach(ad => {
-      const adId = String(ad.id || ad.ad_id || '')
+      const adId = String(ad.id || '')
       const status = ad.effective_status || ad.status || null
       if (adId) {
         statusMap.set(adId, status)
@@ -633,11 +939,23 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     })
     
     // 7. 同步 Today 数据 → 写入 ad_snapshots（实时快照）
-    console.log(`📅 同步 Today 数据 → ad_snapshots...`)
+    logger.info(`📅 同步 Today 数据 → ad_snapshots...`)
     const todayInsights = await fetchInsightsInBatches(accountId, targetAdIds, facebookApi, 'today')
     
+    // 过滤：只保留 spend > 0 的广告（性能优化）
+    const filteredTodayInsights = todayInsights.filter(insight => {
+      const spend = parseFloat(insight.spend || 0)
+      return spend > 0
+    })
+    
+    if (filteredTodayInsights.length === 0) {
+      logger.info(`⚠️  Today 数据中没有 spend > 0 的广告，跳过写入`)
+    } else {
+      logger.info(`📊 Today 过滤结果: ${todayInsights.length} → ${filteredTodayInsights.length} (只保留 spend > 0)`)
+    }
+    
     // 合并广告状态到 today 数据
-    todayInsights.forEach(insight => {
+    filteredTodayInsights.forEach(insight => {
       const adId = String(insight.ad_id || '')
       if (statusMap.has(adId)) {
         insight.status = statusMap.get(adId)
@@ -645,24 +963,30 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     })
     
     // 写入 ad_snapshots（只存 today 数据）
-    const todayCount = await saveSnapshotsToDb(todayInsights, accountId, ownerId, syncSessionId, syncedAt, timezoneName)
-    console.log(`✅ Today 数据已写入 ad_snapshots，共 ${todayCount} 条记录`)
+    const todayCount = await saveSnapshotsToDb(filteredTodayInsights, accountId, ownerId, syncSessionId, syncedAt, timezoneName)
+    logger.info(`✅ Today 数据已写入 ad_snapshots，共 ${todayCount} 条记录`)
     
     // 8. 同步过去 N 天的按日数据 → 更新 daily_stats（修复迟到归因）
-    console.log(`📅 同步过去 ${daysBack} 天的按日数据 → daily_stats...`)
+    logger.info(`📅 同步过去 ${daysBack} 天的按日数据 → daily_stats...`)
     
     // 计算日期范围（账户时区）
     const now = DateTime.now().setZone(timezoneName)
     const untilDate = now.minus({ days: 1 }).toFormat('yyyy-MM-dd')  // 昨天（不包含今天）
     const sinceDate = now.minus({ days: daysBack }).toFormat('yyyy-MM-dd')  // N 天前
     
-    console.log(`📅 日期范围: ${sinceDate} ~ ${untilDate} (账户时区: ${timezoneName})`)
+    logger.info(`📅 日期范围: ${sinceDate} ~ ${untilDate} (账户时区: ${timezoneName})`)
     
     // 拉取按日数据（使用筛选后的广告列表）
     const dailyInsights = await fetchInsightsByDay(accountId, targetAdIds, facebookApi, sinceDate, untilDate)
     
-    if (dailyInsights.length === 0) {
-      console.log(`⚠️  没有拉取到按日数据，跳过更新 daily_stats`)
+    // 过滤：只保留 spend > 0 的按日数据（性能优化）
+    const filteredDailyInsights = dailyInsights.filter(insight => {
+      const spend = parseFloat(insight.spend || 0)
+      return spend > 0
+    })
+    
+    if (filteredDailyInsights.length === 0) {
+      logger.info(`⚠️  没有拉取到 spend > 0 的按日数据，跳过更新 daily_stats`)
       return {
         success: true,
         todayCount: todayCount,
@@ -671,13 +995,15 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
       }
     }
     
-    // 更新 daily_stats（按日修复迟到归因）
-    const dailyStatsCount = await updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, timezoneName)
+    logger.info(`📊 按日数据过滤结果: ${dailyInsights.length} → ${filteredDailyInsights.length} (只保留 spend > 0)`)
     
-    console.log(`✅ 账户 ${accountId} 滑动窗口同步完成`)
-    console.log(`   - Today 数据: ${todayCount} 条（ad_snapshots）`)
-    console.log(`   - 按日数据: ${dailyStatsCount} 条（daily_stats）`)
-    console.log(`   会话ID: ${syncSessionId}`)
+    // 更新 daily_stats（按日修复迟到归因）
+    const dailyStatsCount = await updateDailyStatsFromInsights(filteredDailyInsights, accountId, ownerId, timezoneName)
+    
+    logger.info(`✅ 账户 ${accountId} 滑动窗口同步完成`)
+    logger.info(`   - Today 数据: ${todayCount} 条（ad_snapshots）`)
+    logger.info(`   - 按日数据: ${dailyStatsCount} 条（daily_stats）`)
+    logger.info(`   会话ID: ${syncSessionId}`)
     
     return {
       success: true,
@@ -686,7 +1012,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
       sessionId: syncSessionId
     }
   } catch (error) {
-    console.error(`❌ 同步账户 ${accountId} 滑动窗口数据失败:`, error.message)
+    logger.error(`❌ 同步账户 ${accountId} 滑动窗口数据失败:`, error.message)
     throw error
   }
 }
@@ -701,7 +1027,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
  * @returns {Promise<Object>} 同步结果汇总
  */
 export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota = false) {
-  console.log('🔄 开始同步所有账户的滑动窗口数据（修复归因延迟）...')
+  logger.info('🔄 开始同步所有账户的滑动窗口数据（修复归因延迟）...')
   
   // 分布式锁：防止多实例重复执行
   const lockName = 'sync:sliding_window'
@@ -709,7 +1035,7 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
   const lockAcquired = lockRows[0]?.acquired === 1
   
   if (!lockAcquired) {
-    console.log('⏸️  另一个实例正在执行滑动窗口同步（DB锁已占用），跳过本次执行')
+    logger.info('⏸️  另一个实例正在执行滑动窗口同步（DB锁已占用），跳过本次执行')
     return {
       success: true,
       totalAccounts: 0,
@@ -728,7 +1054,7 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
     `)
     
     if (!accounts || accounts.length === 0) {
-      console.log('⚠️  没有找到活跃账户，跳过滑动窗口同步')
+      logger.info('⚠️  没有找到活跃账户，跳过滑动窗口同步')
       return {
         success: true,
         totalAccounts: 0,
@@ -736,63 +1062,63 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
       }
     }
     
-    console.log(`📋 找到 ${accounts.length} 个活跃账户，开始滑动窗口同步...`)
+    logger.info(`📋 找到 ${accounts.length} 个活跃账户，开始滑动窗口同步...`)
+    logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
-    // 2. 遍历每个账户，调用 syncAccountSlidingWindow
-    const results = []
-    let totalTodayCount = 0
-    let totalDailyStatsCount = 0
-    
-    for (let i = 0; i < accounts.length; i++) {
-      const account = accounts[i]
+    // 2. 使用受控并发遍历每个账户，调用 syncAccountSlidingWindow
+    const accountTasks = accounts.map((account, index) => 
+      accountTaskLimiter(async () => {
       const accountId = String(account.account_id || account.accountId || '')
       const ownerId = account.owner_id || account.ownerId
       const timezoneName = account.timezone_name || 'UTC'
       
       if (!accountId || !ownerId) {
-        console.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
-        continue
+        logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
+          return null
       }
       
       try {
-        console.log(`\n[${i + 1}/${accounts.length}] 滑动窗口同步账户 ${accountId}...`)
+          logger.info(`\n[${index + 1}/${accounts.length}] 滑动窗口同步账户 ${accountId}...`)
         const result = await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, optimizeQuota)
-        results.push({
+          return {
           accountId,
           ownerId,
           ...result
-        })
-        
-        totalTodayCount += result.todayCount || 0
-        totalDailyStatsCount += result.dailyStatsCount || 0
-        
-        // 在账户之间休眠，避免频率超限
-        if (i < accounts.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 1000)) // 休眠 1 秒
         }
       } catch (error) {
-        console.error(`❌ 账户 ${accountId} 滑动窗口同步失败:`, error.message)
-        results.push({
+        logger.error(`❌ 账户 ${accountId} 滑动窗口同步失败:`, error.message)
+          return {
           accountId,
           ownerId,
           success: false,
           error: error.message,
           todayCount: 0,
           dailyStatsCount: 0
-        })
-        // 继续处理下一个账户，不中断整个流程
-      }
-    }
+          }
+        }
+      })
+    )
+    
+    // 等待所有账户任务完成
+    const results = (await Promise.all(accountTasks)).filter(r => r !== null)
+    
+    // 统计总数
+    let totalTodayCount = 0
+    let totalDailyStatsCount = 0
+    results.forEach(r => {
+      totalTodayCount += r.todayCount || 0
+      totalDailyStatsCount += r.dailyStatsCount || 0
+    })
     
     // 3. 汇总结果
     const successCount = results.filter(r => r.success).length
     
-    console.log(`\n✅ 所有账户滑动窗口同步完成`)
-    console.log(`📊 统计:`)
-    console.log(`   - 账户总数: ${accounts.length}`)
-    console.log(`   - 成功账户: ${successCount}`)
-    console.log(`   - Today 数据: ${totalTodayCount} 条（ad_snapshots）`)
-    console.log(`   - 按日数据: ${totalDailyStatsCount} 条（daily_stats）`)
+    logger.info(`\n✅ 所有账户滑动窗口同步完成`)
+    logger.info(`📊 统计:`)
+    logger.info(`   - 账户总数: ${accounts.length}`)
+    logger.info(`   - 成功账户: ${successCount}`)
+    logger.info(`   - Today 数据: ${totalTodayCount} 条（ad_snapshots）`)
+    logger.info(`   - 按日数据: ${totalDailyStatsCount} 条（daily_stats）`)
     
     return {
       success: true,
@@ -803,14 +1129,14 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
       results
     }
   } catch (error) {
-    console.error('❌ 同步所有账户滑动窗口数据失败:', error.message)
+    logger.error('❌ 同步所有账户滑动窗口数据失败:', error.message)
     throw error
   } finally {
     // 释放锁
     try {
       await pool.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
     } catch (lockError) {
-      console.warn(`⚠️  释放锁失败: ${lockError.message}`)
+      logger.warn(`⚠️  释放锁失败: ${lockError.message}`)
     }
   }
 }
@@ -820,7 +1146,22 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
  * @returns {Promise<Object>} 同步结果汇总
  */
 export async function syncAllAccountsTodayStats() {
-  console.log('🔄 开始同步所有账户的今日数据...')
+  logger.info('🔄 开始同步所有账户的今日数据...')
+  
+  // 分布式锁：防止多实例重复执行（多人并发使用时尤其重要）
+  const lockName = 'sync:today_stats'
+  const [lockRows] = await pool.execute('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
+  const lockAcquired = lockRows[0]?.acquired === 1
+  
+  if (!lockAcquired) {
+    logger.info('⏸️  另一个实例正在执行 Today 数据同步（DB锁已占用），跳过本次执行')
+    return {
+      success: true,
+      totalAccounts: 0,
+      skipped: true,
+      message: '另一个实例正在执行，跳过'
+    }
+  }
   
   try {
     // 1. 从 account_mappings 表获取所有账户列表
@@ -836,7 +1177,7 @@ export async function syncAllAccountsTodayStats() {
     `)
     
     if (!accounts || accounts.length === 0) {
-      console.log('⚠️  没有找到活跃账户，跳过同步')
+      logger.info('⚠️  没有找到活跃账户，跳过同步')
       return {
         success: true,
         totalAccounts: 0,
@@ -844,47 +1185,45 @@ export async function syncAllAccountsTodayStats() {
       }
     }
     
-    console.log(`📋 找到 ${accounts.length} 个活跃账户，开始同步...`)
+    logger.info(`📋 找到 ${accounts.length} 个活跃账户，开始同步...`)
+    logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
-    // 2. 遍历每个账户，调用 syncAccountTodayStats
-    const results = []
-    for (let i = 0; i < accounts.length; i++) {
-      const account = accounts[i]
+    // 2. 使用受控并发遍历每个账户，调用 syncAccountTodayStats
+    const accountTasks = accounts.map((account, index) => 
+      accountTaskLimiter(async () => {
       const accountId = String(account.account_id || account.accountId || '')
       const ownerId = account.owner_id || account.ownerId
       // 从数据库读取时区，如果没有则使用默认值 'UTC'
       const timezoneName = account.timezone_name || 'UTC'
       
       if (!accountId || !ownerId) {
-        console.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
-        continue
+        logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
+          return null
       }
       
       try {
-        console.log(`\n[${i + 1}/${accounts.length}] 同步账户 ${accountId}...`)
+          logger.info(`\n[${index + 1}/${accounts.length}] 同步账户 ${accountId}...`)
         const result = await syncAccountTodayStats(accountId, ownerId, timezoneName)
-        results.push({
+          return {
           accountId,
           ownerId,
           ...result
-        })
-        
-        // 在账户之间休眠，避免频率超限
-        if (i < accounts.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 1000)) // 休眠 1 秒
         }
       } catch (error) {
-        console.error(`❌ 账户 ${accountId} 同步失败:`, error.message)
-        results.push({
+        logger.error(`❌ 账户 ${accountId} 同步失败:`, error.message)
+          return {
           accountId,
           ownerId,
           success: false,
           error: error.message,
           syncedCount: 0
-        })
-        // 继续处理下一个账户，不中断整个流程
       }
     }
+      })
+    )
+    
+    // 等待所有账户任务完成
+    const results = (await Promise.all(accountTasks)).filter(r => r !== null)
     
     // 3. 汇总结果（增强统计：区分成功且有数据、成功但无数据、失败）
     const successWithData = results.filter(r => r.success && (r.syncedCount || 0) > 0).length
@@ -892,28 +1231,164 @@ export async function syncAllAccountsTodayStats() {
     const failed = results.filter(r => !r.success).length
     const totalSyncedCount = results.reduce((sum, r) => sum + (r.syncedCount || 0), 0)
     
-    console.log(`\n✅ 所有账户同步完成，共 ${accounts.length} 个账户`)
-    console.log(`📊 详细统计:`)
-    console.log(`   - 成功且有数据: ${successWithData} 个`)
-    console.log(`   - 成功但无数据: ${successNoData} 个`)
-    console.log(`   - 失败: ${failed} 个`)
-    console.log(`   - 共同步 ${totalSyncedCount} 条记录`)
+    logger.info(`\n✅ 所有账户同步完成，共 ${accounts.length} 个账户`)
+    logger.info(`📊 详细统计:`)
+    logger.info(`   - 成功且有数据: ${successWithData} 个`)
+    logger.info(`   - 成功但无数据: ${successNoData} 个`)
+    logger.info(`   - 失败: ${failed} 个`)
+    logger.info(`   - 共同步 ${totalSyncedCount} 条记录`)
     
-    // 如果有失败账户，列出详细信息
-    if (failed > 0) {
+    // 4. 识别可重试的失败账户（API限流错误）
       const failedAccounts = results.filter(r => !r.success)
-      console.log(`\n⚠️  失败的账户详情:`)
+    const retryableAccounts = failedAccounts.filter(r => isRetryableError(r.error))
+    const nonRetryableAccounts = failedAccounts.filter(r => !isRetryableError(r.error))
+    
+    if (failed > 0) {
+      logger.info(`\n⚠️  失败的账户详情:`)
       failedAccounts.forEach(r => {
-        console.log(`   - ${r.accountId}: ${r.error || '未知错误'}`)
+        const isRetryable = isRetryableError(r.error)
+        logger.info(`   - ${r.accountId}: ${r.error || '未知错误'} ${isRetryable ? '[可重试]' : '[不可重试]'}`)
       })
+    }
+    
+    // 5. 重试可重试的失败账户（API限流错误）- 支持多次重试和指数退避
+    if (retryableAccounts.length > 0) {
+      logger.info(`\n🔄 开始重试 ${retryableAccounts.length} 个因API限流失败的账户（最多重试 ${RETRY_MAX_ATTEMPTS} 次）...`)
+      
+      // 多次重试循环（指数退避）
+      let remainingAccounts = [...retryableAccounts]
+      let totalRetrySuccess = 0
+      let totalRetryFailed = 0
+      let totalRetrySyncedCount = 0
+      
+      for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS && remainingAccounts.length > 0; attempt++) {
+        const delay = calculateBackoffDelay(attempt)
+        logger.info(`\n🔄 第 ${attempt} 次重试（共 ${remainingAccounts.length} 个账户）...`)
+        logger.info(`⏳ 等待 ${delay / 1000} 秒后重试（指数退避）...`)
+        
+        // 延迟重试（指数退避）
+        await new Promise(resolve => setTimeout(resolve, delay))
+        
+        // 过滤掉仍在冷却期内的账户
+        const accountsToRetry = remainingAccounts.filter(account => {
+          if (isAccountInCooldown(account.accountId)) {
+            const lastCallTime = accountLastCallTime.get(account.accountId)
+            const remainingCooldown = Math.ceil((ACCOUNT_COOLDOWN_MS - (Date.now() - lastCallTime)) / 1000)
+            logger.info(`   ⏸️  账户 ${account.accountId} 仍在冷却期内（还需等待 ${remainingCooldown} 秒），跳过本次重试`)
+            return false
+          }
+          return true
+        })
+        
+        if (accountsToRetry.length === 0) {
+          logger.info(`   ⏸️  所有账户都在冷却期内，跳过本次重试`)
+          break
+        }
+        
+        // 并发重试失败的账户
+        const retryTasks = accountsToRetry.map((failedAccount, index) => 
+          accountTaskLimiter(async () => {
+            const accountId = failedAccount.accountId
+            const ownerId = failedAccount.ownerId
+            const timezoneName = accounts.find(a => String(a.account_id || a.accountId || '') === accountId)?.timezone_name || 'UTC'
+            
+            // 记录账户调用时间（账户级别限流保护）
+            recordAccountCall(accountId)
+            
+            try {
+              logger.info(`\n[重试 ${attempt}/${RETRY_MAX_ATTEMPTS} - ${index + 1}/${accountsToRetry.length}] 重试账户 ${accountId}...`)
+              const result = await syncAccountTodayStats(accountId, ownerId, timezoneName)
+              logger.info(`✅ 账户 ${accountId} 重试成功，同步 ${result.syncedCount} 条记录`)
+              return {
+                accountId,
+                ownerId,
+                ...result,
+                retried: true,
+                retryAttempt: attempt
+              }
+            } catch (error) {
+              const isStillRetryable = isRetryableError(error)
+              logger.error(`❌ 账户 ${accountId} 第 ${attempt} 次重试失败: ${error.message} ${isStillRetryable ? '[仍可重试]' : '[不可重试]'}`)
+              return {
+                accountId,
+                ownerId,
+                success: false,
+                error: error.message,
+                syncedCount: 0,
+                retried: true,
+                retryAttempt: attempt,
+                isStillRetryable
+              }
+            }
+          })
+        )
+        
+        const retryResults = (await Promise.all(retryTasks)).filter(r => r !== null)
+        
+        // 更新结果：用重试结果替换原来的失败结果
+        retryResults.forEach(retryResult => {
+          const originalIndex = results.findIndex(r => r.accountId === retryResult.accountId)
+          if (originalIndex >= 0) {
+            results[originalIndex] = retryResult
+          } else {
+            results.push(retryResult)
+          }
+        })
+        
+        // 统计本次重试结果
+        const attemptSuccess = retryResults.filter(r => r.success).length
+        const attemptFailed = retryResults.filter(r => !r.success).length
+        const attemptSyncedCount = retryResults.reduce((sum, r) => sum + (r.syncedCount || 0), 0)
+        
+        totalRetrySuccess += attemptSuccess
+        totalRetryFailed += attemptFailed
+        totalRetrySyncedCount += attemptSyncedCount
+        
+        logger.info(`\n📊 第 ${attempt} 次重试结果:`)
+        logger.info(`   - 重试成功: ${attemptSuccess} 个`)
+        logger.info(`   - 重试失败: ${attemptFailed} 个`)
+        logger.info(`   - 重试同步: ${attemptSyncedCount} 条记录`)
+        
+        // 更新剩余需要重试的账户（只保留仍可重试的失败账户）
+        remainingAccounts = retryResults
+          .filter(r => !r.success && r.isStillRetryable)
+          .map(r => ({
+            accountId: r.accountId,
+            ownerId: r.ownerId,
+            error: r.error
+          }))
+        
+        // 如果所有账户都成功了或都不可重试，提前退出
+        if (remainingAccounts.length === 0) {
+          logger.info(`✅ 所有账户重试完成（成功或不可重试）`)
+          break
+        }
+      }
+      
+      logger.info(`\n🔄 重试完成（共 ${RETRY_MAX_ATTEMPTS} 次尝试）:`)
+      logger.info(`   - 重试成功: ${totalRetrySuccess} 个`)
+      logger.info(`   - 重试失败: ${totalRetryFailed} 个`)
+      logger.info(`   - 重试同步: ${totalRetrySyncedCount} 条记录`)
+      
+      // 更新总统计
+      const finalSuccessWithData = results.filter(r => r.success && (r.syncedCount || 0) > 0).length
+      const finalSuccessNoData = results.filter(r => r.success && (r.syncedCount || 0) === 0).length
+      const finalFailed = results.filter(r => !r.success).length
+      const finalTotalSyncedCount = results.reduce((sum, r) => sum + (r.syncedCount || 0), 0)
+      
+      logger.info(`\n📊 最终统计（含重试）:`)
+      logger.info(`   - 成功且有数据: ${finalSuccessWithData} 个`)
+      logger.info(`   - 成功但无数据: ${finalSuccessNoData} 个`)
+      logger.info(`   - 失败: ${finalFailed} 个`)
+      logger.info(`   - 共同步 ${finalTotalSyncedCount} 条记录`)
     }
     
     // 如果无数据账户过多，给出提示
     if (successNoData > accounts.length * 0.5) {
-      console.log(`\n💡 提示: 超过 50% 的账户没有数据，可能是:`)
-      console.log(`   - 账户下没有活跃广告`)
-      console.log(`   - 广告今天没有花费数据`)
-      console.log(`   - 数据同步时间窗口问题`)
+      logger.info(`\n💡 提示: 超过 50% 的账户没有数据，可能是:`)
+      logger.info(`   - 账户下没有活跃广告`)
+      logger.info(`   - 广告今天没有花费数据`)
+      logger.info(`   - 数据同步时间窗口问题`)
     }
     
     return {
@@ -927,8 +1402,15 @@ export async function syncAllAccountsTodayStats() {
       results
     }
   } catch (error) {
-    console.error('❌ 同步所有账户失败:', error.message)
+    logger.error('❌ 同步所有账户失败:', error.message)
     throw error
+  } finally {
+    // 释放分布式锁（无论成功或失败都要释放）
+    try {
+      await pool.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
+    } catch (lockError) {
+      logger.warn(`⚠️  释放锁失败: ${lockError.message}`)
+    }
   }
 }
 
@@ -970,15 +1452,15 @@ function chunkArray(array, size) {
  * @returns {Promise<Array>} 广告洞察数据列表
  */
 async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset = 'today') {
-  console.log(`📦 开始批量拉取账户 ${accountId} 的广告数据（${datePreset}），共 ${adIds.length} 个广告`)
+  logger.info(`📦 开始批量拉取账户 ${accountId} 的广告数据（${datePreset}），共 ${adIds.length} 个广告`)
   
   // 如果没有广告，直接返回空数组
   if (!adIds || adIds.length === 0) {
     return []
   }
   
-  // 将广告ID列表按 20 个一组切分（Facebook Batch API 限制）
-  const BATCH_SIZE = 20
+  // 将广告ID列表按 50 个一组切分（Facebook Batch API 最多支持 50 个）
+  const BATCH_SIZE = 50
   const adIdChunks = chunkArray(adIds, BATCH_SIZE)
   const allInsights = []
   
@@ -986,16 +1468,17 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
   // 注意：cost_per_action_type 是数组，包含各种 action_type 的成本
   // cost_per_unique_link_click 或 cost_per_unique_inline_link_click 是 uCPC
   // 新增：inline_link_clicks, unique_inline_link_clicks（用于提取原始计数）
+  // P0：增加 unique_actions，当 unique_inline_link_clicks 缺失时 fallback 提取
   // 新增：adset_id（广告组ID，用于规则动作：增减预算）
-  // 重要：ROAS 字段名是 purchase_roas（不是 roas），返回格式是数组，需要提取
-  // 兜底：如果 purchase_roas 不可用，则通过计算：ROAS = purchase_value / spend
-  const fields = 'ad_id,ad_name,adset_id,spend,cpc,actions,action_values,cost_per_action_type,cost_per_unique_link_click,cost_per_unique_inline_link_click,inline_link_clicks,unique_inline_link_clicks,purchase_roas'
+  // 重要：ROAS 兜底字段来自 purchase_roas / website_purchase_roas（数组格式）
+  // 当前策略（方案A）：写库不做 ROAS 本地计算，只存 API 兜底值或 null；真实 ROAS 由读侧按分子/分母计算
+  const fields = 'ad_id,ad_name,adset_id,spend,actions,action_values,unique_actions,cost_per_action_type,cost_per_unique_link_click,cost_per_unique_inline_link_click,inline_link_clicks,unique_inline_link_clicks,purchase_roas,website_purchase_roas'
   const useAccountAttributionSetting = 'true'
   
   // 遍历每一组，发送 Batch API 请求
   for (let i = 0; i < adIdChunks.length; i++) {
     const chunk = adIdChunks[i]
-    console.log(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
+    logger.info(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
     
     try {
       // 构造 Batch API 请求体
@@ -1036,7 +1519,7 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
       
       // 检查是否有错误
       if (responseData.error) {
-        console.error(`❌ Batch API 请求失败:`, responseData.error)
+        logger.error(`❌ Batch API 请求失败:`, responseData.error)
         // 继续处理下一批，不中断整个流程
         continue
       }
@@ -1050,7 +1533,7 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
         await sleepBasedOnUsage(usageInfo)
       } else if (i < adIdChunks.length - 1) {
         // 如果没有响应头，使用默认休眠时间（保守策略）
-        console.log(`⏸️  未获取到使用率信息，使用默认休眠时间: 1000ms`)
+        logger.info(`⏸️  未获取到使用率信息，使用默认休眠时间: 1000ms`)
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
       
@@ -1071,10 +1554,10 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
             if (bodyData.error) {
               // 增强错误信息：打印完整的错误详情
               const error = bodyData.error
-              console.warn(`⚠️  广告 ${adId} 拉取失败:`)
-              console.warn(`   错误码: ${error.code || '未知'}`)
-              console.warn(`   错误类型: ${error.type || '未知'}`)
-              console.warn(`   错误消息: ${error.message || '无消息'}`)
+              logger.warn(`⚠️  广告 ${adId} 拉取失败:`)
+              logger.warn(`   错误码: ${error.code || '未知'}`)
+              logger.warn(`   错误类型: ${error.type || '未知'}`)
+              logger.warn(`   错误消息: ${error.message || '无消息'}`)
               
               // 特殊处理：如果是"今天没有数据"的错误，记录但不中断
               if (error.message && (
@@ -1082,7 +1565,7 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
                 error.message.includes('no data') ||
                 error.message.includes('insufficient data')
               )) {
-                console.log(`   💡 提示: 广告 ${adId} 今天没有数据，这是正常情况（可能是新广告或已暂停）`)
+                logger.info(`   💡 提示: 广告 ${adId} 今天没有数据，这是正常情况（可能是新广告或已暂停）`)
               }
               
               return
@@ -1106,41 +1589,41 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
                   
                   // 特殊处理：400 错误通常是参数或数据问题
                   if (item.code === 400) {
-                    console.warn(`⚠️  广告 ${adId} 请求返回 400 错误:`)
-                    console.warn(`   ${errorDetails}`)
+                    logger.warn(`⚠️  广告 ${adId} 请求返回 400 错误:`)
+                    logger.warn(`   ${errorDetails}`)
                     
                     // 常见 400 错误原因分析
                     if (error.message) {
                       if (error.message.includes('No data available') || error.message.includes('no data')) {
-                        console.log(`   💡 原因: 今天没有数据（可能是新广告、已暂停或今天未投放）`)
+                        logger.info(`   💡 原因: 今天没有数据（可能是新广告、已暂停或今天未投放）`)
                       } else if (error.message.includes('Invalid parameter') || error.message.includes('invalid')) {
-                        console.log(`   💡 原因: 参数无效（可能是广告ID格式问题）`)
+                        logger.info(`   💡 原因: 参数无效（可能是广告ID格式问题）`)
                       } else if (error.message.includes('permission') || error.message.includes('access')) {
-                        console.log(`   💡 原因: 权限不足（Token可能没有该广告的访问权限）`)
+                        logger.info(`   💡 原因: 权限不足（Token可能没有该广告的访问权限）`)
                       } else {
-                        console.log(`   💡 原因: ${error.message}`)
+                        logger.info(`   💡 原因: ${error.message}`)
                       }
                     }
                   } else {
-                    console.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${errorDetails}`)
+                    logger.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${errorDetails}`)
                   }
                 } else {
-                  console.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${errorDetails}`)
+                  logger.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${errorDetails}`)
                 }
               } catch (parseError) {
                 // 如果 body 不是 JSON，直接打印原始内容（截断前200字符）
                 const bodyPreview = String(item.body).substring(0, 200)
-                console.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${item.code}`)
-                console.warn(`   响应内容预览: ${bodyPreview}${item.body.length > 200 ? '...' : ''}`)
+                logger.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${item.code}`)
+                logger.warn(`   响应内容预览: ${bodyPreview}${item.body.length > 200 ? '...' : ''}`)
               }
             } else {
-              console.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${item.code} (无响应体)`)
+              logger.warn(`⚠️  广告 ${adId} 请求返回非 200 状态码: ${item.code} (无响应体)`)
             }
           }
         } catch (parseError) {
-          console.error(`❌ 解析广告 ${chunk[index]} 的响应失败:`, parseError.message)
+          logger.error(`❌ 解析广告 ${chunk[index]} 的响应失败:`, parseError.message)
           if (parseError.stack) {
-            console.error(`   堆栈: ${parseError.stack.split('\n').slice(0, 3).join('\n')}`)
+            logger.error(`   堆栈: ${parseError.stack.split('\n').slice(0, 3).join('\n')}`)
           }
         }
       })
@@ -1148,13 +1631,13 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
       // 注意：动态休眠已在上面处理（基于响应头），这里不再需要固定休眠
       
     } catch (error) {
-      console.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
+      logger.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
       // 继续处理下一批，不中断整个流程
       continue
     }
   }
   
-  console.log(`✅ 批量拉取完成，共获取 ${allInsights.length} 条广告数据`)
+  logger.info(`✅ 批量拉取完成，共获取 ${allInsights.length} 条广告数据`)
   return allInsights
 }
 
@@ -1168,8 +1651,14 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
  * @param {string} timezoneName - 时区
  * @returns {Promise<number>} 成功写入的记录数
  */
-async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, syncedAt, timezoneName) {
-  console.log(`💾 开始写入数据库，共 ${insights.length} 条记录`)
+/**
+ * 内部写入函数：实际执行数据库写入（从队列调用）
+ * 注意：这个函数是串行调用的，不需要事务和重试机制
+ */
+async function saveSnapshotsToDbInternal(insights, metadata) {
+  const { accountId, ownerId, syncSessionId, syncedAt, timezoneName } = metadata
+  
+  logger.info(`💾 [队列写入器] 开始写入数据库，共 ${insights.length} 条记录（写入前会清洗）`)
   
   // 如果没有数据，直接返回 0
   if (!insights || insights.length === 0) {
@@ -1177,125 +1666,140 @@ async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, sy
   }
   
   try {
-    // 将 insights 数据转换为 ad_snapshots 表的格式
-    const values = insights.map(insight => {
-      // 解析 actions 字段，提取购买次数
+    // 【AdsPolar 动作B：优化写入逻辑】在写入前清洗数据
+    // 【问题1修复】统一清洗逻辑：只保留 spend > 0 的广告
+    // 注意：与 API 嗅探阶段的过滤逻辑保持一致（见 syncAccountTodayStats 第310-315行）
+    // 这样可以确保所有数据路径（today/滑动窗口/批量按日）都统一过滤标准
+    const cleanInsights = insights.filter(insight => {
+      const spend = parseFloat(insight.spend || 0)
+      return spend > 0
+    })
+    
+    if (cleanInsights.length < insights.length) {
+      const filteredCount = insights.length - cleanInsights.length
+      logger.info(`🧹 [队列写入器] 数据清洗: ${insights.length} → ${cleanInsights.length} (过滤 ${filteredCount} 条 spend=0 的广告)`)
+    }
+    
+    if (cleanInsights.length === 0) {
+      logger.info(`⚠️  [队列写入器] 清洗后无有效数据，跳过写入`)
+      return 0
+    }
+    
+    // warn 日志限流：每个 syncSessionId（本次写入批次）只汇总输出 1 条
+    let roasMissingCount = 0
+    const roasMissingAdIds = new Set()
+    const ROAS_WARN_SAMPLE_LIMIT = 10
+
+    // 复用原有的数据转换逻辑
+    const values = cleanInsights.map(insight => {
+      // ... 数据转换逻辑（从原 saveSnapshotsToDb 复制）...
       const actions = insight.actions || []
       const purchases = parseActions(actions)
-      
-      // 注意：ROAS 不入库（当天数据从 API 获取，历史数据通过计算得出）
-      // 如果需要 ROAS，可以在查询时计算：ROAS = 购买总金额 / 花费
-      
-      // 提取成本字段（使用辅助函数，做好防御性编程）
-      // 注意：Facebook API 的"不值不显"原则，如果值为 0 或不存在，字段可能不存在
       const costPerActionType = insight.cost_per_action_type || []
-      
-      // CPA：从 cost_per_action_type 中提取 purchase 的成本
       const cpa = pickCostPerActionType(costPerActionType, [
         'offsite_conversion.fb_pixel_purchase',
         'purchase'
       ])
-      
-      // 加购费：从 cost_per_action_type 中提取 add_to_cart 的成本
       const addToCartCost = pickCostPerActionType(costPerActionType, [
         'offsite_conversion.fb_pixel_add_to_cart',
         'add_to_cart'
       ])
-      
-      // 结账费：从 cost_per_action_type 中提取 initiate_checkout 的成本
       const checkoutCost = pickCostPerActionType(costPerActionType, [
         'offsite_conversion.fb_pixel_initiate_checkout',
         'initiate_checkout'
       ])
-      
-      // 支付费：从 cost_per_action_type 中提取 add_payment_info 的成本
       const paymentCost = pickCostPerActionType(costPerActionType, [
         'offsite_conversion.fb_pixel_add_payment_info',
         'add_payment_info'
       ])
-      
-      // uCPC：从 cost_per_unique_link_click 或 cost_per_unique_inline_link_click 提取
-      const ucpc = extractUcpc(insight)
-      
-      // 提取原始计数字段（方案B+优化版）
-      // 1. link_clicks：从 inline_link_clicks 提取（Insights API 专用字段）
-      const linkClicks = parseInt(insight.inline_link_clicks || 0)
-      
-      // 2. unique_link_clicks：从 unique_inline_link_clicks 提取（Insights API 专用字段）
-      const uniqueLinkClicks = parseInt(insight.unique_inline_link_clicks || 0)
-      
-      // 3. purchase_value：从 action_values 中提取购买总转化金额
+      // P0：口径正确。link_clicks 仅用 inline_link_clicks / actions，绝不 fallback 到 clicks（全部点击）
+      const rawLink = (insight.inline_link_clicks != null && insight.inline_link_clicks !== '') ? parseInt(insight.inline_link_clicks) : NaN
+      const fromActions = extractActionCount(actions, ['link_click', 'inline_link_click'])
+      const linkClicks = !Number.isNaN(rawLink) ? rawLink : (fromActions > 0 ? fromActions : 0)
+      const rawUnique = (insight.unique_inline_link_clicks != null && insight.unique_inline_link_clicks !== '') ? parseInt(insight.unique_inline_link_clicks) : NaN
+      const uniqueFromActions = extractActionCount(insight.unique_actions || [], ['link_click', 'inline_link_click'])
+      const uniqueLinkClicks = !Number.isNaN(rawUnique) ? rawUnique : (uniqueFromActions > 0 ? uniqueFromActions : 0)
       const purchaseValue = extractPurchaseValue(insight.action_values)
-      
-      // 4. ROAS：优先从 purchase_roas 提取，缺失时用 purchase_value / spend 计算
       const spend = parseFloat(insight.spend || 0)
-      const roas = extractRoas(insight, spend, purchaseValue)
-      
-      // 5-7. 从 actions 中提取三个 count 字段（兼容多种变体）
+      const apiRoas = extractApiRoas(insight)
+      const roas = purchaseValue > 0 ? null : (apiRoas != null ? apiRoas : null)
+      if (purchases > 0 && purchaseValue === 0 && apiRoas == null) {
+        roasMissingCount += 1
+        if (roasMissingAdIds.size < ROAS_WARN_SAMPLE_LIMIT) {
+          const adId = String(insight.ad_id || '')
+          if (adId) roasMissingAdIds.add(adId)
+        }
+      }
       const addToCartCount = extractActionCount(actions, [
         'offsite_conversion.fb_pixel_add_to_cart',
         'add_to_cart'
       ])
-      
       const initiateCheckoutCount = extractActionCount(actions, [
         'offsite_conversion.fb_pixel_initiate_checkout',
         'initiate_checkout'
       ])
-      
       const addPaymentInfoCount = extractActionCount(actions, [
         'offsite_conversion.fb_pixel_add_payment_info',
         'add_payment_info'
       ])
-      
-      // 7. ad_set_id：从 Insights API 响应中获取（用于规则动作：增减预算）
       const adSetId = insight.adset_id ? String(insight.adset_id) : null
+      const campaignId = insight.campaign_id ? String(insight.campaign_id) : null
+
+      // 【AdsPolar 修复：ETL 时间语义错误】
+      // 核心原则：永远只信 API 返回的 date_start，绝对不信服务器的当前时间
+      // 这是解决数据错乱、归档失败的关键
+      // 
+      // 1. 优先使用 API 返回的 date_start（事件时间）
+      // 2. 如果没有 date_start，使用 insight.date（fetchInsightsByDay 添加的字段）
+      // 3. 如果都没有，才使用账户时区的"今天"（兜底逻辑，仅用于 today 数据）
+      const accountToday = DateTime.now().setZone(timezoneName || 'UTC').toFormat('yyyy-MM-dd')
+      const dataDate = insight.date_start || insight.date || accountToday
+      
+      // 调试日志：如果 date_start 存在但与 accountToday 不同，记录日志
+      if (insight.date_start && insight.date_start !== accountToday) {
+        // 静默处理，不打印日志（避免日志过多）
+        // 但确保 data_date 使用 date_start
+      }
       
       return {
-        accountId: String(accountId), // 确保是字符串
-        adId: String(insight.ad_id || ''), // 确保是字符串，避免精度丢失
+        accountId: String(accountId),
+        adId: String(insight.ad_id || ''),
         adName: insight.ad_name || null,
-        status: insight.status || null, // 广告状态（从 /ads API 获取并合并）
+        status: insight.status || null,
         ownerId: ownerId,
-        spend: parseFloat(insight.spend || 0),
-        cpc: insight.cpc != null ? parseFloat(insight.cpc) : null, // 直接从 API 获取
-        ucpc: ucpc, // 可能为 null
-        roas: roas, // 优先从 purchase_roas 提取，缺失时计算
-        cpa: cpa, // 可能为 null（从 cost_per_action_type 提取）
-        actions: actions, // JSON 字段，Drizzle 会自动序列化
+        spend: spend,
+        cpc: null,
+        ucpc: null,
+        roas: roas,
+        cpa: cpa,
+        actions: actions,
         purchases: purchases,
-        addToCartCost: addToCartCost, // 可能为 null
-        checkoutCost: checkoutCost, // 可能为 null
-        paymentCost: paymentCost, // 可能为 null
-        // 新增：原始计数字段（方案B+优化版）
+        addToCartCost: addToCartCost,
+        checkoutCost: checkoutCost,
+        paymentCost: paymentCost,
         linkClicks: linkClicks,
         uniqueLinkClicks: uniqueLinkClicks,
         purchaseValue: purchaseValue,
         addToCartCount: addToCartCount,
         initiateCheckoutCount: initiateCheckoutCount,
         addPaymentInfoCount: addPaymentInfoCount,
-        adSetId: adSetId, // 广告组ID
+        adSetId: adSetId,
+        campaignId: campaignId,
         syncSessionId: syncSessionId,
         syncedAt: syncedAt,
         timezoneName: timezoneName || 'UTC',
-        muteUntil: null, // 默认为 null
+        dataDate: dataDate,
+        muteUntil: null,
         muteReason: null,
         isSimulation: false
       }
     })
     
-    // 使用 Drizzle ORM 批量插入
-    // 注意：使用 ON DUPLICATE KEY UPDATE 来更新已存在的记录（基于唯一索引 uk_ad_session）
-    // 但 Drizzle 不直接支持 ON DUPLICATE KEY UPDATE，我们需要使用原生 SQL
-    // 或者先删除旧记录再插入新记录
-    
-    // 方案1：使用原生 SQL 的 ON DUPLICATE KEY UPDATE（推荐，性能更好）
     if (values.length > 0) {
-      // 构建批量插入 SQL（使用 ON DUPLICATE KEY UPDATE 更新已存在的记录）
-      // 注意：字段数量已更新，现在是 26 个字段（新增 7 个原始计数字段）
-      const placeholders = values.map(() => 
-        '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      const placeholders = values.map(() =>
+        '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
       ).join(', ')
-      
+
       const sql = `
         INSERT INTO ad_snapshots (
           account_id, ad_id, ad_name, status, owner_id,
@@ -1303,8 +1807,8 @@ async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, sy
           add_to_cart_cost, checkout_cost, payment_cost,
           link_clicks, unique_link_clicks, purchase_value,
           add_to_cart_count, initiate_checkout_count, add_payment_info_count,
-          ad_set_id,
-          sync_session_id, synced_at, timezone_name, mute_until, mute_reason, is_simulation
+          ad_set_id, campaign_id,
+          sync_session_id, synced_at, timezone_name, data_date, mute_until, mute_reason, is_simulation
         ) VALUES ${placeholders}
         ON DUPLICATE KEY UPDATE
           ad_name = VALUES(ad_name),
@@ -1326,11 +1830,14 @@ async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, sy
           initiate_checkout_count = VALUES(initiate_checkout_count),
           add_payment_info_count = VALUES(add_payment_info_count),
           ad_set_id = VALUES(ad_set_id),
+          campaign_id = VALUES(campaign_id),
           synced_at = VALUES(synced_at),
-          timezone_name = VALUES(timezone_name)
+          timezone_name = VALUES(timezone_name),
+          data_date = VALUES(data_date)
       `
-      
-      // 准备参数数组（按顺序，共 28 个字段，新增 cpc 和 roas）
+
+      // 【队列写入】串行写入，不需要事务和重试机制
+      // 因为同一时间只有一个写入任务在执行，不会产生死锁
       const params = values.flatMap(v => [
         v.accountId,
         v.adId,
@@ -1338,44 +1845,68 @@ async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, sy
         v.status,
         v.ownerId,
         v.spend,
-        v.cpc, // 直接从 API 获取
+        v.cpc,
         v.ucpc,
-        v.roas, // 优先从 purchase_roas 提取，缺失时计算
+        v.roas,
         v.cpa,
-        JSON.stringify(v.actions), // JSON 字段需要手动序列化
+        v.actions ? JSON.stringify(v.actions) : null,
         v.purchases,
         v.addToCartCost,
         v.checkoutCost,
         v.paymentCost,
-        // 新增：原始计数字段（方案B+优化版）
         v.linkClicks,
         v.uniqueLinkClicks,
         v.purchaseValue,
         v.addToCartCount,
         v.initiateCheckoutCount,
         v.addPaymentInfoCount,
-        v.adSetId, // 广告组ID
+        v.adSetId,
+        v.campaignId ?? null,
         v.syncSessionId,
         v.syncedAt,
         v.timezoneName,
+        v.dataDate,
         v.muteUntil,
         v.muteReason,
-        v.isSimulation ? 1 : 0 // MySQL 的 BOOLEAN 类型实际是 TINYINT(1)，需要转换为 0/1
+        v.isSimulation ? 1 : 0
       ])
       
-      // 执行批量插入
       const [result] = await pool.execute(sql, params)
       const insertedCount = result.affectedRows || 0
       
-      console.log(`✅ 成功写入 ${insertedCount} 条记录到数据库`)
+      if (roasMissingCount > 0) {
+        logger.warn(
+          `[ROAS] sync_session_id=${syncSessionId} purchases>0 且 purchase_value=0 且 api_roas=null：count=${roasMissingCount}, sample_ad_ids=${Array.from(roasMissingAdIds).join(',')}`
+        )
+      }
+
+      logger.info(`✅ [队列写入器] 成功写入 ${insertedCount} 条记录到数据库`)
       return insertedCount
     }
     
     return 0
   } catch (error) {
-    console.error('❌ 写入数据库失败:', error.message)
+    logger.error('❌ [队列写入器] 写入数据库失败:', error.message)
     throw error
   }
+}
+
+/**
+ * 外部接口：保持向后兼容（内部使用队列）
+ * 注意：这个函数现在只是推入队列，不直接写数据库
+ */
+async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, syncedAt, timezoneName) {
+  // 推入队列，由串行写入器统一处理
+  enqueueWrite('SNAPSHOT', insights, {
+    accountId,
+    ownerId,
+    syncSessionId,
+    syncedAt,
+    timezoneName
+  })
+  
+  // 返回入队数量（不是实际写入数量）
+  return insights.length
 }
 
 /**
@@ -1384,24 +1915,40 @@ async function saveSnapshotsToDb(insights, accountId, ownerId, syncSessionId, sy
  * @returns {number} 购买次数
  */
 function parseActions(actions) {
-  let purchases = 0
-  
-  // 如果 actions 不是数组，直接返回 0
-  if (!Array.isArray(actions)) {
-    return purchases
+  if (!Array.isArray(actions)) return 0
+
+  const normalize = (s) => String(s || '').toLowerCase().trim()
+  const toInt = (v) => {
+    const n = parseInt(v, 10)
+    return Number.isFinite(n) ? n : 0
   }
-  
-  // 遍历 actions 数组，累加购买次数
-  actions.forEach(action => {
-    if (!action || !action.action_type) return
-    
-    // 购买：精确匹配 offsite_conversion.fb_pixel_purchase（避免累加其他包含 purchase 的 action_type）
-    if (action.action_type === 'offsite_conversion.fb_pixel_purchase') {
-      purchases += parseInt(action.value || 0)
+
+  // 1) omni_purchase 优先：若存在直接返回（避免与渠道字段重复计数）
+  for (const action of actions) {
+    if (!action || !action.action_type) continue
+    if (normalize(action.action_type) === 'omni_purchase') {
+      return toInt(action.value)
     }
+  }
+
+  // 2) 保守防双算：各渠道分别取值后返回 max(各渠道)
+  const channelTypes = [
+    'offsite_conversion.fb_pixel_purchase',
+    'website_purchase',
+    'onsite_conversion.purchase',
+    'mobile_app_purchase'
+  ]
+  const channelCounts = channelTypes.map(type => {
+    const target = normalize(type)
+    const found = actions.find(action => action && normalize(action.action_type) === target)
+    return found ? toInt(found.value) : 0
   })
-  
-  return purchases
+  const maxChannel = Math.max(...channelCounts)
+  if (maxChannel > 0) return maxChannel
+
+  // 3) 最后兜底：purchase（仅当上述都不存在时才用）
+  const purchase = actions.find(action => action && normalize(action.action_type) === 'purchase')
+  return purchase ? toInt(purchase.value) : 0
 }
 
 /**
@@ -1479,69 +2026,79 @@ function extractUcpc(insight) {
 
 /**
  * 提取 ROAS（广告支出回报率）
+ * 策略：计算优先（purchase_value / spend），API 兜底；不可计算时返回 null（不写 0，避免规则误判）
  * @param {Object} insight - 广告洞察数据
- * @param {number} spend - 花费（用于兜底计算）
- * @param {number} purchaseValue - 购买总金额（用于兜底计算）
+ * @param {number} spend - 花费（用于计算）
+ * @param {number} purchaseValue - 购买总金额（用于计算）
  * @returns {number|null} ROAS 值，如果不存在则返回 null
  */
 function extractRoas(insight, spend, purchaseValue) {
-  // 优先从 purchase_roas 数组中提取（API 直接返回的 ROAS）
-  if (insight.purchase_roas && Array.isArray(insight.purchase_roas)) {
-    // 查找 omni_purchase 或 offsite_conversion.fb_pixel_purchase 类型的 ROAS
-    const roasEntry = insight.purchase_roas.find(item => 
-      item.action_type === 'omni_purchase' || 
-      item.action_type === 'offsite_conversion.fb_pixel_purchase' ||
-      item.action_type === 'purchase'
-    )
-    if (roasEntry && roasEntry.value != null) {
-      return parseFloat(roasEntry.value)
+  // 保留同名函数，兼容已有调用；语义调整为 API 兜底值（ROAS_Fallback_Only）
+  return extractApiRoas(insight)
+}
+
+/**
+ * 仅提取 API 返回的 ROAS（兜底值，不做本地计算）
+ * @param {Object} insight - 广告洞察数据
+ * @returns {number|null}
+ */
+function extractApiRoas(insight) {
+  const priorityTypes = [
+    'omni_purchase',
+    'offsite_conversion.fb_pixel_purchase',
+    'mobile_app_purchase',
+    'website_purchase',
+    'onsite_conversion.purchase',
+    'purchase'
+  ]
+  const normalize = (s) => String(s || '').toLowerCase().trim()
+  const pickFrom = (arr) => {
+    if (!Array.isArray(arr)) return null
+    for (const type of priorityTypes) {
+      const target = normalize(type)
+      const found = arr.find(item => item && normalize(item.action_type) === target)
+      if (!found || found.value == null) continue
+      const value = parseFloat(found.value)
+      if (Number.isFinite(value)) return value
     }
+    return null
   }
-  
-  // 降级：从 website_purchase_roas 提取（如果存在）
-  if (insight.website_purchase_roas && Array.isArray(insight.website_purchase_roas)) {
-    const roasEntry = insight.website_purchase_roas.find(item => 
-      item.action_type === 'website_purchase' || 
-      item.action_type === 'offsite_conversion.fb_pixel_purchase'
-    )
-    if (roasEntry && roasEntry.value != null) {
-      return parseFloat(roasEntry.value)
-    }
-  }
-  
-  // 兜底：通过计算得出（purchase_value / spend）
-  if (spend > 0 && purchaseValue > 0) {
-    return purchaseValue / spend
-  }
-  
+  const fromPurchaseRoas = pickFrom(insight?.purchase_roas)
+  if (fromPurchaseRoas != null) return fromPurchaseRoas
+  const fromWebsitePurchaseRoas = pickFrom(insight?.website_purchase_roas)
+  if (fromWebsitePurchaseRoas != null) return fromWebsitePurchaseRoas
   return null
 }
 
 /**
  * 从 action_values 中提取购买总转化金额（purchase_value）
- * 注意：Facebook API 的 action_values 是数组，需要查找 offsite_conversion.fb_pixel_purchase
+ * 按优先级查找，只取第一命中，不做求和，避免重复累计
  * @param {Array} actionValues - Facebook API 返回的 action_values 数组
  * @returns {number} 购买总转化金额，如果不存在则返回 0
  */
 function extractPurchaseValue(actionValues) {
-  // 防御性编程：如果 actionValues 不存在或不是数组，返回 0
   if (!actionValues || !Array.isArray(actionValues)) {
     return 0
   }
-  
-  // 遍历 action_values 数组，查找购买转化金额
-  for (const item of actionValues) {
-    if (!item || !item.action_type) continue
-    
-    // 查找购买转化（兼容多种变体）
-    const actionType = String(item.action_type || '').toLowerCase()
-    if (actionType === 'offsite_conversion.fb_pixel_purchase' || actionType === 'purchase') {
-      const value = parseFloat(item.value || 0)
-      return Number.isNaN(value) ? 0 : value
+  const priorityTypes = [
+    'omni_purchase',
+    'offsite_conversion.fb_pixel_purchase',
+    'mobile_app_purchase',
+    'website_purchase',
+    'onsite_conversion.purchase',
+    'purchase'
+  ]
+  const normalize = (s) => String(s || '').toLowerCase().trim()
+  for (const targetType of priorityTypes) {
+    const target = normalize(targetType)
+    for (const item of actionValues) {
+      if (!item || !item.action_type) continue
+      if (normalize(item.action_type) === target) {
+        const value = parseFloat(item.value)
+        return Number.isFinite(value) ? value : 0
+      }
     }
   }
-  
-  // 如果没找到，返回 0（而不是 null，因为这是计数字段，应该有默认值）
   return 0
 }
 
@@ -1599,7 +2156,7 @@ function extractActionCount(actions, actionTypes) {
  * @returns {Promise<Object>} 落盘结果 { success: boolean, archivedCount: number }
  */
 export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', targetDate = null) {
-  console.log(`📦 开始冷数据落盘...`)
+  logger.info(`📦 开始冷数据落盘...`)
   
   try {
     // 1. 计算目标日期（昨日）- 使用账户时区
@@ -1618,9 +2175,11 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
     const targetDateStart = targetDateTime.startOf('day')
     const targetDateEnd = targetDateTime.endOf('day')
     const dateStr = targetDateTime.toFormat('yyyy-MM-dd') // YYYY-MM-DD
+    const startTime = targetDateStart.toJSDate()
+    const endTime = targetDateEnd.toJSDate()
     
-    console.log(`📅 目标日期: ${dateStr} (时区: ${timezoneName})`)
-    console.log(`📅 时间范围: ${targetDateStart.toISO()} ~ ${targetDateEnd.toISO()}`)
+    logger.info(`📅 目标日期: ${dateStr} (时区: ${timezoneName})`)
+    logger.info(`📅 时间范围: ${targetDateStart.toISO()} ~ ${targetDateEnd.toISO()}`)
     
     // 2. 查询 ad_snapshots 表中该日期的数据
     // 重要修正：取每个广告当日的最后快照（不是 SUM）
@@ -1634,6 +2193,7 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
         ad_id,
         ad_name,
         ad_set_id,
+        campaign_id,
         owner_id,
         spend,
         purchases,
@@ -1653,15 +2213,14 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
             ORDER BY synced_at DESC, id DESC
           ) as rn
         FROM ad_snapshots
-        WHERE synced_at >= ? AND synced_at <= ?
+        WHERE data_date = ?
       ) ranked
       WHERE rn = 1
     `
     
-    // 将 Luxon DateTime 转换为 MySQL DATETIME 格式
-    const startTime = targetDateStart.toJSDate()
-    const endTime = targetDateEnd.toJSDate()
-    const params = [startTime, endTime]
+    // 【AdsPolar 动作A：修改查询口径】使用 data_date 而不是 synced_at
+    // 将目标日期转换为 YYYY-MM-DD 格式
+    const params = [dateStr]
     
     if (accountId) {
       query = query.replace('WHERE rn = 1', 'WHERE rn = 1 AND account_id = ?')
@@ -1669,28 +2228,35 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
     }
     
     let rows
+    let compatMeta = null
     try {
       const [result] = await pool.execute(query, params)
       rows = result
     } catch (error) {
       // 如果 ROW_NUMBER() 不支持（非 MySQL 8.0），降级到兼容方案
       if (error.message.includes('ROW_NUMBER') || error.message.includes('syntax')) {
-        console.log('⚠️  ROW_NUMBER() 不支持，使用兼容方案（最大时间戳连接法）')
-        rows = await queryLastSnapshotCompatible(accountId, startTime, endTime)
+        logger.info('⚠️  ROW_NUMBER() 不支持，使用兼容方案（最大时间戳连接法）')
+        const compatResult = await queryLastSnapshotCompatible(accountId, dateStr, startTime, endTime)
+        rows = compatResult.rows || []
+        compatMeta = {
+          mode: compatResult.mode,
+          ads: compatResult.ads
+        }
       } else {
         throw error
       }
     }
     
     if (!rows || rows.length === 0) {
-      console.log(`⚠️  没有找到 ${dateStr} 的数据，跳过落盘`)
+      logger.info(`⚠️  没有找到 ${dateStr} 的数据，跳过落盘`)
       return {
         success: true,
-        archivedCount: 0
+        archivedCount: 0,
+        compat: compatMeta
       }
     }
     
-    console.log(`📋 找到 ${rows.length} 条记录需要落盘（最后快照）`)
+    logger.info(`📋 找到 ${rows.length} 条记录需要落盘（最后快照）`)
     
     // 3. 拉取昨日 API 比值字段（cpc），用于单日值入库；缺失时用原始计数兜底计算
     // 注意：roas 不是 Insights API 的有效字段，需要通过计算得出：ROAS = purchase_value / spend
@@ -1705,16 +2271,13 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
           yesterdayMap = new Map(
             yInsights.map(ins => {
               const adId = String(ins.ad_id || '')
-              const spend = parseFloat(ins.spend || 0)
-              // ROAS 需要通过计算得出：从 action_values 中提取 purchase_value，然后计算
-              const purchaseValue = extractPurchaseValue(ins.action_values)
-              const roas = spend > 0 ? purchaseValue / spend : 0
+              const roas = extractApiRoas(ins) // 方案A：仅存 API 兜底值（ROAS_Fallback_Only）
               
               return [
                 adId,
                 {
-                  cpc: ins.cpc != null ? parseFloat(ins.cpc) : null,
-                  roas: roas > 0 ? roas : null  // 如果计算结果为 0，返回 null
+                  cpc: null,
+                  roas
                 }
               ]
             }).filter(([k]) => k)
@@ -1726,11 +2289,11 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
     // 4. 批量写入 daily_stats（移除 CTR/CPM；cpc/roas 单日优先 API 值，缺失用计数兜底）
     const values = rows.map(row => {
       const spend = parseFloat(row.spend || 0)
-      const linkClicks = parseInt(row.link_clicks || 0)
-      const purchaseValue = parseFloat(row.purchase_value || 0)
       const y = yesterdayMap.get(String(row.ad_id)) || {}
-      const cpc = y.cpc != null ? y.cpc : (linkClicks > 0 ? spend / linkClicks : 0)
-      const roas = y.roas != null ? y.roas : (spend > 0 ? purchaseValue / spend : 0)
+      const linkClicksCount = parseInt(row.link_clicks || 0)
+      const cpc = (linkClicksCount > 0 && spend > 0) ? (spend / linkClicksCount) : null
+      const purchaseValue = parseFloat(row.purchase_value ?? 0)
+      const roas = y.roas != null ? y.roas : (spend > 0 && purchaseValue > 0 ? (purchaseValue / spend) : null)
       const addToCart = parseInt(row.add_to_cart_count || 0)
       
       return [
@@ -1752,12 +2315,13 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
         parseInt(row.add_to_cart_count || 0),
         parseInt(row.initiate_checkout_count || 0),
         parseInt(row.add_payment_info_count || 0),
-        row.ad_set_id || null
+        row.ad_set_id || null,
+        row.campaign_id || null
       ]
     })
     
     // 使用 ON DUPLICATE KEY UPDATE 更新已存在的记录
-    const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+    const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
     
     const sql = `
       INSERT INTO daily_stats (
@@ -1765,7 +2329,7 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
         spend, cpc, roas, purchases, add_to_cart, actions,
         link_clicks, unique_link_clicks, purchase_value,
         add_to_cart_count, initiate_checkout_count, add_payment_info_count,
-        ad_set_id
+        ad_set_id, campaign_id
       ) VALUES ${placeholders}
       ON DUPLICATE KEY UPDATE
         ad_name = VALUES(ad_name),
@@ -1781,6 +2345,7 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
         initiate_checkout_count = VALUES(initiate_checkout_count),
         add_payment_info_count = VALUES(add_payment_info_count),
         ad_set_id = VALUES(ad_set_id),
+        campaign_id = VALUES(campaign_id),
         updated_at = NOW()
     `
     
@@ -1789,14 +2354,15 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
     const [result] = await pool.execute(sql, params2)
     const archivedCount = result.affectedRows || 0
     
-    console.log(`✅ 冷数据落盘完成，共归档 ${archivedCount} 条记录（使用最后快照）`)
+    logger.info(`✅ 冷数据落盘完成，共归档 ${archivedCount} 条记录（使用最后快照）`)
     
     return {
       success: true,
-      archivedCount: archivedCount
+      archivedCount: archivedCount,
+      compat: compatMeta
     }
   } catch (error) {
-    console.error('❌ 冷数据落盘失败:', error.message)
+    logger.error('❌ 冷数据落盘失败:', error.message)
     throw error
   }
 }
@@ -1805,40 +2371,84 @@ export async function archiveDailyStats(accountId = null, timezoneName = 'UTC', 
  * 兼容方案：使用最大时间戳连接法取最后快照（适用于非 MySQL 8.0）
  * 参考：方案B+优化版-最终版.md 第十四章
  * @param {string|null} accountId - 账户ID（可选）
+ * @param {string} targetDateStr - 目标自然日（YYYY-MM-DD），用于 data_date 口径优先
  * @param {Date} startTime - 开始时间
  * @param {Date} endTime - 结束时间
- * @returns {Promise<Array>} 最后快照数据
+ * @returns {Promise<{ rows: Array, mode: 'data_date' | 'synced_at', ads: number }>} 最后快照数据与口径信息
  */
-async function queryLastSnapshotCompatible(accountId, startTime, endTime) {
-  // 步骤1：取每个广告当日的最大 synced_at（最后快照时间）
-  let query1 = `
+async function queryLastSnapshotCompatible(accountId, targetDateStr, startTime, endTime) {
+  // 去重：同一 (account_id, ad_id) 只保留 synced_at 最大；若并列，取 id 最大（对齐主路径 ROW_NUMBER 的 ORDER BY synced_at DESC, id DESC）
+  const dedupeByMaxId = (rows) => {
+    const map = new Map()
+    for (const r of rows || []) {
+      const key = `${r.account_id}:${r.ad_id}`
+      const prev = map.get(key)
+      const curId = Number(r.id ?? -1)
+      const prevId = prev ? Number(prev.id ?? -1) : -1
+      if (!prev || curId > prevId) {
+        map.set(key, r)
+      }
+    }
+    return [...map.values()]
+  }
+
+  // -----------------------------
+  // 第一步（优先）：data_date 口径
+  // -----------------------------
+  const queryDataDate = `
     SELECT 
-      account_id,
-      ad_id,
-      MAX(synced_at) AS last_synced_at
-    FROM ad_snapshots
-    WHERE synced_at >= ? AND synced_at <= ?
+      s.id,
+      s.account_id,
+      s.ad_id,
+      s.ad_name,
+      s.ad_set_id,
+      s.owner_id,
+      s.spend,
+      s.purchases,
+      s.link_clicks,
+      s.unique_link_clicks,
+      s.purchase_value,
+      s.add_to_cart_count,
+      s.initiate_checkout_count,
+      s.add_payment_info_count,
+      s.ucpc,
+      s.cpa,
+      s.actions
+    FROM ad_snapshots s
+    INNER JOIN (
+      SELECT 
+        account_id,
+        ad_id,
+        MAX(synced_at) AS last_synced_at
+      FROM ad_snapshots
+      WHERE data_date = ?
+      ${accountId ? 'AND account_id = ?' : ''}
+      GROUP BY account_id, ad_id
+    ) t
+    ON s.account_id = t.account_id
+    AND s.ad_id = t.ad_id
+    AND s.synced_at = t.last_synced_at
+    WHERE s.data_date = ?
+    ${accountId ? 'AND s.account_id = ?' : ''}
   `
-  const params1 = [startTime, endTime]
-  
-  if (accountId) {
-    query1 += ` AND account_id = ?`
-    params1.push(accountId)
+
+  const paramsDataDate = [targetDateStr]
+  if (accountId) paramsDataDate.push(accountId)
+  paramsDataDate.push(targetDateStr)
+  if (accountId) paramsDataDate.push(accountId)
+
+  const [dataDateRowsRaw] = await pool.execute(queryDataDate, paramsDataDate)
+  const dataDateRows = dedupeByMaxId(dataDateRowsRaw)
+  if (dataDateRows && dataDateRows.length > 0) {
+    return { rows: dataDateRows, mode: 'data_date', ads: dataDateRows.length }
   }
-  
-  query1 += ` GROUP BY account_id, ad_id`
-  
-  const [lastSnapRows] = await pool.execute(query1, params1)
-  
-  if (!lastSnapRows || lastSnapRows.length === 0) {
-    return []
-  }
-  
-  // 步骤2：用最后时间点连接原表，获取该时间点的完整字段（即"最后快照"的值）
-  // 使用子查询 + INNER JOIN，性能更好
-  // 注意：如果记录数很多，可以考虑使用临时表，但这里简化处理
-  const query2 = `
+
+  // -----------------------------
+  // 第二步（兜底）：synced_at 时间范围（非标准口径兜底）
+  // -----------------------------
+  const queryRange = `
     SELECT 
+      s.id,
       s.account_id,
       s.ad_id,
       s.ad_name,
@@ -1869,15 +2479,23 @@ async function queryLastSnapshotCompatible(accountId, startTime, endTime) {
     ON s.account_id = t.account_id
     AND s.ad_id = t.ad_id
     AND s.synced_at = t.last_synced_at
+    WHERE s.synced_at >= ? AND s.synced_at <= ?
+    ${accountId ? 'AND s.account_id = ?' : ''}
   `
-  
-  const params2 = [startTime, endTime]
-  if (accountId) {
-    params2.push(accountId)
-  }
-  
-  const [rows] = await pool.execute(query2, params2)
-  return rows
+
+  const paramsRange = [startTime, endTime]
+  if (accountId) paramsRange.push(accountId)
+  paramsRange.push(startTime, endTime)
+  if (accountId) paramsRange.push(accountId)
+
+  const [rangeRowsRaw] = await pool.execute(queryRange, paramsRange)
+  const rangeRows = dedupeByMaxId(rangeRowsRaw)
+
+  logger.warn(
+    `⚠️  [兼容归档] data_date 无数据，使用 synced_at 范围兜底（非标准口径兜底）: account=${accountId || 'ALL'}, date=${targetDateStr}, ads=${rangeRows.length}`
+  )
+
+  return { rows: rangeRows, mode: 'synced_at', ads: rangeRows.length }
 }
 
 /**
@@ -1894,8 +2512,8 @@ async function queryLastSnapshotCompatible(accountId, startTime, endTime) {
  * @returns {Promise<Object>} 落盘结果汇总
  */
 export async function archiveAllAccountsDailyStats(targetDate = null, forceAll = false) {
-  console.log('📦 开始冷数据归档检查（高频检查模式）...')
-  console.log(`⏰ 当前服务器时间: ${new Date().toISOString()}`)
+  logger.info('📦 开始冷数据归档检查（高频检查模式）...')
+  logger.info(`⏰ 当前服务器时间: ${new Date().toISOString()}`)
   
   try {
     // 1. 从 account_mappings 表获取所有账户列表
@@ -1908,7 +2526,7 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
     `)
     
     if (!accounts || accounts.length === 0) {
-      console.log('⚠️  没有找到活跃账户，跳过归档检查')
+      logger.info('⚠️  没有找到活跃账户，跳过归档检查')
       return {
         success: true,
         totalAccounts: 0,
@@ -1919,12 +2537,10 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
       }
     }
     
-    console.log(`📋 找到 ${accounts.length} 个活跃账户，开始检查归档窗口...`)
+    logger.info(`📋 找到 ${accounts.length} 个活跃账户，开始检查归档窗口...`)
+    logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
-    // 2. 为每个账户检查归档窗口并执行归档
-    let totalArchivedCount = 0
-    let archivedAccounts = 0
-    let skippedAccounts = 0
+    // 2. 使用受控并发为每个账户检查归档窗口并执行归档
     // 跳过原因分类统计（增强观测性）
     let skipReasons = {
       complete: 0,        // 已归档且完整
@@ -1935,16 +2551,15 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
       error: 0             // 异常失败
     }
     
-    for (const account of accounts) {
+    const accountTasks = accounts.map(account => 
+      accountTaskLimiter(async () => {
       const accountId = String(account.account_id || account.accountId || '')
       const ownerId = account.owner_id || account.ownerId
       const timezoneName = account.timezone_name || 'UTC'
       
       if (!accountId || !ownerId) {
-        console.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
-        skippedAccounts++
-        skipReasons.invalidAccount++
-        continue
+        logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
+          return { archived: false, archivedCount: 0, skipReason: 'invalidAccount' }
       }
       
       try {
@@ -1963,16 +2578,14 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
           
           if (!shouldArchive) {
             // 不在归档窗口，跳过（不打印日志，避免日志过多）
-            skippedAccounts++
-            skipReasons.windowNotReached++
-            continue
+              return { archived: false, archivedCount: 0, skipReason: 'windowNotReached' }
           }
           
-          console.log(`\n🕐 账户 ${accountId} 到达归档窗口`)
-          console.log(`   时区: ${timezoneName}`)
-          console.log(`   本地时间: ${localTime.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ')}`)
+          logger.info(`\n🕐 账户 ${accountId} 到达归档窗口`)
+          logger.info(`   时区: ${timezoneName}`)
+          logger.info(`   本地时间: ${localTime.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ')}`)
         } else {
-          console.log(`\n🔧 强制归档账户 ${accountId} (时区: ${timezoneName})`)
+          logger.info(`\n🔧 强制归档账户 ${accountId} (时区: ${timezoneName})`)
         }
         
         // 2.2 计算目标日期（账户本地时区的"昨日"）
@@ -1987,12 +2600,13 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
         const endTime = targetDateEnd.toJSDate()
         
         // 2.3 完整性检查：检查是否已归档且完整（修复：不再只检查是否有任意记录）
+          // 【AdsPolar 动作A：修改查询口径】使用 data_date 而不是 synced_at
         // 查询 ad_snapshots 中目标日期的 DISTINCT ad_id 数量（期望归档的广告数）
         const [expectedRows] = await pool.execute(
           `SELECT COUNT(DISTINCT ad_id) as cnt 
            FROM ad_snapshots 
-           WHERE account_id = ? AND synced_at >= ? AND synced_at <= ?`,
-          [accountId, startTime, endTime]
+             WHERE account_id = ? AND data_date = ?`,
+            [accountId, targetDateStr]
         )
         const expectedCount = expectedRows[0]?.cnt || 0
         
@@ -2009,76 +2623,118 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
         // 如果 expectedCount = 0（当天没有数据），也视为已完成
         const isComplete = expectedCount === 0 || archivedCount >= expectedCount
         
-        if (isComplete) {
+        // 强制模式（如手动触发）：不跳过完整性检查的“跳过”，一律执行归档，用于回填 cpc/roas 等
+        if (!forceAll && isComplete) {
           if (expectedCount === 0) {
-            console.log(`   ✅ 已归档且完整，跳过 (date: ${targetDateStr}, 无数据)`)
+            logger.info(`   ✅ 已归档且完整，跳过 (date: ${targetDateStr}, 无数据)`)
           } else {
-            console.log(`   ✅ 已归档且完整，跳过 (date: ${targetDateStr}, ${archivedCount}/${expectedCount} 条)`)
+            logger.info(`   ✅ 已归档且完整，跳过 (date: ${targetDateStr}, ${archivedCount}/${expectedCount} 条)`)
           }
-          skippedAccounts++
-          skipReasons.complete++
-          continue
-        } else {
-          // 已归档但不完整，继续归档补齐（不跳过，继续执行归档）
+          return { archived: false, archivedCount: 0, skipReason: 'complete' }
+        }
+        if (!forceAll && !isComplete) {
           const missingCount = expectedCount - archivedCount
-          console.log(`   ⚠️  已归档但不完整，继续补齐 (date: ${targetDateStr}, 已归档: ${archivedCount}, 期望: ${expectedCount}, 缺失: ${missingCount})`)
-          skipReasons.incomplete++
+          logger.info(`   ⚠️  已归档但不完整，继续补齐 (date: ${targetDateStr}, 已归档: ${archivedCount}, 期望: ${expectedCount}, 缺失: ${missingCount})`)
+        }
+        if (forceAll && isComplete && expectedCount > 0) {
+          logger.info(`   🔄 强制重跑归档 (date: ${targetDateStr}, ${archivedCount}/${expectedCount} 条)，将更新 cpc/roas 等`)
         }
         
-        // 2.4 获取 DB 锁（防止多实例并发）
+          // 2.4 获取 DB 锁（防止多实例并发）- 使用专用连接
         const lockName = `archive:${accountId}:${targetDateStr}`
-        const [lockRows] = await pool.execute('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
-        const lockAcquired = lockRows[0]?.acquired === 1
+          const connection = await pool.getConnection()
+          let lockAcquired = false
+          
+          try {
+            // 在同一连接上获取锁
+            const [lockRows] = await connection.execute('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
+            lockAcquired = lockRows[0]?.acquired === 1
         
         if (!lockAcquired) {
-          console.log(`   ⏸️  锁已被占用，跳过（可能其他实例正在归档）`)
-          skippedAccounts++
-          skipReasons.lockBusy++
-          continue
+          logger.info(`   ⏸️  锁已被占用，跳过（可能其他实例正在归档）`)
+              return { archived: false, archivedCount: 0, skipReason: 'lockBusy' }
         }
         
         try {
           // 2.5 执行归档
-          console.log(`   📦 开始归档 (date: ${targetDateStr})`)
+          logger.info(`   📦 开始归档 (date: ${targetDateStr})`)
           const result = await archiveDailyStats(accountId, timezoneName, targetDate || yesterday.toJSDate())
           const archivedCount = result.archivedCount || 0
           
-          totalArchivedCount += archivedCount
-          archivedAccounts++
-          
-          console.log(`   ✅ 归档完成，共 ${archivedCount} 条记录`)
+          logger.info(`   ✅ 归档完成，共 ${archivedCount} 条记录`)
+              return { archived: true, archivedCount, compat: result.compat || null }
         } finally {
-          // 2.6 释放锁（无论成功或失败都要释放）
+              // 2.6 在同一连接上释放锁（无论成功或失败都要释放）
+              if (lockAcquired) {
           try {
-            await pool.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
+                  await connection.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
           } catch (lockError) {
             // 锁释放失败不影响主流程，只记录警告
-            console.warn(`   ⚠️  释放锁失败: ${lockError.message}`)
+            logger.warn(`   ⚠️  释放锁失败: ${lockError.message}`)
           }
+              }
+            }
+          } finally {
+            // 释放连接
+            connection.release()
         }
       } catch (error) {
-        console.error(`   ❌ 账户 ${accountId} 归档失败:`, error.message)
+        logger.error(`   ❌ 账户 ${accountId} 归档失败:`, error.message)
+          return { archived: false, archivedCount: 0, skipReason: 'error' }
+        }
+      })
+    )
+    
+    // 等待所有账户任务完成
+    const results = await Promise.all(accountTasks)
+    
+    // 统计结果
+    let totalArchivedCount = 0
+    let archivedAccounts = 0
+    let skippedAccounts = 0
+    // 回退观测：兼容方案（ROW_NUMBER 不可用）与 synced_at 非标准兜底使用情况
+    let compatAccounts = 0
+    let syncedAtFallbackAccounts = 0
+    let syncedAtFallbackAds = 0
+    
+    results.forEach(result => {
+      if (result.archived) {
+        archivedAccounts++
+        totalArchivedCount += result.archivedCount || 0
+        if (result.compat) {
+          compatAccounts++
+          if (result.compat.mode === 'synced_at') {
+            syncedAtFallbackAccounts++
+            syncedAtFallbackAds += (result.compat.ads || 0)
+          }
+        }
+      } else {
         skippedAccounts++
-        skipReasons.error++
-        // 继续处理下一个账户，不中断整个流程
+        if (result.skipReason) {
+          skipReasons[result.skipReason] = (skipReasons[result.skipReason] || 0) + 1
       }
     }
+    })
     
-    console.log('\n' + '='.repeat(50))
-    console.log(`✅ 归档检查完成`)
-    console.log(`📊 统计:`)
-    console.log(`   - 检查账户: ${accounts.length}`)
-    console.log(`   - 归档账户: ${archivedAccounts}`)
-    console.log(`   - 跳过账户: ${skippedAccounts}`)
-    console.log(`   - 归档记录: ${totalArchivedCount} 条`)
-    console.log(`📊 跳过原因分类:`)
-    console.log(`   - 已归档且完整: ${skipReasons.complete} 个`)
-    console.log(`   - 已归档但不完整（已补齐）: ${skipReasons.incomplete} 个`)
-    console.log(`   - 锁被占用: ${skipReasons.lockBusy} 个`)
-    console.log(`   - 窗口未到: ${skipReasons.windowNotReached} 个`)
-    console.log(`   - 无效账户: ${skipReasons.invalidAccount} 个`)
-    console.log(`   - 异常失败: ${skipReasons.error} 个`)
-    console.log('='.repeat(50))
+    logger.info('\n' + '='.repeat(50))
+    logger.info(`✅ 归档检查完成`)
+    logger.info(`📊 统计:`)
+    logger.info(`   - 检查账户: ${accounts.length}`)
+    logger.info(`   - 归档账户: ${archivedAccounts}`)
+    logger.info(`   - 跳过账户: ${skippedAccounts}`)
+    logger.info(`   - 归档记录: ${totalArchivedCount} 条`)
+    logger.info(`📊 回退观测:`)
+    logger.info(`   - 兼容方案账户（ROW_NUMBER 不可用）: ${compatAccounts} 个`)
+    logger.info(`   - synced_at 兜底账户（非标准口径）: ${syncedAtFallbackAccounts} 个`)
+    logger.info(`   - synced_at 兜底广告数: ${syncedAtFallbackAds} 条`)
+    logger.info(`📊 跳过原因分类:`)
+    logger.info(`   - 已归档且完整: ${skipReasons.complete} 个`)
+    logger.info(`   - 已归档但不完整（已补齐）: ${skipReasons.incomplete} 个`)
+    logger.info(`   - 锁被占用: ${skipReasons.lockBusy} 个`)
+    logger.info(`   - 窗口未到: ${skipReasons.windowNotReached} 个`)
+    logger.info(`   - 无效账户: ${skipReasons.invalidAccount} 个`)
+    logger.info(`   - 异常失败: ${skipReasons.error} 个`)
+    logger.info('='.repeat(50))
     
     return {
       success: true,
@@ -2089,14 +2745,673 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
       skippedAccounts: skippedAccounts
     }
   } catch (error) {
-    console.error('❌ 归档检查失败:', error.message)
+    logger.error('❌ 归档检查失败:', error.message)
     throw error
+  }
+}
+
+// ============================================
+// 统一心跳同步（M2 阶段二：统一心跳 + 双窗口归档）
+// ============================================
+
+/**
+ * 统一心跳同步任务
+ * 每 15 分钟执行一次，内部根据当前时间和账户时区决定：
+ * 1. 数据同步：Today / last_3d / last_7d / last_14d
+ * 2. 双窗口归档：≥02:00 ARCHIVED，≥12:00 FINALIZED
+ * 
+ * 依据：TASKS.md 1.4 + DEV_PLAN.md 4.4
+ * @returns {Promise<Object>} 执行结果
+ */
+// AdsPolar 优化：统一心跳防重入锁
+let heartbeatRunning = false
+const HEARTBEAT_LOCK_NAME = 'fb_ad_brain:unified_heartbeat'
+
+export async function unifiedHeartbeatSync() {
+  // AdsPolar 优化：防重入检查（防止多实例或长时间执行导致重叠）
+  if (heartbeatRunning) {
+    logger.info('⏸️  统一心跳正在执行中，跳过本次任务（防重入）')
+    return {
+      success: true,
+      totalAccounts: 0,
+      syncedAccounts: 0,
+      archivedAccounts: 0,
+      syncedAccountIds: [],
+      skipped: true,
+      skipReason: 'already_running'
+    }
+  }
+
+  // 【问题3修复】使用专用连接获取和释放锁（必须在同一连接上操作）
+  // MySQL 的 GET_LOCK 和 RELEASE_LOCK 必须在同一个连接上操作，否则会导致锁状态异常
+  let lockAcquired = false
+  let lockConnection = null
+  try {
+    lockConnection = await pool.getConnection()
+    const [lockRows] = await lockConnection.query(`SELECT GET_LOCK(?, 0) AS acquired`, [HEARTBEAT_LOCK_NAME])
+    lockAcquired = lockRows[0]?.acquired === 1
+    
+    if (!lockAcquired) {
+      logger.info('⏸️  统一心跳锁已被占用（可能其他实例正在执行），跳过本次任务')
+      // 立即释放连接（未获取锁时）
+      if (lockConnection) {
+        lockConnection.release()
+        lockConnection = null
+      }
+      return {
+        success: true,
+        totalAccounts: 0,
+        syncedAccounts: 0,
+        archivedAccounts: 0,
+        syncedAccountIds: [],
+        skipped: true,
+        skipReason: 'lock_busy'
+      }
+    }
+    // 注意：获取锁后，不能立即释放连接，必须等到释放锁后再释放连接
+  } catch (lockError) {
+    logger.warn('⚠️  获取统一心跳锁失败，使用进程内标志位:', lockError.message)
+    // 如果获取锁失败，回退到进程内标志位（单实例场景）
+    if (lockConnection) {
+      lockConnection.release()
+      lockConnection = null
+    }
+  }
+
+  heartbeatRunning = true
+  const startTime = Date.now()
+  
+  try {
+    logger.info('')
+    logger.info('='.repeat(50))
+    logger.info('💓 统一心跳同步任务（每 15 分钟）')
+    logger.info('⏰ 执行时间:', new Date().toLocaleString('zh-CN'))
+    logger.info('='.repeat(50))
+    // 1. 获取所有活跃账户
+    const [accounts] = await pool.query(`
+      SELECT DISTINCT fb_account_id as account_id, owner_id, COALESCE(timezone_name, 'UTC') as timezone_name
+      FROM account_mappings 
+      WHERE is_active = 1
+      ORDER BY fb_account_id
+    `)
+    
+    if (!accounts || accounts.length === 0) {
+      logger.info('⚠️  没有找到活跃账户，跳过同步')
+      return {
+        success: true,
+        totalAccounts: 0,
+        syncedAccounts: 0,
+        archivedAccounts: 0
+      }
+    }
+    
+    logger.info(`📋 找到 ${accounts.length} 个活跃账户`)
+    logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
+    
+    // 2. 为每个账户执行同步和归档（受控并发）
+    let syncedAccounts = 0
+    let archivedAccounts = 0
+    let finalizedAccounts = 0
+    
+    // 使用 p-limit 控制并发度
+    const accountTasks = accounts.map(account => 
+      accountTaskLimiter(async () => {
+        const accountId = String(account.account_id || '')
+        const ownerId = account.owner_id || account.ownerId
+        const timezoneName = account.timezone_name || 'UTC'
+        
+        if (!accountId || !ownerId) {
+          logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
+          return { synced: false, archived: false, finalized: false }
+        }
+        
+        try {
+          // 2.1 根据账户时区决定本轮使用的 time_range
+          const now = DateTime.now()
+          const localTime = now.setZone(timezoneName)
+          const hour = localTime.hour
+          
+          // 决定同步范围：根据当前时间选择合适的时间窗口
+          // 策略：白天（6-18点）同步 Today，夜间同步历史数据
+          let timeRange = 'today'
+          let daysBack = 0
+          
+          if (hour >= 6 && hour < 18) {
+            // 白天：主要同步 Today，偶尔回补最近 3 天
+            timeRange = 'today'
+            daysBack = 0
+            // 每小时的第 0 分钟回补 last_3d
+            if (localTime.minute === 0) {
+              daysBack = 3
+            }
+          } else {
+            // 夜间：回补历史数据
+            if (hour >= 0 && hour < 6) {
+              // 凌晨：回补 last_7d
+              timeRange = 'last_7d'
+              daysBack = 7
+            } else {
+              // 晚上：回补 last_14d
+              timeRange = 'last_14d'
+              daysBack = 14
+            }
+          }
+          
+          logger.info(`\n[账户 ${accountId}] 时区: ${timezoneName}, 本地时间: ${localTime.toFormat('yyyy-MM-dd HH:mm:ss')}`)
+          logger.info(`  同步范围: ${timeRange} (daysBack=${daysBack})`)
+          
+          // 2.2 执行数据同步（AdsPolar 优化：检测实际数据变化）
+          let synced = false
+          let dataUpdated = false  // 是否有实际数据更新
+          let syncError = null
+          let syncResult = null
+          try {
+            if (daysBack === 0) {
+              // 同轮复用 facebookApi，供 Piggyback 只补缺口、不再对 activeAdIds 调 resolve
+              const accessToken = process.env.FACEBOOK_ACCESS_TOKEN
+              const facebookApi = accessToken ? new FacebookMarketingAPI(accessToken) : null
+              syncResult = await syncAccountTodayStats(accountId, ownerId, timezoneName, facebookApi)
+              dataUpdated = syncResult && syncResult.success && syncResult.syncedCount > 0
+              if (dataUpdated) {
+                logger.info(`   ✅ [${accountId}] 有数据更新: ${syncResult.syncedCount} 条`)
+              } else if (syncResult?.success) {
+                logger.info(`   📋 [${accountId}] 同步完成但无数据更新（今日 spend>0 广告数=0，未写入 ad_snapshots）`)
+              }
+              if (syncResult?.success) {
+                logger.info(`   📊 [${accountId}] 拉取 spend>0=${syncResult.syncedCount ?? 0}, 写入 ad_snapshots=${syncResult.syncedCount ?? 0}`)
+              }
+              // Piggyback：用本轮已拿到的 structurePayload 补齐 structure_ads（best-effort，同轮 resolve 只一次）
+              if (syncResult?.activeAdIds?.length && facebookApi) {
+                try {
+                  await piggybackStructureFromToday(accountId, syncResult.activeAdIds, syncResult.structurePayload || {}, facebookApi)
+                } catch (pbErr) {
+                  logger.warn(`   ⚠️ [${accountId}] Piggyback 跳过:`, pbErr.message)
+                }
+              }
+            } else {
+              // 同步滑动窗口数据（启用配额优化，只拉取活跃广告）
+              syncResult = await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true)
+              // 判断是否有实际数据更新（todayCount > 0 或 dailyStatsCount > 0）
+              dataUpdated = syncResult && syncResult.success && (syncResult.todayCount > 0 || syncResult.dailyStatsCount > 0)
+              if (dataUpdated) {
+                logger.info(`   ✅ [${accountId}] 有数据更新: Today=${syncResult.todayCount || 0}, Daily=${syncResult.dailyStatsCount || 0}`)
+              } else if (syncResult?.success) {
+                logger.info(`   📋 [${accountId}] 同步完成但无数据更新（Today=${syncResult.todayCount ?? 0}, Daily=${syncResult.dailyStatsCount ?? 0}，未写入 ad_snapshots）`)
+              }
+              if (syncResult?.success) {
+                logger.info(`   📊 [${accountId}] 写入 ad_snapshots=${syncResult.todayCount ?? 0}, 写入 daily_stats=${syncResult.dailyStatsCount ?? 0}`)
+              }
+            }
+            synced = true
+          } catch (error) {
+            syncError = error
+            logger.error(`   ❌ 数据同步失败: ${error.message}`)
+          }
+          
+          // 2.3 执行双窗口归档检查
+          const archiveResult = await checkAndExecuteArchive(accountId, ownerId, timezoneName, localTime)
+          
+          // 2.4 AdsPolar 事件驱动优化：数据同步完成后立即触发规则执行
+          // 这是"顺手触发"模式：数据刚落库，立即评估规则，避免批量执行导致的资源浪费
+          // 注意：使用异步执行，不阻塞数据同步流程
+          if (synced && dataUpdated) {
+            // 异步触发规则执行（不等待完成，避免阻塞数据同步）
+            setImmediate(async () => {
+              try {
+                // 动态导入规则执行服务（避免循环依赖）
+                const { executeRulesForAccount } = await import('./cronService.js')
+                const { generateRunId } = await import('./ruleExecutionSummaryService.js')
+                const runId = generateRunId()
+                logger.info(`   🔄 [${accountId}] 数据同步完成，立即触发规则执行（AdsPolar 事件驱动，run_id: ${runId}）`)
+                await executeRulesForAccount(accountId, { force: false, runId })
+              } catch (ruleError) {
+                // 规则执行失败不影响数据同步结果
+                logger.error(`   ⚠️  [${accountId}] 规则执行失败:`, ruleError.message)
+              }
+            })
+          }
+          
+          return {
+            synced,
+            dataUpdated,
+            archived: archiveResult.archived,
+            finalized: archiveResult.finalized,
+            accountId,
+            ownerId,
+            timezoneName,
+            activeAdIds: (daysBack === 0 && syncResult?.activeAdIds?.length) ? syncResult.activeAdIds : [],
+            syncError: syncError ? { message: syncError.message, isRetryable: isRetryableError(syncError) } : null
+          }
+        } catch (error) {
+          logger.error(`   ❌ 账户 ${accountId} 处理失败:`, error.message)
+          return {
+            synced: false,
+            dataUpdated: false,
+            archived: false,
+            finalized: false,
+            accountId,
+            ownerId,
+            timezoneName,
+            activeAdIds: [],
+            syncError: { message: error.message, isRetryable: isRetryableError(error) }
+          }
+        }
+      })
+    )
+    
+    // 等待所有账户任务完成
+    const results = await Promise.all(accountTasks)
+
+    // 心跳后置阶段：伪增量（对所有账户跑，传空 activeAdIds 也可——由 recentActiveIds 决定是否调 FB，满足「没花钱也要管状态」）
+    const accountsForPseudo = results.filter(r => r?.accountId)
+    if (accountsForPseudo.length > 0 && process.env.FACEBOOK_ACCESS_TOKEN) {
+      const facebookApi = new FacebookMarketingAPI(process.env.FACEBOOK_ACCESS_TOKEN)
+      for (const r of accountsForPseudo) {
+        try {
+          await runPseudoIncrementForAccount(r.accountId, r.activeAdIds || [], facebookApi)
+        } catch (err) {
+          logger.warn(`[伪增量] account=${r.accountId} 跳过:`, err.message)
+        }
+      }
+    }
+
+    // 统计结果
+    results.forEach(result => {
+      if (result.synced) syncedAccounts++
+      if (result.archived) archivedAccounts++
+      if (result.finalized) finalizedAccounts++
+    })
+    
+    // 3. 识别可重试的失败账户（API限流错误）- 支持多次重试和指数退避
+    const failedSyncAccounts = results.filter(r => !r.synced && r.syncError && r.syncError.isRetryable)
+    
+    if (failedSyncAccounts.length > 0) {
+      logger.info(`\n🔄 检测到 ${failedSyncAccounts.length} 个因API限流失败的账户，准备重试（最多重试 ${RETRY_MAX_ATTEMPTS} 次）...`)
+      
+      // 多次重试循环（指数退避）
+      let remainingAccounts = [...failedSyncAccounts]
+      let totalRetrySuccess = 0
+      let totalRetryFailed = 0
+      
+      for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS && remainingAccounts.length > 0; attempt++) {
+        const delay = calculateBackoffDelay(attempt)
+        logger.info(`\n🔄 第 ${attempt} 次重试（共 ${remainingAccounts.length} 个账户）...`)
+        logger.info(`⏳ 等待 ${delay / 1000} 秒后重试（指数退避）...`)
+        
+        // 延迟重试（指数退避）
+        await new Promise(resolve => setTimeout(resolve, delay))
+        
+        // 过滤掉仍在冷却期内的账户
+        const accountsToRetry = remainingAccounts.filter(account => {
+          if (isAccountInCooldown(account.accountId)) {
+            const lastCallTime = accountLastCallTime.get(account.accountId)
+            const remainingCooldown = Math.ceil((ACCOUNT_COOLDOWN_MS - (Date.now() - lastCallTime)) / 1000)
+            logger.info(`   ⏸️  账户 ${account.accountId} 仍在冷却期内（还需等待 ${remainingCooldown} 秒），跳过本次重试`)
+            return false
+          }
+          return true
+        })
+        
+        if (accountsToRetry.length === 0) {
+          logger.info(`   ⏸️  所有账户都在冷却期内，跳过本次重试`)
+          break
+        }
+        
+        // 并发重试失败的账户
+        const retryTasks = accountsToRetry.map((failedAccount, index) => 
+          accountTaskLimiter(async () => {
+            const accountId = failedAccount.accountId
+            const ownerId = failedAccount.ownerId
+            const timezoneName = failedAccount.timezoneName || 'UTC'
+            
+            // 记录账户调用时间（账户级别限流保护）
+            recordAccountCall(accountId)
+            
+            try {
+              logger.info(`\n[重试 ${attempt}/${RETRY_MAX_ATTEMPTS} - ${index + 1}/${accountsToRetry.length}] 重试账户 ${accountId}...`)
+              
+              // 重新决定同步范围（使用相同的逻辑）
+              const now = DateTime.now()
+              const localTime = now.setZone(timezoneName)
+              const hour = localTime.hour
+              let daysBack = 0
+              
+              if (hour >= 6 && hour < 18) {
+                daysBack = 0
+                if (localTime.minute === 0) {
+                  daysBack = 3
+                }
+              } else {
+                if (hour >= 0 && hour < 6) {
+                  daysBack = 7
+                } else {
+                  daysBack = 14
+                }
+              }
+              
+              // 重试同步
+              if (daysBack === 0) {
+                await syncAccountTodayStats(accountId, ownerId, timezoneName)
+              } else {
+                await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true)
+              }
+              
+              logger.info(`✅ 账户 ${accountId} 重试成功`)
+              return { synced: true, archived: false, finalized: false }
+            } catch (error) {
+              const isStillRetryable = isRetryableError(error)
+              logger.error(`❌ 账户 ${accountId} 第 ${attempt} 次重试失败: ${error.message} ${isStillRetryable ? '[仍可重试]' : '[不可重试]'}`)
+              return { 
+                synced: false, 
+                archived: false, 
+                finalized: false,
+                accountId,
+                ownerId,
+                timezoneName,
+                isStillRetryable
+              }
+            }
+          })
+        )
+        
+        const retryResults = await Promise.all(retryTasks)
+        
+        // 更新统计：用重试结果更新原结果
+        retryResults.forEach((retryResult) => {
+          const originalIndex = results.findIndex(r => r.accountId === retryResult.accountId)
+          if (originalIndex >= 0 && retryResult.synced) {
+            results[originalIndex].synced = true
+            syncedAccounts++
+          }
+        })
+        
+        // 统计本次重试结果
+        const attemptSuccess = retryResults.filter(r => r.synced).length
+        const attemptFailed = retryResults.filter(r => !r.synced).length
+        
+        totalRetrySuccess += attemptSuccess
+        totalRetryFailed += attemptFailed
+        
+        logger.info(`\n📊 第 ${attempt} 次重试结果:`)
+        logger.info(`   - 重试成功: ${attemptSuccess} 个`)
+        logger.info(`   - 重试失败: ${attemptFailed} 个`)
+        
+        // 更新剩余需要重试的账户（只保留仍可重试的失败账户）
+        remainingAccounts = retryResults
+          .filter(r => !r.synced && r.isStillRetryable)
+          .map(r => ({
+            accountId: r.accountId,
+            ownerId: r.ownerId,
+            timezoneName: r.timezoneName,
+            syncError: { message: r.syncError?.message || '重试失败', isRetryable: true }
+          }))
+        
+        // 如果所有账户都成功了或都不可重试，提前退出
+        if (remainingAccounts.length === 0) {
+          logger.info(`✅ 所有账户重试完成（成功或不可重试）`)
+          break
+        }
+      }
+      
+      logger.info(`\n🔄 重试完成（共 ${RETRY_MAX_ATTEMPTS} 次尝试）:`)
+      logger.info(`   - 重试成功: ${totalRetrySuccess} 个`)
+      logger.info(`   - 重试失败: ${totalRetryFailed} 个`)
+    }
+    
+    // 收集有实际数据更新的账户ID列表（AdsPolar 优化：真正的"零空转"）
+    // 只有同步成功且确实有数据更新的账户才触发规则执行
+    const syncedAccountIds = results
+      .filter(r => r.synced && r.dataUpdated && r.accountId)
+      .map(r => String(r.accountId))
+    
+    // 调试日志：显示数据更新统计
+    const totalSynced = results.filter(r => r.synced).length
+    const totalDataUpdated = results.filter(r => r.synced && r.dataUpdated).length
+    if (totalSynced > 0) {
+      logger.info(`📊 数据更新统计: 同步成功=${totalSynced}, 有数据更新=${totalDataUpdated}`)
+    }
+    
+    const duration = Date.now() - startTime
+    logger.info('\n' + '='.repeat(50))
+    logger.info(`✅ 统一心跳同步完成`)
+    logger.info(`📊 统计:`)
+    logger.info(`   - 账户总数: ${accounts.length}`)
+    logger.info(`   - 同步账户: ${syncedAccounts}`)
+    logger.info(`   - 归档账户: ${archivedAccounts}`)
+    logger.info(`   - 对账账户: ${finalizedAccounts}`)
+    logger.info(`⏱️  耗时: ${duration}ms`)
+    logger.info('='.repeat(50))
+    logger.info('')
+    
+    return {
+      success: true,
+      totalAccounts: accounts.length,
+      syncedAccounts,
+      archivedAccounts,
+      finalizedAccounts,
+      syncedAccountIds, // AdsPolar 流水线：返回有实际数据更新的账户ID列表，用于触发规则执行
+      durationMs: duration
+    }
+  } catch (error) {
+    logger.error('❌ 统一心跳同步失败:', error.message)
+    throw error
+  } finally {
+    // 释放进程内标志位
+    heartbeatRunning = false
+    
+    // 【问题3修复】在同一连接上释放锁（必须在获取锁的同一连接上释放）
+    if (lockAcquired && lockConnection) {
+      try {
+        // 在同一连接上释放锁（关键修复）
+        await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [HEARTBEAT_LOCK_NAME])
+        logger.info('✅ 统一心跳锁已释放')
+      } catch (releaseError) {
+        logger.warn('⚠️  释放统一心跳锁失败:', releaseError.message)
+      } finally {
+        // 释放锁后再释放连接
+        lockConnection.release()
+        lockConnection = null
+      }
+    } else if (lockConnection) {
+      // 如果获取锁失败但连接还存在，释放连接
+      lockConnection.release()
+      lockConnection = null
+    }
+  }
+}
+
+/**
+ * 检查并执行双窗口归档
+ * 依据：TASKS.md 1.4 - 账户本地时间 ≥02:00 执行 ARCHIVED，≥12:00 执行 FINALIZED
+ * @param {string} accountId - 账户ID
+ * @param {number} ownerId - 负责人ID
+ * @param {string} timezoneName - 时区
+ * @param {DateTime} localTime - 账户本地时间（Luxon DateTime 对象）
+ * @returns {Promise<Object>} { archived: boolean, finalized: boolean }
+ */
+async function checkAndExecuteArchive(accountId, ownerId, timezoneName, localTime) {
+  const hour = localTime.hour
+  const yesterday = localTime.minus({ days: 1 })
+  const targetDateStr = yesterday.toFormat('yyyy-MM-dd')
+  
+  let archived = false
+  let finalized = false
+  
+  // 检查是否需要执行初步归档（≥02:00）
+  if (hour >= 2) {
+    const archiveStatus = await getArchiveStatus(accountId, targetDateStr)
+    
+    if (archiveStatus === null || archiveStatus === 'PENDING') {
+      // 执行初步归档（ARCHIVED）
+      try {
+        logger.info(`   📦 执行初步归档 (date: ${targetDateStr}, status: ${archiveStatus || 'PENDING'} → ARCHIVED)`)
+        await executeArchive(accountId, ownerId, timezoneName, targetDateStr, 'ARCHIVED')
+        archived = true
+      } catch (error) {
+        logger.error(`   ❌ 初步归档失败: ${error.message}`)
+      }
+    } else if (archiveStatus === 'ARCHIVED') {
+      logger.info(`   ✅ 已初步归档，跳过 (date: ${targetDateStr})`)
+    }
+  }
+  
+  // 检查是否需要执行深度对账（≥12:00）
+  if (hour >= 12) {
+    const archiveStatus = await getArchiveStatus(accountId, targetDateStr)
+    
+    if (archiveStatus === 'ARCHIVED') {
+      // 执行深度对账覆盖（FINALIZED）
+      try {
+        logger.info(`   🔍 执行深度对账 (date: ${targetDateStr}, status: ARCHIVED → FINALIZED)`)
+        await executeArchive(accountId, ownerId, timezoneName, targetDateStr, 'FINALIZED')
+        finalized = true
+      } catch (error) {
+        logger.error(`   ❌ 深度对账失败: ${error.message}`)
+      }
+    } else if (archiveStatus === 'FINALIZED') {
+      logger.info(`   ✅ 已深度对账，跳过 (date: ${targetDateStr})`)
+    }
+  }
+  
+  return { archived, finalized }
+}
+
+/**
+ * 获取归档状态
+ * @param {string} accountId - 账户ID
+ * @param {string} targetDateStr - 目标日期（YYYY-MM-DD）
+ * @returns {Promise<string|null>} PENDING/ARCHIVED/FINALIZED 或 null（不存在）
+ */
+async function getArchiveStatus(accountId, targetDateStr) {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT status FROM daily_archive_status 
+       WHERE account_id = ? AND target_date = ?`,
+      [accountId, targetDateStr]
+    )
+    return rows.length > 0 ? rows[0].status : null
+  } catch (error) {
+    logger.error(`获取归档状态失败: ${error.message}`)
+    return null
+  }
+}
+
+/**
+ * 执行归档（使用 daily_archive_status 状态流转）
+ * @param {string} accountId - 账户ID
+ * @param {number} ownerId - 负责人ID
+ * @param {string} timezoneName - 时区
+ * @param {string} targetDateStr - 目标日期（YYYY-MM-DD）
+ * @param {string} targetStatus - 目标状态（ARCHIVED 或 FINALIZED）
+ * @returns {Promise<Object>} 归档结果
+ */
+async function executeArchive(accountId, ownerId, timezoneName, targetDateStr, targetStatus) {
+  // 使用专用连接获取锁（修复 GET_LOCK 实现）
+  const connection = await pool.getConnection()
+  
+  try {
+    // 在同一连接上获取锁
+    const lockName = `archive:${accountId}:${targetDateStr}`
+    const [lockRows] = await connection.execute('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
+    const lockAcquired = lockRows[0]?.acquired === 1
+    
+    if (!lockAcquired) {
+      logger.info(`   ⏸️  锁已被占用，跳过（可能其他实例正在归档）`)
+      return { success: false, skipped: true, reason: 'lock_busy' }
+    }
+    
+    try {
+      // 计算目标日期的 UTC 时间范围
+      const targetDate = DateTime.fromISO(targetDateStr).setZone(timezoneName)
+      const startTime = targetDate.startOf('day').toJSDate()
+      const endTime = targetDate.endOf('day').toJSDate()
+      
+      // 执行归档（调用现有的 archiveDailyStats 函数）
+      const result = await archiveDailyStats(accountId, timezoneName, targetDate.toJSDate())
+      const archivedCount = result.archivedCount || 0
+      
+      // 更新归档状态表
+      await connection.execute(
+        `INSERT INTO daily_archive_status (account_id, target_date, status, updated_at)
+         VALUES (?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE 
+           status = VALUES(status),
+           updated_at = NOW(),
+           last_error = NULL`,
+        [accountId, targetDateStr, targetStatus]
+      )
+      
+      logger.info(`   ✅ 归档完成，共 ${archivedCount} 条记录，状态: ${targetStatus}`)
+      
+      return {
+        success: true,
+        archivedCount,
+        status: targetStatus
+      }
+    } finally {
+      // 在同一连接上释放锁
+      await connection.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
+    }
+  } catch (error) {
+    // 更新错误信息到状态表
+    try {
+      await connection.execute(
+        `INSERT INTO daily_archive_status (account_id, target_date, status, updated_at, last_error)
+         VALUES (?, ?, 'PENDING', NOW(), ?)
+         ON DUPLICATE KEY UPDATE 
+           last_error = VALUES(last_error),
+           updated_at = NOW()`,
+        [accountId, targetDateStr, error.message]
+      )
+    } catch (updateError) {
+      logger.error(`更新归档状态失败: ${updateError.message}`)
+    }
+    
+    throw error
+  } finally {
+    // 释放连接
+    connection.release()
+  }
+}
+
+/**
+ * 清理 ad_snapshots 热表：删除超过 2 天的历史快照，保持热表轻量
+ * TASKS §1.7：synced_at < NOW() - INTERVAL 2 DAY
+ * 保留最近 2 天数据，确保昨日真空期兜底查询不受影响
+ * @returns {Promise<{ success: boolean, deleted: number, error?: string }>}
+ */
+export async function cleanupAdSnapshots() {
+  try {
+    const [result] = await pool.execute(
+      `DELETE FROM ad_snapshots WHERE synced_at < NOW() - INTERVAL 2 DAY`
+    )
+    const deleted = result?.affectedRows ?? 0
+    if (deleted > 0) {
+      logger.info(`🧹 [热表清理] ad_snapshots 删除 ${deleted} 条超过 2 天的历史快照`)
+    }
+    return { success: true, deleted }
+  } catch (error) {
+    logger.error(`❌ [热表清理] ad_snapshots 清理失败:`, error.message)
+    return { success: false, deleted: 0, error: error.message }
   }
 }
 
 // ============================================
 // 导出所有函数
 // ============================================
+
+/**
+ * 获取写入队列统计信息（用于监控和优雅退出）
+ */
+export function getWriteQueueStats() {
+  return {
+    queueLength: writeQueue.length,
+    isWriting,
+    stats: { ...writeStats }
+  }
+}
+
+// 注意：getWriteQueueStats 已通过 export function 导出，不需要在这里重复导出
 
 export {
   generateSyncSessionId,
@@ -2106,7 +3421,16 @@ export {
   pickCostPerActionType,
   extractUcpc,
   extractPurchaseValue,
-  extractActionCount
+  extractActionCount,
+  // 导出写入队列相关函数（用于优雅退出）
+  processWriteQueue,
+  // 导出归档状态表相关函数（用于 TASKS §1.6 测试）
+  checkAndExecuteArchive,
+  getArchiveStatus,
+  executeArchive
+  // cleanupAdSnapshots 已通过 export async function 导出，不在此重复
+  // unifiedHeartbeatSync 已在上面通过 export async function 导出，不需要在这里重复导出
+  // getWriteQueueStats 已通过 export function 导出，不需要在这里重复导出
 }
 
 

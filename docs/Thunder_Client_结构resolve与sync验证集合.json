@@ -1,0 +1,53 @@
+{
+  "clientName": "Thunder Client",
+  "collectionName": "顺序2 resolve回显与sync刷新",
+  "folders": [],
+  "requests": [
+    {
+      "name": "1. resolve-存在ID(查库)",
+      "url": "http://localhost:3001/api/structure/resolve?ids=REPLACE_WITH_REAL_AD_ID",
+      "method": "GET",
+      "headers": [
+        {"key": "Authorization", "value": "Bearer {{token}}"}
+      ],
+      "body": {}
+    },
+    {
+      "name": "2. resolve-DB_miss返回missing",
+      "url": "http://localhost:3001/api/structure/resolve?ids=99999999999999,88888888888888",
+      "method": "GET",
+      "headers": [
+        {"key": "Authorization", "value": "Bearer {{token}}"}
+      ],
+      "body": {}
+    },
+    {
+      "name": "3. resolve-混合(存在+不存在)",
+      "url": "http://localhost:3001/api/structure/resolve?ids=REPLACE_EXISTING_ID,99999999999999",
+      "method": "GET",
+      "headers": [
+        {"key": "Authorization", "value": "Bearer {{token}}"}
+      ],
+      "body": {}
+    },
+    {
+      "name": "4. sync-强制同步结构",
+      "url": "http://localhost:3001/api/sync/structure",
+      "method": "POST",
+      "headers": [
+        {"key": "Content-Type", "value": "application/json"},
+        {"key": "Authorization", "value": "Bearer {{token}}"}
+      ],
+      "body": {"type": "json", "raw": "{\n  \"account_id\": \"act_1155891202142879\"\n}"}
+    },
+    {
+      "name": "5. 选择器-ads查库",
+      "url": "http://localhost:3001/api/structure/ads?account_id=act_1155891202142879&limit=20",
+      "method": "GET",
+      "headers": [
+        {"key": "Authorization", "value": "Bearer {{token}}"}
+      ],
+      "body": {}
+    }
+  ]
+}

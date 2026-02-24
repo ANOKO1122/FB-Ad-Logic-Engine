@@ -38,6 +38,7 @@
 
 <script>
 import { ref, watch, onMounted } from 'vue'
+import { authFetch } from '../utils/authFetch.js'
 
 export default {
   name: 'AdminReview',
@@ -51,7 +52,7 @@ export default {
       loading.value = true
       try {
         const url = statusFilter.value ? `/api/admin/users?status=${statusFilter.value}` : '/api/admin/users'
-        const resp = await fetch(url, { credentials: 'include' })
+        const resp = await authFetch(url)
         const data = await resp.json()
         users.value = data.users || []
       } finally {
@@ -61,7 +62,7 @@ export default {
 
     const approve = async (id) => {
       if (!confirm('确定通过该用户？')) return
-      const resp = await fetch(`/api/admin/users/${id}/approve`, { method: 'POST', credentials: 'include' })
+      const resp = await authFetch(`/api/admin/users/${id}/approve`, { method: 'POST' })
       const data = await resp.json()
       if (!data.success) return alert(data.error || '操作失败')
       await load()
@@ -70,7 +71,7 @@ export default {
 
     const reject = async (id) => {
       if (!confirm('确定拒绝该用户？')) return
-      const resp = await fetch(`/api/admin/users/${id}/reject`, { method: 'POST', credentials: 'include' })
+      const resp = await authFetch(`/api/admin/users/${id}/reject`, { method: 'POST' })
       const data = await resp.json()
       if (!data.success) return alert(data.error || '操作失败')
       await load()

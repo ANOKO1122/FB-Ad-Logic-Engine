@@ -1,31 +1,156 @@
 // 规则数据查询服务测试
 // 按照 .cursorrules 的要求：最小自动化测试，培养测开意识
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { getAccountTimezone, queryRuleData } from '../services/ruleDataService.js'
+import { describe, it, expect } from 'vitest'
+import { getAccountTimezone, queryRuleData, calculateSingleDayMetrics } from '../services/ruleDataService.js'
 
 /**
  * 【为什么需要这个测试？】
  * - 验证时区查询功能是否正常
  * - 验证错误处理（账户不存在时返回默认值）
- * - 培养测开意识：每个函数都要有测试
+ * - 验证规则判断一律用本地计算（不落库的 API 比值仅用于前端展示）
  */
 describe('ruleDataService', () => {
-  // 测试1：获取账户时区（最小测试用例）
   it('应该从数据库获取账户时区，如果不存在则返回 UTC', async () => {
-    // 第1行：调用函数（使用一个不存在的账户ID，测试默认值）
     const timezone = await getAccountTimezone('act_nonexistent')
-    
-    // 第2行：验证返回值（应该是 'UTC'，因为账户不存在）
     expect(timezone).toBe('UTC')
-    
-    // 第3行：验证返回值是字符串类型（防御性检查）
     expect(typeof timezone).toBe('string')
   })
-  
-  // 测试2：智能路由（待实现，需要 mock 数据库）
-  // it('应该根据时间窗口选择正确的数据源', async () => {
-  //   // TODO: 实现测试
-  // })
+
+  describe('calculateSingleDayMetrics（计算优先 -> API兜底 -> 零兜底）', () => {
+    it('spend=50, purchase_value=0, day.roas=null 时 roas 应为 0.0', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 50,
+        link_clicks: 0,
+        unique_link_clicks: 0,
+        purchases: 0,
+        purchase_value: 0,
+        roas: null,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.roas).toBe(0)
+    })
+
+    it('spend=0, purchase_value=0 时 roas 应为 null', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 0,
+        link_clicks: 0,
+        unique_link_clicks: 0,
+        purchases: 0,
+        purchase_value: 0,
+        roas: null,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.roas).toBeNull()
+    })
+
+    it('spend=50, purchase_value=30 时 roas 应为 0.6', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 50,
+        link_clicks: 10,
+        unique_link_clicks: 8,
+        purchases: 1,
+        purchase_value: 30,
+        roas: null,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.roas).toBe(0.6)
+    })
+
+    it('spend=50, purchase_value=0, day.roas=1.2 时应走 API 兜底', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 50,
+        link_clicks: 10,
+        unique_link_clicks: 8,
+        purchases: 0,
+        purchase_value: 0,
+        roas: 1.2,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.roas).toBe(1.2)
+    })
+
+    it('link_clicks=0 / unique_link_clicks=0 时 cpc/ucpc 应为 null', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 2,
+        link_clicks: 0,
+        unique_link_clicks: 0,
+        purchases: 0,
+        purchase_value: 0,
+        roas: null,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.cpc).toBeNull()
+      expect(result.ucpc).toBeNull()
+    })
+
+    it('有 link_clicks 时 cpc/ucpc 应为分子分母计算值', () => {
+      const row = {
+        account_id: 'act_test',
+        ad_id: '120xxx',
+        ad_name: 'test',
+        ad_set_id: null,
+        owner_id: 0,
+        status: 'ACTIVE',
+        spend: 2,
+        link_clicks: 5,
+        unique_link_clicks: 4,
+        purchases: 0,
+        purchase_value: 0,
+        roas: null,
+        add_to_cart_count: 0,
+        initiate_checkout_count: 0,
+        add_payment_info_count: 0
+      }
+      const result = calculateSingleDayMetrics(row)
+      expect(result.cpc).toBe(0.4)
+      expect(result.ucpc).toBe(0.5)
+    })
+  })
 })
 

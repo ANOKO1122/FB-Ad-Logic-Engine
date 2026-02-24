@@ -1,0 +1,3 @@
+npm run dev:server，启动后端不写logs
+npm run dev:server:logs,启动后端有日志，保留14天
+npm run dev，启动前端
