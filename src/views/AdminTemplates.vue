@@ -249,12 +249,25 @@
                     step="0.01"
                   />
                   <span class="unit">{{ a.type === 'set_budget' || (a.value_unit || 'percent') === 'usd' ? '$' : '%' }}</span>
-                  <span class="budget-cap-wrap">
+                  <span v-if="a.type === 'increase_budget'" class="budget-cap-wrap">
                     <span class="budget-cap-label">预算上限</span>
                     <input
                       type="number"
                       :value="a.max_daily_budget != null ? a.max_daily_budget / 100 : ''"
                       @input="onMaxBudgetInput($event, a)"
+                      class="input-clean input-num"
+                      placeholder="不填则不限制"
+                      min="1"
+                      step="0.01"
+                    />
+                    <span class="unit-hint">美元</span>
+                  </span>
+                  <span v-else-if="a.type === 'decrease_budget'" class="budget-cap-wrap">
+                    <span class="budget-cap-label">预算下限</span>
+                    <input
+                      type="number"
+                      :value="a.min_daily_budget != null ? a.min_daily_budget / 100 : ''"
+                      @input="onMinBudgetInput($event, a)"
                       class="input-clean input-num"
                       placeholder="不填则不限制"
                       min="1"
@@ -409,13 +422,41 @@ export default {
       showModal.value = true
     }
 
-    /** 兜底归一化：加载时若 max_daily_budget < 100 分则清空（旧数据/手工改库/脚本导入） */
-    const normalizeInvalidMaxBudget = (actions) => {
+    /**
+     * 兜底归一化：预算护栏字段与动作类型对齐
+     * - increase 仅允许 max_daily_budget
+     * - decrease 仅允许 min_daily_budget
+     * - set_budget 不允许 max/min
+     * - 小于 100 分的上下限一律清空
+     */
+    const normalizeBudgetGuardsByAction = (actions) => {
       let n = 0
       for (const a of actions || []) {
         if (a?.max_daily_budget != null && Number(a.max_daily_budget) < 100) {
           a.max_daily_budget = undefined
           n++
+        }
+        if (a?.min_daily_budget != null && Number(a.min_daily_budget) < 100) {
+          a.min_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'increase_budget' && a?.min_daily_budget != null) {
+          a.min_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'decrease_budget' && a?.max_daily_budget != null) {
+          a.max_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'set_budget') {
+          if (a?.max_daily_budget != null) {
+            a.max_daily_budget = undefined
+            n++
+          }
+          if (a?.min_daily_budget != null) {
+            a.min_daily_budget = undefined
+            n++
+          }
         }
       }
       return n
@@ -436,9 +477,9 @@ export default {
       form.actions = Array.isArray(t.actions) && t.actions.length
         ? t.actions.map(a => ({ ...a }))
         : [{ type: 'pause_ad', value: null }]
-      const normalizedCount = normalizeInvalidMaxBudget(form.actions)
+      const normalizedCount = normalizeBudgetGuardsByAction(form.actions)
       if (normalizedCount > 0) {
-        console.info(`[模板编辑] 已自动清空 ${normalizedCount} 个无效的预算上限（<1美元）`)
+        console.info(`[模板编辑] 已自动归一化 ${normalizedCount} 个预算护栏字段（动作与上下限口径对齐）`)
       }
       if (t.when_time_window === 'custom_range' && t.when_custom_range) {
         customRange.since = t.when_custom_range.since || ''
@@ -472,9 +513,19 @@ export default {
       if (a.type === 'set_budget') {
         a.value_unit = 'usd'
         if (a.value == null || a.value === '' || a.value < 0.01) a.value = 30
+        a.max_daily_budget = undefined
+        a.min_daily_budget = undefined
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
+        if (a.type === 'increase_budget') {
+          a.min_daily_budget = undefined
+        } else if (a.type === 'decrease_budget') {
+          a.max_daily_budget = undefined
+        }
+      } else {
+        a.max_daily_budget = undefined
+        a.min_daily_budget = undefined
       }
     }
     /** 预算上限输入（美元 → 分）：展示用美元，后端存分；输入 0 视为未设置 */
@@ -490,6 +541,21 @@ export default {
         return
       }
       a.max_daily_budget = Math.round(v * 100)
+    }
+
+    /** 预算下限输入（美元 → 分）：展示用美元，后端存分；输入 0 视为未设置 */
+    const onMinBudgetInput = (e, a) => {
+      const raw = e.target.value
+      if (raw === '' || raw == null) {
+        a.min_daily_budget = undefined
+        return
+      }
+      const v = parseFloat(raw)
+      if (Number.isNaN(v) || v < 0 || v === 0) {
+        a.min_daily_budget = undefined
+        return
+      }
+      a.min_daily_budget = Math.round(v * 100)
     }
 
     const doRestore = async (t) => {
@@ -533,6 +599,14 @@ export default {
               return alert('百分比模式下 value 须为 1–100 的整数')
             }
           }
+          if (a.type === 'increase_budget' && a.max_daily_budget != null) {
+            const m = Number(a.max_daily_budget)
+            if (!Number.isInteger(m) || m < 100) return alert('预算上限需为 >= 1 美元')
+          }
+          if (a.type === 'decrease_budget' && a.min_daily_budget != null) {
+            const m = Number(a.min_daily_budget)
+            if (!Number.isInteger(m) || m < 100) return alert('预算下限需为 >= 1 美元')
+          }
         }
       }
       if (form.when_time_window === 'custom_range') {
@@ -553,10 +627,12 @@ export default {
           const out = { type: a.type, value: a.value }
           if (a.type === 'set_budget') {
             out.value_unit = 'usd'
-            if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
-          } else if (a.type?.includes('budget')) {
+          } else if (a.type === 'increase_budget') {
             out.value_unit = a.value_unit || 'percent'
             if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
+          } else if (a.type === 'decrease_budget') {
+            out.value_unit = a.value_unit || 'percent'
+            if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
           }
           return out
         })
@@ -621,6 +697,7 @@ export default {
       addAction,
       onActionTypeChange,
       onMaxBudgetInput,
+      onMinBudgetInput,
       saveTemplate,
       doDelete,
       doRestore

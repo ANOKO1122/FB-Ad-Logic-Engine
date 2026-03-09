@@ -65,4 +65,60 @@ describe('RuleEngineDispatcher', () => {
     expect(matchedByCache[0].ad_id).toBe('ad_1')
     expect(matchedByData[0].ad_id).toBe('ad_1')
   })
+
+  it('use_dynamic_scope=1 时应优先使用快照目标（覆盖 targetIds）', async () => {
+    mockPoolExecute.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM rule_matched_objects')) {
+        return [[{ object_id: 'ad_1' }]]
+      }
+      throw new Error(`unexpected SQL: ${sql}`)
+    })
+    mockQueryRuleData.mockResolvedValue({
+      data: [
+        { ad_id: 'ad_1', ad_name: 'A', ad_set_id: 'as_1', status: 'ACTIVE', spend: 10, link_clicks: 5, cpc: 2, roas: 1.5, purchases: 2, mute_until: null, mute_reason: null }
+      ]
+    })
+
+    const rule = {
+      id: 3,
+      ruleName: 'R3',
+      enabled: true,
+      useDynamicScope: true,
+      targetLevel: 'ad',
+      targetIds: ['ad_2'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(matched.length).toBe(1)
+    expect(matched[0].ad_id).toBe('ad_1')
+  })
+
+  it('targetIds 为 act:id 时应按当前账户隔离目标', async () => {
+    mockQueryRuleData.mockResolvedValue({
+      data: [
+        { ad_id: 'ad_1', ad_name: 'A', ad_set_id: 'as_1', status: 'ACTIVE', spend: 10, link_clicks: 5, cpc: 2, roas: 1.5, purchases: 2, mute_until: null, mute_reason: null },
+        { ad_id: 'ad_2', ad_name: 'B', ad_set_id: 'as_2', status: 'ACTIVE', spend: 10, link_clicks: 5, cpc: 2, roas: 1.5, purchases: 2, mute_until: null, mute_reason: null }
+      ]
+    })
+
+    const rule = {
+      id: 4,
+      ruleName: 'R4',
+      enabled: true,
+      targetLevel: 'ad',
+      targetIds: ['act_test:ad_1', 'act_other:ad_2'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(matched.length).toBe(1)
+    expect(matched[0].ad_id).toBe('ad_1')
+  })
 })

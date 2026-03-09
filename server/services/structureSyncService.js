@@ -6,14 +6,15 @@
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { getCircuitBreakerStatus, getLastUsageRate } from './rateLimitService.js'
+import pLimit from 'p-limit'
 
 const COOLDOWN_MS = 120_000  // 2 分钟
 const LOCK_PREFIX = 'sync:structure:'
 // 每页之间间隔，减轻 FB 限流（手动同步是重型路径，宁愿慢一点也不要 burst 撞限流）
 const PAGE_DELAY_MS = 1200
-const ADS_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time'
-const CAMPAIGNS_FIELDS = 'id,name,effective_status,status,updated_time'
-const ADSETS_FIELDS = 'id,name,effective_status,status,campaign_id,updated_time'
+const ADS_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time,created_time'
+const CAMPAIGNS_FIELDS = 'id,name,effective_status,status,updated_time,created_time'
+const ADSETS_FIELDS = 'id,name,effective_status,status,campaign_id,updated_time,created_time'
 
 /** AdsPolar 标准：拉取除 DELETED/ARCHIVED 外的所有状态，避免漏掉「准备中」等中间态（官方 Ad effective_status 无 PENDING_PROCESS，准备中多为 IN_PROCESS/PREAPPROVED 等） */
 const EFFECTIVE_STATUS_FILTER = [
@@ -34,23 +35,48 @@ const EFFECTIVE_STATUS_FILTER = [
  * 过滤口径（与 TASKS.md「选择器本地展示过滤」一致）：
  * - q 为空：只返回 ACTIVE；include_paused=1 时再加 PAUSED
  * - q 非空：放宽到 EFFECTIVE_STATUS_FILTER 多类状态，仍排除 DELETED/ARCHIVED
+ * - scope_status 优先：active_only|paused_only|active_and_paused 时覆盖上述状态
+ * - 当 scope_status 有值时忽略 include_paused；当 scope_status 为空时按 include_paused + q 决定 statusList
+ * - name_exclude：名称不包含（NOT LIKE）
  * 分页：基于 structure_ads.id 的稳定游标，返回 paging.after。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureAdsFromDb(accountId, opts = {}) {
   const q = String(opts.q || '').trim()
   const includePaused = opts.include_paused === '1' || opts.include_paused === true
+  const scopeStatus = String(opts.scope_status || '').trim().toLowerCase()
+  const nameExclude = opts.name_exclude != null ? String(opts.name_exclude).trim() : ''
   const rawLimit = Number(opts.limit || 50)
   const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
   const after = opts.after != null && opts.after !== '' ? String(opts.after).trim() : null
 
-  const statusList = q === ''
+  // scope_created_within_hours：只查近 N 小时内创建的对象；阈值在 Node 中算成 ISO 字符串，避免 MySQL 对 VARCHAR(ISO8601) 解析差异
+  const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
+  const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
+  const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  let statusList
+  if (scopeStatus === 'active_only') statusList = ['ACTIVE']
+  else if (scopeStatus === 'paused_only') statusList = ['PAUSED']
+  else if (scopeStatus === 'active_and_paused') statusList = ['ACTIVE', 'PAUSED']
+  else statusList = q === ''
     ? (includePaused ? ['ACTIVE', 'PAUSED'] : ['ACTIVE'])
     : EFFECTIVE_STATUS_FILTER
 
+  // scope_status_exclude：排除指定状态（逗号分隔，如 'PAUSED' 或 'ACTIVE,PAUSED'）
+  const excludeRaw = opts.scope_status_exclude != null ? String(opts.scope_status_exclude).trim() : ''
+  if (excludeRaw) {
+    const excludeSet = new Set(excludeRaw.split(',').map(s => s.trim()).filter(Boolean))
+    statusList = statusList.filter(s => !excludeSet.has(s))
+  }
+  if (statusList.length === 0) {
+    return { items: [], paging: { after: null, next: null } }
+  }
+
+  // 顺序：先 account_id + effective_status（走索引），再 name LIKE/NOT LIKE（大表较贵），便于大表性能。
   const params = [accountId]
   let sql = `
     SELECT id, account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time
@@ -63,13 +89,24 @@ export async function listStructureAdsFromDb(accountId, opts = {}) {
     sql += ` AND name LIKE ?`
     params.push(`%${q}%`)
   }
+  if (nameExclude) {
+    sql += ` AND (name NOT LIKE ? OR name IS NULL)`
+    params.push(`%${nameExclude}%`)
+  }
+  if (createdSinceThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ?`
+    params.push(createdSinceThreshold)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
   }
-  // LIMIT 不能使用占位符（MySQL 预处理会报 ER_WRONG_ARGUMENTS），limit 已校验为 1..500，安全内联
+  const orderBy =
+    statusList.length === 2 && statusList.includes('ACTIVE') && statusList.includes('PAUSED')
+      ? ` ORDER BY (effective_status = 'ACTIVE') DESC, id ASC`
+      : ` ORDER BY id ASC`
   const limitRows = Math.min(501, limit + 1)
-  sql += ` ORDER BY id ASC LIMIT ${limitRows}`
+  sql += orderBy + ` LIMIT ${limitRows}`
 
   const [rows] = await pool.execute(sql, params)
   const hasNext = rows.length > limit
@@ -94,23 +131,44 @@ export async function listStructureAdsFromDb(accountId, opts = {}) {
 
 /**
  * 选择器查库：从 structure_campaigns 分页查询，0 FB 调用。
- * 过滤口径与 listStructureAdsFromDb 一致。
+ * 过滤口径与 listStructureAdsFromDb 一致；支持 scope_status、name_exclude。
+ * 当 scope_status 有值时忽略 include_paused；当 scope_status 为空时按 include_paused + q 决定 statusList。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureCampaignsFromDb(accountId, opts = {}) {
   const q = String(opts.q || '').trim()
   const includePaused = opts.include_paused === '1' || opts.include_paused === true
+  const scopeStatus = String(opts.scope_status || '').trim().toLowerCase()
+  const nameExclude = opts.name_exclude != null ? String(opts.name_exclude).trim() : ''
   const rawLimit = Number(opts.limit || 50)
   const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
   const after = opts.after != null && opts.after !== '' ? String(opts.after).trim() : null
 
-  const statusList = q === ''
+  const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
+  const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
+  const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  let statusList
+  if (scopeStatus === 'active_only') statusList = ['ACTIVE']
+  else if (scopeStatus === 'paused_only') statusList = ['PAUSED']
+  else if (scopeStatus === 'active_and_paused') statusList = ['ACTIVE', 'PAUSED']
+  else statusList = q === ''
     ? (includePaused ? ['ACTIVE', 'PAUSED'] : ['ACTIVE'])
     : EFFECTIVE_STATUS_FILTER
 
+  const excludeRaw = opts.scope_status_exclude != null ? String(opts.scope_status_exclude).trim() : ''
+  if (excludeRaw) {
+    const excludeSet = new Set(excludeRaw.split(',').map(s => s.trim()).filter(Boolean))
+    statusList = statusList.filter(s => !excludeSet.has(s))
+  }
+  if (statusList.length === 0) {
+    return { items: [], paging: { after: null, next: null } }
+  }
+
+  // 顺序：先 account_id + effective_status（走索引），再 name LIKE/NOT LIKE（大表较贵），便于大表性能。
   const params = [accountId]
   let sql = `
     SELECT id, account_id, campaign_id, name, effective_status, status, updated_time
@@ -123,12 +181,24 @@ export async function listStructureCampaignsFromDb(accountId, opts = {}) {
     sql += ` AND name LIKE ?`
     params.push(`%${q}%`)
   }
+  if (nameExclude) {
+    sql += ` AND (name NOT LIKE ? OR name IS NULL)`
+    params.push(`%${nameExclude}%`)
+  }
+  if (createdSinceThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ?`
+    params.push(createdSinceThreshold)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
   }
+  const orderBy =
+    statusList.length === 2 && statusList.includes('ACTIVE') && statusList.includes('PAUSED')
+      ? ` ORDER BY (effective_status = 'ACTIVE') DESC, id ASC`
+      : ` ORDER BY id ASC`
   const limitRows = Math.min(501, limit + 1)
-  sql += ` ORDER BY id ASC LIMIT ${limitRows}`
+  sql += orderBy + ` LIMIT ${limitRows}`
 
   const [rows] = await pool.execute(sql, params)
   const hasNext = rows.length > limit
@@ -150,23 +220,44 @@ export async function listStructureCampaignsFromDb(accountId, opts = {}) {
 
 /**
  * 选择器查库：从 structure_adsets 分页查询，0 FB 调用。
- * 过滤口径与 listStructureAdsFromDb 一致。
+ * 过滤口径与 listStructureAdsFromDb 一致；支持 scope_status、name_exclude。
+ * 当 scope_status 有值时忽略 include_paused；当 scope_status 为空时按 include_paused + q 决定 statusList。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureAdsetsFromDb(accountId, opts = {}) {
   const q = String(opts.q || '').trim()
   const includePaused = opts.include_paused === '1' || opts.include_paused === true
+  const scopeStatus = String(opts.scope_status || '').trim().toLowerCase()
+  const nameExclude = opts.name_exclude != null ? String(opts.name_exclude).trim() : ''
   const rawLimit = Number(opts.limit || 50)
   const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
   const after = opts.after != null && opts.after !== '' ? String(opts.after).trim() : null
 
-  const statusList = q === ''
+  const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
+  const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
+  const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  let statusList
+  if (scopeStatus === 'active_only') statusList = ['ACTIVE']
+  else if (scopeStatus === 'paused_only') statusList = ['PAUSED']
+  else if (scopeStatus === 'active_and_paused') statusList = ['ACTIVE', 'PAUSED']
+  else statusList = q === ''
     ? (includePaused ? ['ACTIVE', 'PAUSED'] : ['ACTIVE'])
     : EFFECTIVE_STATUS_FILTER
 
+  const excludeRaw = opts.scope_status_exclude != null ? String(opts.scope_status_exclude).trim() : ''
+  if (excludeRaw) {
+    const excludeSet = new Set(excludeRaw.split(',').map(s => s.trim()).filter(Boolean))
+    statusList = statusList.filter(s => !excludeSet.has(s))
+  }
+  if (statusList.length === 0) {
+    return { items: [], paging: { after: null, next: null } }
+  }
+
+  // 顺序：先 account_id + effective_status（走索引），再 name LIKE/NOT LIKE（大表较贵），便于大表性能。
   const params = [accountId]
   let sql = `
     SELECT id, account_id, adset_id, campaign_id, name, effective_status, status, updated_time
@@ -179,12 +270,24 @@ export async function listStructureAdsetsFromDb(accountId, opts = {}) {
     sql += ` AND name LIKE ?`
     params.push(`%${q}%`)
   }
+  if (nameExclude) {
+    sql += ` AND (name NOT LIKE ? OR name IS NULL)`
+    params.push(`%${nameExclude}%`)
+  }
+  if (createdSinceThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ?`
+    params.push(createdSinceThreshold)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
   }
+  const orderBy =
+    statusList.length === 2 && statusList.includes('ACTIVE') && statusList.includes('PAUSED')
+      ? ` ORDER BY (effective_status = 'ACTIVE') DESC, id ASC`
+      : ` ORDER BY id ASC`
   const limitRows = Math.min(501, limit + 1)
-  sql += ` ORDER BY id ASC LIMIT ${limitRows}`
+  sql += orderBy + ` LIMIT ${limitRows}`
 
   const [rows] = await pool.execute(sql, params)
   const hasNext = rows.length > limit
@@ -210,7 +313,7 @@ export async function listStructureAdsetsFromDb(accountId, opts = {}) {
  * type 只允许 campaign | adset | ad，分发到已有 list 方法，返回统一字段结构。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { type, q, limit, after, include_paused }
+ * @param {Object} opts - { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
  * @returns {Promise<{ items: Array<{ id, type, name, campaign_id, adset_id, effective_status, account_id }>, paging }>}
  */
 export async function listStructureObjectsFromDb(accountId, opts = {}) {
@@ -219,7 +322,16 @@ export async function listStructureObjectsFromDb(accountId, opts = {}) {
   if (!allowed.includes(type)) {
     throw new Error(`type 只允许 campaign | adset | ad，当前: ${opts.type}`)
   }
-  const listOpts = { q: opts.q, limit: opts.limit, after: opts.after, include_paused: opts.include_paused }
+  const listOpts = {
+    q: opts.q,
+    limit: opts.limit,
+    after: opts.after,
+    include_paused: opts.include_paused,
+    scope_status: opts.scope_status,
+    scope_status_exclude: opts.scope_status_exclude,
+    name_exclude: opts.name_exclude,
+    scope_created_within_hours: opts.scope_created_within_hours
+  }
   let result
   if (type === 'campaign') {
     result = await listStructureCampaignsFromDb(accountId, listOpts)
@@ -427,8 +539,8 @@ function updatedTimeToUnixSec(val) {
 /** 单条写入 structure_ads（供 Piggyback / 伪增量复用） */
 const UPSERT_STRUCTURE_SQL = `
   INSERT INTO structure_ads
-    (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, last_synced_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, created_time, last_synced_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
   ON DUPLICATE KEY UPDATE
     adset_id = VALUES(adset_id),
     campaign_id = VALUES(campaign_id),
@@ -437,6 +549,7 @@ const UPSERT_STRUCTURE_SQL = `
     status = VALUES(status),
     configured_status = VALUES(configured_status),
     updated_time = VALUES(updated_time),
+    created_time = VALUES(created_time),
     last_synced_at = NOW()
 `
 
@@ -465,11 +578,13 @@ export async function piggybackStructureFromToday(accountId, activeAdIds, struct
       const payload = structurePayload[String(adId)]
       if (payload) {
         const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(payload.updated_time)
+        const createdTimeNorm = normalizeUpdatedTimeToUtcZ(payload.created_time)
         await pool.execute(UPSERT_STRUCTURE_SQL, [
           accountId, adId,
           payload.adset_id ?? null, payload.campaign_id ?? null, payload.name ?? null,
           payload.effective_status ?? null, payload.status ?? null, payload.configured_status ?? null,
-          updatedTimeNorm ?? null
+          updatedTimeNorm ?? null,
+          createdTimeNorm ?? payload.created_time ?? null
         ])
         filledFromPayload++
       } else {
@@ -482,11 +597,13 @@ export async function piggybackStructureFromToday(accountId, activeAdIds, struct
       for (const ad of resolved) {
         const id = String(ad.id || '')
         const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(ad.updated_time)
+        const createdTimeNorm = normalizeUpdatedTimeToUtcZ(ad.created_time)
         await pool.execute(UPSERT_STRUCTURE_SQL, [
           accountId, id,
           ad.adset_id ?? null, ad.campaign_id ?? null, ad.name ?? null,
           ad.effective_status ?? null, ad.status ?? null, ad.configured_status ?? null,
-          updatedTimeNorm ?? null
+          updatedTimeNorm ?? null,
+          createdTimeNorm ?? ad.created_time ?? null
         ])
         gapFetched++
       }
@@ -537,11 +654,13 @@ export async function runPseudoIncrementForAccount(accountId, activeAdIds, faceb
     for (const ad of resolved) {
       const id = String(ad.id || '')
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(ad.updated_time)
+      const createdTimeNorm = normalizeUpdatedTimeToUtcZ(ad.created_time)
       await pool.execute(UPSERT_STRUCTURE_SQL, [
         accountId, id,
         ad.adset_id ?? null, ad.campaign_id ?? null, ad.name ?? null,
         ad.effective_status ?? null, ad.status ?? null, ad.configured_status ?? null,
-        updatedTimeNorm ?? null
+        updatedTimeNorm ?? null,
+        createdTimeNorm ?? ad.created_time ?? null
       ])
       touched++
     }
@@ -553,9 +672,6 @@ export async function runPseudoIncrementForAccount(accountId, activeAdIds, faceb
   }
 }
 
-/** 实验开关：是否允许手动同步时尝试 updated_time 增量（文档已禁止作为主策略，现网不可靠，默认关闭） */
-const ENABLE_INCREMENTAL_EXPERIMENT = false
-
 /**
  * 执行 structure_ads 批量 upsert 和 structure_sync_status 更新（共享逻辑）
  * @param {Object} lockConnection
@@ -563,12 +679,13 @@ const ENABLE_INCREMENTAL_EXPERIMENT = false
  * @param {Array} allItems
  * @param {number|null} cursorTs - 当前游标
  * @param {boolean} isFullRun
+ * @param {number|null} [filterSinceSec] - 本次使用的过滤起点 Unix 秒（近 3 天窗口），写入 last_filter_since_sec 便于可观测
  */
-async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems, cursorTs, isFullRun) {
+async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems, cursorTs, isFullRun, filterSinceSec = null) {
   const UPSERT_BATCH_SIZE = 50
   const upsertBase = `
     INSERT INTO structure_ads
-      (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, last_synced_at)
+      (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, created_time, last_synced_at)
     VALUES
   `
   const upsertUpdate = `
@@ -580,14 +697,16 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
       status = VALUES(status),
       configured_status = VALUES(configured_status),
       updated_time = VALUES(updated_time),
+      created_time = VALUES(created_time),
       last_synced_at = NOW()
   `
   for (let i = 0; i < allItems.length; i += UPSERT_BATCH_SIZE) {
     const chunk = allItems.slice(i, i + UPSERT_BATCH_SIZE)
-    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
     const values = []
     for (const item of chunk) {
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(item.updated_time)
+      const createdTimeNorm = normalizeUpdatedTimeToUtcZ(item.created_time)
       values.push(
         accountId,
         item.id,
@@ -597,7 +716,8 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
         item.effective_status ?? null,
         item.status ?? null,
         item.configured_status ?? null,
-        updatedTimeNorm ?? item.updated_time ?? null
+        updatedTimeNorm ?? item.updated_time ?? null,
+        createdTimeNorm ?? item.created_time ?? null
       )
     }
     await lockConnection.execute(upsertBase + placeholders + upsertUpdate, values)
@@ -624,9 +744,9 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
   const fullSuccessAt = isFullRun ? new Date() : null
   const upsertStatusSql = `
     INSERT INTO structure_sync_status
-      (account_id, last_success_at, last_error, updated_at, last_sync_updated_ts, last_full_count, has_full_synced, last_full_success_at)
+      (account_id, last_success_at, last_error, updated_at, last_sync_updated_ts, last_full_count, has_full_synced, last_full_success_at, last_filter_since_sec)
     VALUES
-      (?, NOW(), NULL, NOW(), ?, ?, ?, ?)
+      (?, NOW(), NULL, NOW(), ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
       last_success_at = NOW(),
       last_error = NULL,
@@ -634,7 +754,8 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
       last_sync_updated_ts = IF(? = 1, ?, last_sync_updated_ts),
       last_full_count = COALESCE(?, last_full_count),
       has_full_synced = CASE WHEN ? = 1 THEN 1 ELSE has_full_synced END,
-      last_full_success_at = COALESCE(?, last_full_success_at)
+      last_full_success_at = COALESCE(?, last_full_success_at),
+      last_filter_since_sec = COALESCE(?, last_filter_since_sec)
   `
   await lockConnection.execute(upsertStatusSql, [
     accountId,
@@ -642,11 +763,13 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
     fullCount,
     isFullRun ? 1 : 0,
     fullSuccessAt,
+    filterSinceSec,
     cursorChanged ? 1 : 0,
     newCursorTs,
     fullCount,
     isFullRun ? 1 : 0,
-    fullSuccessAt
+    fullSuccessAt,
+    filterSinceSec
   ])
 }
 
@@ -660,7 +783,7 @@ async function doStructureCampaignsUpsert(lockConnection, accountId, allItems) {
   const UPSERT_BATCH_SIZE = 50
   const upsertBase = `
     INSERT INTO structure_campaigns
-      (account_id, campaign_id, name, effective_status, status, updated_time, last_synced_at)
+      (account_id, campaign_id, name, effective_status, status, updated_time, created_time, last_synced_at)
     VALUES
   `
   const upsertUpdate = `
@@ -669,21 +792,24 @@ async function doStructureCampaignsUpsert(lockConnection, accountId, allItems) {
       effective_status = VALUES(effective_status),
       status = VALUES(status),
       updated_time = VALUES(updated_time),
+      created_time = VALUES(created_time),
       last_synced_at = NOW()
   `
   for (let i = 0; i < allItems.length; i += UPSERT_BATCH_SIZE) {
     const chunk = allItems.slice(i, i + UPSERT_BATCH_SIZE)
-    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, NOW())').join(', ')
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
     const values = []
     for (const item of chunk) {
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(item.updated_time)
+      const createdTimeNorm = normalizeUpdatedTimeToUtcZ(item.created_time)
       values.push(
         accountId,
         item.id,
         item.name ?? null,
         item.effective_status ?? null,
         item.status ?? null,
-        updatedTimeNorm ?? null
+        updatedTimeNorm ?? null,
+        createdTimeNorm ?? item.created_time ?? null
       )
     }
     await lockConnection.execute(upsertBase + placeholders + upsertUpdate, values)
@@ -700,7 +826,7 @@ async function doStructureAdsetsUpsert(lockConnection, accountId, allItems) {
   const UPSERT_BATCH_SIZE = 50
   const upsertBase = `
     INSERT INTO structure_adsets
-      (account_id, adset_id, campaign_id, name, effective_status, status, updated_time, last_synced_at)
+      (account_id, adset_id, campaign_id, name, effective_status, status, updated_time, created_time, last_synced_at)
     VALUES
   `
   const upsertUpdate = `
@@ -710,14 +836,16 @@ async function doStructureAdsetsUpsert(lockConnection, accountId, allItems) {
       effective_status = VALUES(effective_status),
       status = VALUES(status),
       updated_time = VALUES(updated_time),
+      created_time = VALUES(created_time),
       last_synced_at = NOW()
   `
   for (let i = 0; i < allItems.length; i += UPSERT_BATCH_SIZE) {
     const chunk = allItems.slice(i, i + UPSERT_BATCH_SIZE)
-    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
     const values = []
     for (const item of chunk) {
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(item.updated_time)
+      const createdTimeNorm = normalizeUpdatedTimeToUtcZ(item.created_time)
       values.push(
         accountId,
         item.id,
@@ -725,7 +853,8 @@ async function doStructureAdsetsUpsert(lockConnection, accountId, allItems) {
         item.name ?? null,
         item.effective_status ?? null,
         item.status ?? null,
-        updatedTimeNorm ?? null
+        updatedTimeNorm ?? null,
+        createdTimeNorm ?? item.created_time ?? null
       )
     }
     await lockConnection.execute(upsertBase + placeholders + upsertUpdate, values)
@@ -733,19 +862,69 @@ async function doStructureAdsetsUpsert(lockConnection, accountId, allItems) {
 }
 
 /**
- * 强制同步该账户的广告结构到 structure_ads（顺序2 2.4：重型全量/分页路径）
- * 默认策略：仅全量分页，不依赖 /ads 的 updated_time filtering（已证伪）。
- * 可选实验：ENABLE_INCREMENTAL_EXPERIMENT=true 时先尝试增量，失败/回退仍走全量。
+ * 仅同步指定账户的广告组（adsets）到 structure_adsets，全量分页拉取，不拉 campaigns/ads。
+ * 用于补数：某账户 structure_adsets 为空时单独补齐广告组数据。
+ * @param {string} accountId - 广告账户 ID（如 act_xxx）
+ * @param {Object} facebookApi - 已构造的 FacebookMarketingAPI 实例
+ * @param {{ skipLock?: boolean }} [opts] - skipLock=true 时不占账户锁（脚本专用）
+ * @returns {Promise<{ ok: boolean, synced_count?: number, reason?: string }>}
+ */
+export async function syncAccountStructureAdsetsOnly(accountId, facebookApi, opts = {}) {
+  const skipLock = opts.skipLock === true
+  let conn = null
+  const lockName = LOCK_PREFIX + accountId
+  try {
+    conn = await pool.getConnection()
+    if (!skipLock) {
+      const [lockRows] = await conn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName])
+      if (lockRows[0]?.acquired !== 1) {
+        conn.release()
+        return { ok: false, reason: 'lock_busy' }
+      }
+    }
+    const allAdsets = []
+    let after = null
+    do {
+      const page = await facebookApi.getStructurePage(accountId, 'adsets', {
+        fields: ADSETS_FIELDS,
+        limit: 100,
+        after,
+        filtering: null
+      })
+      if (page?.items?.length) allAdsets.push(...page.items)
+      after = page?.paging?.after ?? null
+      if (after) await sleep(PAGE_DELAY_MS)
+    } while (after)
+    await doStructureAdsetsUpsert(conn, accountId, allAdsets)
+    if (!skipLock) await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+    conn.release()
+    conn = null
+    logger.info(`[adsets-only] account=${accountId} 同步 adsets 完成 count=${allAdsets.length}`)
+    return { ok: true, synced_count: allAdsets.length }
+  } catch (err) {
+    if (conn) {
+      try {
+        if (!skipLock) await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+      } catch (_) {}
+      conn.release()
+      conn = null
+    }
+    throw err
+  }
+}
+
+/**
+ * 强制同步该账户的广告结构到 structure_ads（顺序2 2.4：近 3 天路径）
+ * 策略：campaigns/adsets/ads 均只拉 updated_time >= since（since = 当前时间减 3 天），filtering value 优先 Unix 秒；分页拉完再 upsert；ads 的 isFullRun 传 false。
  * @param {string} accountId - 广告账户 ID（如 act_xxx）
  * @param {Object} facebookApi - 已构造的 FacebookMarketingAPI 实例，需有 getStructurePage(accountId, edge, opts)
- * @param {Object} [opts] - 可选，{ useIncrementalExperiment: boolean } 覆盖实验开关
+ * @param {Object} [opts] - 可选，保留供调用方传参
  * @returns {Promise<{ ok: boolean, reason?: string, synced_count?: number, duration_ms?: number, retry_after_sec?: number }>}
  */
 export async function syncAccountStructureAds(accountId, facebookApi, opts = {}) {
   const startTime = Date.now()
   let lockConnection = null
   const lockName = LOCK_PREFIX + accountId
-  const useIncrementalExperiment = opts.useIncrementalExperiment ?? ENABLE_INCREMENTAL_EXPERIMENT
 
   try {
     lockConnection = await pool.getConnection()
@@ -760,7 +939,7 @@ export async function syncAccountStructureAds(accountId, facebookApi, opts = {})
       return { ok: false, reason: 'lock_busy' }
     }
 
-    // 冷却期：按「上一次重型全量同步成功时间」structure_sync_status.last_success_at，避免被 Piggyback/伪增量误触发
+    // 冷却期：按「上一次结构同步（近 3 天）成功时间」structure_sync_status.last_success_at，避免被 Piggyback/伪增量误触发
     const [cooldownRows] = await lockConnection.query(
       `SELECT UNIX_TIMESTAMP(last_success_at) AS last_ts FROM structure_sync_status WHERE account_id = ?`,
       [accountId]
@@ -778,7 +957,7 @@ export async function syncAccountStructureAds(accountId, facebookApi, opts = {})
       return { ok: false, reason: 'cooldown', retry_after_sec: retryAfterSec }
     }
 
-    // ✅ 预检：若最近一次已知的 API 使用率很高，提前拒绝“重型全量同步”
+    // ✅ 预检：若最近一次已知的 API 使用率很高，提前拒绝「结构同步（近 3 天）」请求
     // 目的：避免在配额紧张时继续触发 FB 的 user request limit（更差体验：前端 90s 超时）
     const usageRate = getLastUsageRate()
     if (usageRate != null && Number.isFinite(Number(usageRate)) && Number(usageRate) >= 85) {
@@ -788,128 +967,71 @@ export async function syncAccountStructureAds(accountId, facebookApi, opts = {})
       await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
       lockConnection.release()
       lockConnection = null
-      logger.warn(`[2.4] usage 高，跳过手动结构全量 account=${accountId} usageRate=${r} retry_after_sec=${retryAfterSec}`)
+      logger.warn(`[2.4] usage 高，跳过结构同步（近3天） account=${accountId} usageRate=${r} retry_after_sec=${retryAfterSec}`)
       return { ok: false, reason: 'quota_high', retry_after_sec: retryAfterSec }
     }
 
-    // 读取 structure_sync_status（仅全量时用于异常态判定；不再用游标做默认增量）
+    // 读取 structure_sync_status（用于 doStructureAdsUpsertAndStatus 的 last_sync_updated_ts）
     const [statusRows] = await lockConnection.query(
-      `SELECT last_sync_updated_ts, last_full_count, has_full_synced FROM structure_sync_status WHERE account_id = ?`,
+      `SELECT last_sync_updated_ts FROM structure_sync_status WHERE account_id = ?`,
       [accountId]
     )
     const status = statusRows[0] || null
     const cursorTs = status?.last_sync_updated_ts != null ? Number(status.last_sync_updated_ts) : null
-    const lastFullCount = status?.last_full_count != null ? Number(status.last_full_count) : null
-    const [countRows] = await lockConnection.query(
-      `SELECT COUNT(*) AS n FROM structure_ads WHERE account_id = ?`,
-      [accountId]
-    )
-    const currentLocalCount = Number(countRows[0]?.n ?? 0)
 
-    const baseFiltering = [{ field: 'effective_status', operator: 'IN', value: EFFECTIVE_STATUS_FILTER }]
+    // 近 3 天：since 用 Unix 秒；filtering value 优先 Unix 时间戳（秒），若某 edge 报错则自动回退为 ISO8601
+    const sinceSec = Math.floor((Date.now() - 3 * 24 * 60 * 60 * 1000) / 1000)
+    let sinceValue = String(sinceSec)
 
-    // 1. campaigns：分页全量拉取并 upsert（不传 filtering：campaigns edge 对部分 status 值不兼容，易触发 FB #100；展示侧再过滤）
-    const allCampaigns = []
-    let campAfter = null
-    do {
-      const page = await facebookApi.getStructurePage(accountId, 'campaigns', {
-        fields: CAMPAIGNS_FIELDS,
-        limit: 100,
-        after: campAfter,
-        filtering: null
-      })
-      if (page?.items?.length) allCampaigns.push(...page.items)
-      campAfter = page?.paging?.after ?? null
-      if (campAfter) await sleep(PAGE_DELAY_MS)
-    } while (campAfter)
-    await doStructureCampaignsUpsert(lockConnection, accountId, allCampaigns)
-    logger.info(`[2.4] campaigns 同步 account=${accountId} count=${allCampaigns.length}`)
-
-    // 2. adsets：分页全量拉取并 upsert（不传 filtering：adsets edge 对部分 status 值不兼容，易触发 FB #100；展示侧再过滤）
-    const allAdsets = []
-    let adsetAfter = null
-    do {
-      const page = await facebookApi.getStructurePage(accountId, 'adsets', {
-        fields: ADSETS_FIELDS,
-        limit: 100,
-        after: adsetAfter,
-        filtering: null
-      })
-      if (page?.items?.length) allAdsets.push(...page.items)
-      adsetAfter = page?.paging?.after ?? null
-      if (adsetAfter) await sleep(PAGE_DELAY_MS)
-    } while (adsetAfter)
-    await doStructureAdsetsUpsert(lockConnection, accountId, allAdsets)
-    logger.info(`[2.4] adsets 同步 account=${accountId} count=${allAdsets.length}`)
-
-    let allItems = []
-    let usedIncremental = false
-    let fallbackReason = null
-
-    // 仅当实验开关开启时尝试 updated_time 增量（文档禁止作为主策略，默认不执行）
-    if (useIncrementalExperiment && cursorTs != null && Number.isFinite(cursorTs)) {
-      const sinceTs = Math.max(0, cursorTs - 300)
-      const sinceISO = new Date(sinceTs * 1000).toISOString()
-      const incrementalFiltering = [...baseFiltering, { field: 'updated_time', operator: 'GREATER_THAN', value: sinceISO }]
-      try {
-        let after = null
-        do {
-          const page = await facebookApi.getStructurePage(accountId, 'ads', {
-            fields: ADS_FIELDS,
-            limit: 100,
-            after,
-            filtering: incrementalFiltering
-          })
-          if (page && Array.isArray(page.items) && page.items.length) allItems.push(...page.items)
-          after = page?.paging?.after ?? null
-          if (after) await sleep(PAGE_DELAY_MS)
-        } while (after)
-        usedIncremental = true
-        if (allItems.length === 0) {
-          const shouldFallback = currentLocalCount === 0 ||
-            (lastFullCount != null && lastFullCount > 0 && currentLocalCount < lastFullCount * 0.3)
-          if (shouldFallback) {
-            fallbackReason = 'incremental_0_and_abnormal_local'
-            usedIncremental = false
-            allItems = []
-          }
-        }
-      } catch (err) {
-        usedIncremental = false
-        fallbackReason = err.message || 'api_or_filter_error'
-        allItems = []
-        logger.warn(`[2.4] 实验增量请求失败，回退全量 account=${accountId} error=${err.message}`)
-      }
-    }
-
-    // 默认路径：全量分页（手动同步 = 重型全量；或实验增量未用/回退后走这里）
-    if (!usedIncremental) {
-      if (fallbackReason) logger.warn(`[2.4] 回退全量 account=${accountId} reason=${fallbackReason}`)
-      allItems = []
+    /** 拉取单 edge 全部分页（filtering: updated_time >= sinceValue），用于 Unix/ISO 回退 */
+    async function fetchAllPagesForEdge(edge, fields) {
+      const items = []
       let after = null
       do {
-        const page = await facebookApi.getStructurePage(accountId, 'ads', {
-          fields: ADS_FIELDS,
+        const page = await facebookApi.getStructurePage(accountId, edge, {
+          fields,
           limit: 100,
           after,
-          filtering: baseFiltering
+          filtering: [{ field: 'updated_time', operator: 'GREATER_THAN', value: sinceValue }]
         })
-        if (page?.items?.length) allItems.push(...page.items)
+        if (page?.items?.length) items.push(...page.items)
         after = page?.paging?.after ?? null
         if (after) await sleep(PAGE_DELAY_MS)
       } while (after)
+      return items
     }
 
-    const isFullRun = !usedIncremental || (usedIncremental && fallbackReason)
-    await doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems, cursorTs, isFullRun)
+    /** 先试当前 sinceValue（优先 Unix 秒），失败则切为 ISO8601 再拉一次 */
+    async function fetchEdgeWithFallback(edge, fields, edgeLabel) {
+      try {
+        return await fetchAllPagesForEdge(edge, fields)
+      } catch (err) {
+        logger.warn(`[2.4] ${edgeLabel} 使用 Unix 秒报错，回退 ISO8601 account=${accountId} error=${err.message}`)
+        sinceValue = new Date(sinceSec * 1000).toISOString()
+        return await fetchAllPagesForEdge(edge, fields)
+      }
+    }
+
+    // 1. campaigns：只拉 updated_time >= since（近 3 天），分页拉完再 upsert
+    const allCampaigns = await fetchEdgeWithFallback('campaigns', CAMPAIGNS_FIELDS, 'campaigns')
+    await doStructureCampaignsUpsert(lockConnection, accountId, allCampaigns)
+    logger.info(`[2.4] campaigns 同步 account=${accountId} count=${allCampaigns.length}`)
+
+    // 2. adsets：只拉 updated_time >= since（近 3 天），分页拉完再 upsert
+    const allAdsets = await fetchEdgeWithFallback('adsets', ADSETS_FIELDS, 'adsets')
+    await doStructureAdsetsUpsert(lockConnection, accountId, allAdsets)
+    logger.info(`[2.4] adsets 同步 account=${accountId} count=${allAdsets.length}`)
+
+    // 3. ads：只拉 updated_time >= since（近 3 天），分页拉完再 upsert；isFullRun 传 false；写入 last_filter_since_sec
+    const allItems = await fetchEdgeWithFallback('ads', ADS_FIELDS, 'ads')
+    await doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems, cursorTs, false, sinceSec)
 
     await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
     lockConnection.release()
     lockConnection = null
 
     const durationMs = Date.now() - startTime
-    const mode = usedIncremental && !fallbackReason ? 'incremental' : 'full'
-    logger.info(`✅ [2.4] 结构同步完成 account=${accountId} mode=${mode} campaigns=${allCampaigns.length} adsets=${allAdsets.length} ads=${allItems.length} duration_ms=${durationMs}${fallbackReason ? ` fallback_reason=${fallbackReason}` : ''}`)
+    logger.info(`✅ [2.4] 结构同步完成 account=${accountId} 近3天 campaigns=${allCampaigns.length} adsets=${allAdsets.length} ads=${allItems.length} duration_ms=${durationMs}`)
     return { ok: true, synced_count: allItems.length, synced_campaigns: allCampaigns.length, synced_adsets: allAdsets.length, duration_ms: durationMs }
   } catch (err) {
     if (lockConnection) {
@@ -925,29 +1047,524 @@ export async function syncAccountStructureAds(accountId, facebookApi, opts = {})
   }
 }
 
-/** 每小时结构全量轮转：默认 6 账户，可调 12；并发固定 1；usage 高/熔断时本小时跳过 */
+/**
+ * Fast Sync（MVP）：单账户一次 unified batch 拉 campaigns/adsets/ads 三层并写库
+ * - 不挂 Cron，仅供脚本/手动入口调用
+ * - 软分页补页：首批后仅对「有 after」的 edge 继续拉，直到 after 为空或命中页为空
+ * - 复用现有三层 upsert + structure_sync_status 更新逻辑
+ *
+ * @param {string} accountId - 广告账户 ID（如 act_xxx）
+ * @param {Object} facebookApi - FacebookMarketingAPI 实例，需实现 unifiedStructureBatch()
+ * @param {{ sinceSec?: number, limit?: number, maxSoftPagesPerEdge?: number, markDirtyOnChange?: boolean }} [opts]
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   reason?: string,
+ *   synced_campaigns?: number,
+ *   synced_adsets?: number,
+ *   synced_ads?: number,
+ *   edges?: { campaigns: { after: string|null }, adsets: { after: string|null }, ads: { after: string|null } },
+ *   duration_ms?: number
+ * }>}
+ */
+export async function fastSyncStructureForAccount(accountId, facebookApi, opts = {}) {
+  const startTime = Date.now()
+  let lockConnection = null
+  const lockName = LOCK_PREFIX + accountId
+  const rawMaxSoftPages = Number(opts?.maxSoftPagesPerEdge ?? 20)
+  const MAX_SOFT_PAGES_PER_EDGE = Number.isFinite(rawMaxSoftPages)
+    ? Math.max(1, Math.min(Math.floor(rawMaxSoftPages), 100))
+    : 20
+
+  try {
+    const sinceSecRaw = Number(opts?.sinceSec)
+    const sinceSec = Number.isFinite(sinceSecRaw)
+      ? Math.floor(sinceSecRaw)
+      : Math.floor((Date.now() - 3 * 24 * 60 * 60 * 1000) / 1000)
+    const limitRaw = Number(opts?.limit ?? 500)
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 500)) : 500
+    const markDirtyOnChange = opts?.markDirtyOnChange !== false
+
+    lockConnection = await pool.getConnection()
+    const [lockRows] = await lockConnection.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName])
+    if (lockRows[0]?.acquired !== 1) {
+      lockConnection.release()
+      lockConnection = null
+      return { ok: false, reason: 'lock_busy' }
+    }
+
+    const [statusRows] = await lockConnection.query(
+      `SELECT last_sync_updated_ts FROM structure_sync_status WHERE account_id = ?`,
+      [accountId]
+    )
+    const cursorTs = statusRows[0]?.last_sync_updated_ts != null
+      ? Number(statusRows[0].last_sync_updated_ts)
+      : null
+
+    const batchResult = await facebookApi.unifiedStructureBatch(accountId, { sinceSec, limit })
+    const campaigns = Array.isArray(batchResult?.campaigns?.items) ? [...batchResult.campaigns.items] : []
+    const adsets = Array.isArray(batchResult?.adsets?.items) ? [...batchResult.adsets.items] : []
+    const ads = Array.isArray(batchResult?.ads?.items) ? [...batchResult.ads.items] : []
+    const criticalEdgeErrors = ['adsets', 'ads']
+      .filter(edge => !!batchResult?.[edge]?.error)
+      .map(edge => ({ edge, error: batchResult?.[edge]?.error }))
+    if (criticalEdgeErrors.length > 0) {
+      await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+      lockConnection.release()
+      lockConnection = null
+      logger.warn(`[FastSync-MVP] account=${accountId} 关键edge失败，跳过写库 errors=${JSON.stringify(criticalEdgeErrors)}`)
+      return { ok: false, reason: 'edge_failed', edge_errors: criticalEdgeErrors }
+    }
+
+    const edgeState = {
+      campaigns: { after: batchResult?.campaigns?.after || null, pages: 0 },
+      adsets: { after: batchResult?.adsets?.after || null, pages: 0 },
+      ads: { after: batchResult?.ads?.after || null, pages: 0 }
+    }
+    const filtering = [{ field: 'updated_time', operator: 'GREATER_THAN', value: String(sinceSec) }]
+
+    async function softFetchMore(edge, fields, bucket) {
+      let after = edgeState[edge].after
+      while (after && edgeState[edge].pages < MAX_SOFT_PAGES_PER_EDGE) {
+        const page = await facebookApi.getStructurePage(accountId, edge, {
+          fields,
+          limit,
+          after,
+          filtering
+        })
+        edgeState[edge].pages += 1
+        const items = Array.isArray(page?.items) ? page.items : []
+        if (items.length > 0) bucket.push(...items)
+
+        const nextAfter = page?.paging?.after ?? null
+        edgeState[edge].after = nextAfter
+        after = nextAfter
+
+        if (items.length === 0 && !nextAfter) break
+        if (after) await sleep(PAGE_DELAY_MS)
+      }
+      if (after && edgeState[edge].pages >= MAX_SOFT_PAGES_PER_EDGE) {
+        logger.warn(
+          `[FastSync-MVP] account=${accountId} edge=${edge} 软分页达到上限 ${MAX_SOFT_PAGES_PER_EDGE} 页，提前停止；last_after=${after}`
+        )
+      }
+    }
+
+    if (edgeState.campaigns.after) await softFetchMore('campaigns', CAMPAIGNS_FIELDS, campaigns)
+    if (edgeState.adsets.after) await softFetchMore('adsets', ADSETS_FIELDS, adsets)
+    if (edgeState.ads.after) await softFetchMore('ads', ADS_FIELDS, ads)
+
+    await doStructureCampaignsUpsert(lockConnection, accountId, campaigns)
+    await doStructureAdsetsUpsert(lockConnection, accountId, adsets)
+    await doStructureAdsUpsertAndStatus(lockConnection, accountId, ads, cursorTs, false, sinceSec)
+    const hasChanges = campaigns.length > 0 || adsets.length > 0 || ads.length > 0
+    await lockConnection.execute(
+      `INSERT INTO structure_sync_status
+        (account_id, last_fast_sync_ts, last_fast_filter_since_sec, last_error, updated_at)
+       VALUES
+        (?, NOW(), ?, NULL, NOW())
+       ON DUPLICATE KEY UPDATE
+        last_fast_sync_ts = NOW(),
+        last_fast_filter_since_sec = VALUES(last_fast_filter_since_sec),
+        last_error = NULL,
+        updated_at = NOW()`,
+      [accountId, sinceSec]
+    )
+    if (markDirtyOnChange && hasChanges) {
+      await lockConnection.execute(
+        `UPDATE structure_sync_status
+         SET fast_dirty = 1,
+             fast_dirty_marked_at = NOW(),
+             updated_at = NOW()
+         WHERE account_id = ?`,
+        [accountId]
+      )
+    }
+
+    await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+    lockConnection.release()
+    lockConnection = null
+
+    const durationMs = Date.now() - startTime
+    logger.info(
+      `[FastSync-MVP] account=${accountId} sinceSec=${sinceSec} limit=${limit} ` +
+      `campaigns=${campaigns.length} adsets=${adsets.length} ads=${ads.length} ` +
+      `softPages(c/a/ad)=${edgeState.campaigns.pages}/${edgeState.adsets.pages}/${edgeState.ads.pages} duration_ms=${durationMs}`
+    )
+
+    return {
+      ok: true,
+      synced_campaigns: campaigns.length,
+      synced_adsets: adsets.length,
+      synced_ads: ads.length,
+      dirty_marked: !!(markDirtyOnChange && hasChanges),
+      edges: {
+        campaigns: { after: edgeState.campaigns.after, pages: edgeState.campaigns.pages },
+        adsets: { after: edgeState.adsets.after, pages: edgeState.adsets.pages },
+        ads: { after: edgeState.ads.after, pages: edgeState.ads.pages }
+      },
+      duration_ms: durationMs
+    }
+  } catch (err) {
+    if (lockConnection) {
+      try {
+        await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+      } catch (_) {}
+      lockConnection.release()
+      lockConnection = null
+    }
+    throw err
+  }
+}
+
+/**
+ * 仅拉取 Track2 Fast Sync 数据（不写库），用于“全账户合并后批量 Upsert”。
+ * - 账户级锁保护：防止与手动刷新/其他结构同步并发冲突
+ */
+export async function collectFastSyncDataForAccount(accountId, facebookApi, opts = {}) {
+  let lockConnection = null
+  const lockName = LOCK_PREFIX + accountId
+  const rawMaxSoftPages = Number(opts?.maxSoftPagesPerEdge ?? 20)
+  const maxSoftPages = Number.isFinite(rawMaxSoftPages)
+    ? Math.max(1, Math.min(Math.floor(rawMaxSoftPages), 100))
+    : 20
+  const sinceSecRaw = Number(opts?.sinceSec)
+  const sinceSec = Number.isFinite(sinceSecRaw)
+    ? Math.floor(sinceSecRaw)
+    : Math.floor((Date.now() - 3 * 24 * 60 * 60 * 1000) / 1000)
+  const limitRaw = Number(opts?.limit ?? 500)
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 500)) : 500
+
+  try {
+    lockConnection = await pool.getConnection()
+    const [lockRows] = await lockConnection.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName])
+    if (lockRows[0]?.acquired !== 1) {
+      lockConnection.release()
+      lockConnection = null
+      return { ok: false, reason: 'lock_busy', accountId }
+    }
+
+    const batchResult = await facebookApi.unifiedStructureBatch(accountId, { sinceSec, limit })
+    const campaigns = Array.isArray(batchResult?.campaigns?.items) ? [...batchResult.campaigns.items] : []
+    const adsets = Array.isArray(batchResult?.adsets?.items) ? [...batchResult.adsets.items] : []
+    const ads = Array.isArray(batchResult?.ads?.items) ? [...batchResult.ads.items] : []
+    const criticalEdgeErrors = ['adsets', 'ads']
+      .filter(edge => !!batchResult?.[edge]?.error)
+      .map(edge => ({ edge, error: batchResult?.[edge]?.error }))
+    if (criticalEdgeErrors.length > 0) {
+      await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+      lockConnection.release()
+      lockConnection = null
+      logger.warn(`[FastSync-Collect] account=${accountId} 关键edge失败，返回失败 errors=${JSON.stringify(criticalEdgeErrors)}`)
+      return { ok: false, reason: 'edge_failed', accountId, edge_errors: criticalEdgeErrors }
+    }
+
+    const edgeState = {
+      campaigns: { after: batchResult?.campaigns?.after || null, pages: 0 },
+      adsets: { after: batchResult?.adsets?.after || null, pages: 0 },
+      ads: { after: batchResult?.ads?.after || null, pages: 0 }
+    }
+    const filtering = [{ field: 'updated_time', operator: 'GREATER_THAN', value: String(sinceSec) }]
+
+    async function softFetchMore(edge, fields, bucket) {
+      let after = edgeState[edge].after
+      while (after && edgeState[edge].pages < maxSoftPages) {
+        const page = await facebookApi.getStructurePage(accountId, edge, {
+          fields,
+          limit,
+          after,
+          filtering
+        })
+        edgeState[edge].pages += 1
+        const items = Array.isArray(page?.items) ? page.items : []
+        if (items.length > 0) bucket.push(...items)
+        const nextAfter = page?.paging?.after ?? null
+        edgeState[edge].after = nextAfter
+        after = nextAfter
+        if (items.length === 0 && !nextAfter) break
+        if (after) await sleep(PAGE_DELAY_MS)
+      }
+      if (after && edgeState[edge].pages >= maxSoftPages) {
+        logger.warn(`[FastSync-Collect] account=${accountId} edge=${edge} 软分页达到上限 ${maxSoftPages} 页，提前停止；last_after=${after}`)
+      }
+    }
+
+    if (edgeState.campaigns.after) await softFetchMore('campaigns', CAMPAIGNS_FIELDS, campaigns)
+    if (edgeState.adsets.after) await softFetchMore('adsets', ADSETS_FIELDS, adsets)
+    if (edgeState.ads.after) await softFetchMore('ads', ADS_FIELDS, ads)
+
+    await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName])
+    lockConnection.release()
+    lockConnection = null
+
+    return {
+      ok: true,
+      accountId,
+      sinceSec,
+      campaigns,
+      adsets,
+      ads,
+      edges: edgeState
+    }
+  } catch (err) {
+    if (lockConnection) {
+      try { await lockConnection.query(`SELECT RELEASE_LOCK(?)`, [lockName]) } catch (_) {}
+      lockConnection.release()
+      lockConnection = null
+    }
+    throw err
+  }
+}
+
+function pickNewerByUpdatedTime(existing, incoming) {
+  if (!existing) return incoming
+  const e = normalizeUpdatedTimeToUtcZ(existing.updated_time) || ''
+  const n = normalizeUpdatedTimeToUtcZ(incoming.updated_time) || ''
+  return n >= e ? incoming : existing
+}
+
+/**
+ * Track2 全账户合并 + 去重 + 分块批量 Upsert
+ * @param {Array<{ ok: boolean, accountId: string, sinceSec: number, campaigns: Array, adsets: Array, ads: Array }>} payloads
+ * @param {{ markDirtyOnChange?: boolean, chunkSize?: number }} opts
+ */
+export async function applyMergedFastSyncPayload(payloads, opts = {}) {
+  const list = (Array.isArray(payloads) ? payloads : []).filter(p => p && p.ok && p.accountId)
+  if (list.length === 0) {
+    return { ok: true, accounts: 0, campaigns: 0, adsets: 0, ads: 0, dirtyMarked: 0 }
+  }
+
+  const markDirtyOnChange = opts?.markDirtyOnChange !== false
+  const chunkSizeRaw = Number(opts?.chunkSize ?? 300)
+  const chunkSize = Number.isFinite(chunkSizeRaw) ? Math.max(50, Math.min(Math.floor(chunkSizeRaw), 500)) : 300
+
+  const campaignMap = new Map()
+  const adsetMap = new Map()
+  const adMap = new Map()
+  const perAccountMeta = new Map() // accountId -> { sinceSec, hasChanges, maxUpdatedTs }
+
+  for (const p of list) {
+    const accountId = String(p.accountId)
+    if (!perAccountMeta.has(accountId)) {
+      perAccountMeta.set(accountId, { sinceSec: p.sinceSec, hasChanges: false, maxUpdatedTs: null })
+    } else if (Number.isFinite(Number(p.sinceSec))) {
+      perAccountMeta.get(accountId).sinceSec = Number(p.sinceSec)
+    }
+
+    const campaigns = Array.isArray(p.campaigns) ? p.campaigns : []
+    const adsets = Array.isArray(p.adsets) ? p.adsets : []
+    const ads = Array.isArray(p.ads) ? p.ads : []
+    if (campaigns.length > 0 || adsets.length > 0 || ads.length > 0) perAccountMeta.get(accountId).hasChanges = true
+
+    for (const item of campaigns) {
+      const id = String(item?.id || '')
+      if (!id) continue
+      const key = `${accountId}:${id}`
+      campaignMap.set(key, pickNewerByUpdatedTime(campaignMap.get(key), { ...item, account_id: accountId }))
+    }
+    for (const item of adsets) {
+      const id = String(item?.id || '')
+      if (!id) continue
+      const key = `${accountId}:${id}`
+      adsetMap.set(key, pickNewerByUpdatedTime(adsetMap.get(key), { ...item, account_id: accountId }))
+    }
+    for (const item of ads) {
+      const id = String(item?.id || '')
+      if (!id) continue
+      const key = `${accountId}:${id}`
+      adMap.set(key, pickNewerByUpdatedTime(adMap.get(key), { ...item, account_id: accountId }))
+      const ts = updatedTimeToUnixSec(item.updated_time)
+      if (ts != null) {
+        const old = perAccountMeta.get(accountId).maxUpdatedTs
+        perAccountMeta.get(accountId).maxUpdatedTs = old == null ? ts : Math.max(old, ts)
+      }
+    }
+  }
+
+  const campaignRows = [...campaignMap.values()]
+  const adsetRows = [...adsetMap.values()]
+  const adRows = [...adMap.values()]
+
+  async function upsertCampaigns(rows) {
+    if (rows.length === 0) return
+    const base = `
+      INSERT INTO structure_campaigns
+        (account_id, campaign_id, name, effective_status, status, updated_time, created_time, last_synced_at)
+      VALUES
+    `
+    const update = `
+      ON DUPLICATE KEY UPDATE
+        name = VALUES(name),
+        effective_status = VALUES(effective_status),
+        status = VALUES(status),
+        updated_time = VALUES(updated_time),
+        created_time = VALUES(created_time),
+        last_synced_at = NOW()
+    `
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize)
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
+      const values = []
+      for (const r of chunk) {
+        values.push(
+          r.account_id,
+          r.id,
+          r.name ?? null,
+          r.effective_status ?? null,
+          r.status ?? null,
+          normalizeUpdatedTimeToUtcZ(r.updated_time) ?? null,
+          normalizeUpdatedTimeToUtcZ(r.created_time) ?? r.created_time ?? null
+        )
+      }
+      await pool.execute(base + placeholders + update, values)
+    }
+  }
+
+  async function upsertAdsets(rows) {
+    if (rows.length === 0) return
+    const base = `
+      INSERT INTO structure_adsets
+        (account_id, adset_id, campaign_id, name, effective_status, status, updated_time, created_time, last_synced_at)
+      VALUES
+    `
+    const update = `
+      ON DUPLICATE KEY UPDATE
+        campaign_id = VALUES(campaign_id),
+        name = VALUES(name),
+        effective_status = VALUES(effective_status),
+        status = VALUES(status),
+        updated_time = VALUES(updated_time),
+        created_time = VALUES(created_time),
+        last_synced_at = NOW()
+    `
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize)
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
+      const values = []
+      for (const r of chunk) {
+        values.push(
+          r.account_id,
+          r.id,
+          r.campaign_id ?? null,
+          r.name ?? null,
+          r.effective_status ?? null,
+          r.status ?? null,
+          normalizeUpdatedTimeToUtcZ(r.updated_time) ?? null,
+          normalizeUpdatedTimeToUtcZ(r.created_time) ?? r.created_time ?? null
+        )
+      }
+      await pool.execute(base + placeholders + update, values)
+    }
+  }
+
+  async function upsertAds(rows) {
+    if (rows.length === 0) return
+    const base = `
+      INSERT INTO structure_ads
+        (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, created_time, last_synced_at)
+      VALUES
+    `
+    const update = `
+      ON DUPLICATE KEY UPDATE
+        adset_id = VALUES(adset_id),
+        campaign_id = VALUES(campaign_id),
+        name = VALUES(name),
+        effective_status = VALUES(effective_status),
+        status = VALUES(status),
+        configured_status = VALUES(configured_status),
+        updated_time = VALUES(updated_time),
+        created_time = VALUES(created_time),
+        last_synced_at = NOW()
+    `
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize)
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
+      const values = []
+      for (const r of chunk) {
+        values.push(
+          r.account_id,
+          r.id,
+          r.adset_id ?? null,
+          r.campaign_id ?? null,
+          r.name ?? null,
+          r.effective_status ?? null,
+          r.status ?? null,
+          r.configured_status ?? null,
+          normalizeUpdatedTimeToUtcZ(r.updated_time) ?? null,
+          normalizeUpdatedTimeToUtcZ(r.created_time) ?? r.created_time ?? null
+        )
+      }
+      await pool.execute(base + placeholders + update, values)
+    }
+  }
+
+  await upsertCampaigns(campaignRows)
+  await upsertAdsets(adsetRows)
+  await upsertAds(adRows)
+
+  let dirtyMarked = 0
+  for (const [accountId, meta] of perAccountMeta.entries()) {
+    await pool.execute(
+      `INSERT INTO structure_sync_status
+        (account_id, last_success_at, last_error, updated_at, last_sync_updated_ts, last_filter_since_sec, last_fast_sync_ts, last_fast_filter_since_sec)
+       VALUES
+        (?, NOW(), NULL, NOW(), ?, ?, NOW(), ?)
+       ON DUPLICATE KEY UPDATE
+        last_success_at = NOW(),
+        last_error = NULL,
+        updated_at = NOW(),
+        last_sync_updated_ts = COALESCE(VALUES(last_sync_updated_ts), last_sync_updated_ts),
+        last_filter_since_sec = COALESCE(VALUES(last_filter_since_sec), last_filter_since_sec),
+        last_fast_sync_ts = NOW(),
+        last_fast_filter_since_sec = VALUES(last_fast_filter_since_sec)`,
+      [accountId, meta.maxUpdatedTs, meta.sinceSec ?? null, meta.sinceSec ?? null]
+    )
+    if (markDirtyOnChange && meta.hasChanges) {
+      await pool.execute(
+        `UPDATE structure_sync_status
+         SET fast_dirty = 1,
+             fast_dirty_marked_at = NOW(),
+             updated_at = NOW()
+         WHERE account_id = ?`,
+        [accountId]
+      )
+      dirtyMarked++
+    }
+  }
+
+  return {
+    ok: true,
+    accounts: list.length,
+    campaigns: campaignRows.length,
+    adsets: adsetRows.length,
+    ads: adRows.length,
+    dirtyMarked
+  }
+}
+
+/** 每小时结构轮转（近 3 天）：默认 6 账户，可调 12；并发固定 1；usage 高/熔断时本小时跳过 */
 const HOURLY_FULL_DEFAULT_ACCOUNTS = 6
 const HOURLY_FULL_MAX_ACCOUNTS = 12
+const HOURLY_FULL_DEFAULT_ACCOUNT_CONCURRENCY = 5
 const USAGE_SKIP_THRESHOLD = 85
 
 const ROTATION_GLOBAL_LOCK = 'sync:hourly_rotation'
 
 /**
- * 每小时结构全量轮转（P1，永远让路 P0）。
- * 逐账户调用 syncAccountStructureAds，同步 campaigns+adsets+ads 三层。
- * 防重入：全局 GET_LOCK 保证同一时间仅一轮轮转在跑，避免超时后下一小时定时器重入叠加压力。
+ * 每小时结构轮转（近 3 天）（P1，永远让路 P0）。
+ * 逐账户调用结构同步（默认旧路径 syncAccountStructureAds；可选 unified batch fast path）。
+ * 防重入：全局 GET_LOCK 保证同一时间仅一轮轮转在跑。
  * 优先 has_full_synced=0 或 last_full_count=0；本地 count=0 且 has_full_synced=1 时全量修复。
  * @param {Object} facebookApi
- * @param {{ maxAccounts?: number }} opts - maxAccounts 默认 6，可上调 12
+ * @param {{ maxAccounts?: number, accountConcurrency?: number, useUnifiedBatch?: boolean, unifiedLimit?: number, unifiedMaxSoftPages?: number }} opts
  */
 export async function runHourlyStructureFullRotation(facebookApi, opts = {}) {
   if (getCircuitBreakerStatus().isLocked) {
-    logger.info('[结构轮转] 本小时跳过：Token 熔断')
+    logger.info('[结构轮转-近3天] 本小时跳过：Token 熔断')
     return { skipped: true, reason: 'circuit_breaker', synced: 0 }
   }
   const usage = getLastUsageRate()
   if (usage != null && usage >= USAGE_SKIP_THRESHOLD) {
-    logger.info(`[结构轮转] 本小时跳过：API 使用率 ${usage}% >= ${USAGE_SKIP_THRESHOLD}%`)
+    logger.info(`[结构轮转-近3天] 本小时跳过：API 使用率 ${usage}% >= ${USAGE_SKIP_THRESHOLD}%`)
     return { skipped: true, reason: 'usage_high', synced: 0 }
   }
 
@@ -956,11 +1573,21 @@ export async function runHourlyStructureFullRotation(facebookApi, opts = {}) {
     rotationConn = await pool.getConnection()
     const [lockRows] = await rotationConn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [ROTATION_GLOBAL_LOCK])
     if (lockRows[0]?.acquired !== 1) {
-      logger.info('[结构轮转] 本小时跳过：上一轮仍在执行，防重入')
+      logger.info('[结构轮转-近3天] 本小时跳过：上一轮仍在执行，防重入')
       return { skipped: true, reason: 'rotation_running', synced: 0 }
     }
 
   const maxAccounts = Math.min(HOURLY_FULL_MAX_ACCOUNTS, opts.maxAccounts ?? HOURLY_FULL_DEFAULT_ACCOUNTS)
+  const accountConcurrencyRaw = Number(opts.accountConcurrency ?? HOURLY_FULL_DEFAULT_ACCOUNT_CONCURRENCY)
+  const accountConcurrency = Number.isFinite(accountConcurrencyRaw)
+    ? Math.max(1, Math.min(Math.floor(accountConcurrencyRaw), HOURLY_FULL_DEFAULT_ACCOUNT_CONCURRENCY))
+    : HOURLY_FULL_DEFAULT_ACCOUNT_CONCURRENCY
+  const useUnifiedBatch = opts.useUnifiedBatch === true
+  const unifiedLimitRaw = Number(opts.unifiedLimit ?? 500)
+  const unifiedLimit = Number.isFinite(unifiedLimitRaw) ? Math.max(1, Math.min(Math.floor(unifiedLimitRaw), 500)) : 500
+  const unifiedMaxSoftPagesRaw = Number(opts.unifiedMaxSoftPages ?? 20)
+  const unifiedMaxSoftPages = Number.isFinite(unifiedMaxSoftPagesRaw) ? Math.max(1, Math.min(Math.floor(unifiedMaxSoftPagesRaw), 100)) : 20
+  const threeDaysAgoSec = Math.floor((Date.now() - 3 * 24 * 60 * 60 * 1000) / 1000)
   const [rows] = await pool.query(
     `SELECT am.fb_account_id AS account_id,
             COALESCE(s.has_full_synced, 0) AS has_full_synced,
@@ -973,7 +1600,7 @@ export async function runHourlyStructureFullRotation(facebookApi, opts = {}) {
        (CASE WHEN COALESCE(s.has_full_synced, 0) = 0 OR COALESCE(s.last_full_count, 0) = 0 THEN 0
              WHEN (SELECT COUNT(*) FROM structure_ads a WHERE a.account_id = am.fb_account_id) = 0 AND COALESCE(s.has_full_synced, 0) = 1 THEN 1
              ELSE 2 END),
-       s.last_full_success_at ASC
+       s.last_success_at ASC
      LIMIT ?`,
     [maxAccounts]
   )
@@ -981,25 +1608,36 @@ export async function runHourlyStructureFullRotation(facebookApi, opts = {}) {
   if (toSync.length === 0) {
     return { skipped: false, reason: null, synced: 0 }
   }
-  logger.info(`[结构轮转] 本小时处理 ${toSync.length} 个账户（campaigns+adsets+ads 全量）`)
-  let synced = 0
-  for (const accountId of toSync) {
-    try {
-      const result = await syncAccountStructureAds(accountId, facebookApi)
-      if (result.ok) synced++
-      else if (result.reason === 'cooldown') logger.info(`[结构轮转] account=${accountId} 冷却中跳过`)
-      else if (result.reason === 'lock_busy') logger.info(`[结构轮转] account=${accountId} 锁占用跳过`)
-    } catch (err) {
-      logger.warn(`[结构轮转] account=${accountId} 失败:`, err.message)
-    }
-  }
+  logger.info(`[结构轮转-近3天] 本小时处理 ${toSync.length} 个账户（mode=${useUnifiedBatch ? 'unified_batch' : 'legacy'}, accountConcurrency=${accountConcurrency}）`)
+  const accountLimit = pLimit(accountConcurrency)
+  const results = await Promise.all(toSync.map((accountId) =>
+    accountLimit(async () => {
+      try {
+        const result = useUnifiedBatch
+          ? await fastSyncStructureForAccount(accountId, facebookApi, {
+              sinceSec: threeDaysAgoSec,
+              limit: unifiedLimit,
+              maxSoftPagesPerEdge: unifiedMaxSoftPages,
+              markDirtyOnChange: false
+            })
+          : await syncAccountStructureAds(accountId, facebookApi)
+        if (!result.ok && result.reason === 'cooldown') logger.info(`[结构轮转-近3天] account=${accountId} 冷却中跳过`)
+        else if (!result.ok && result.reason === 'lock_busy') logger.info(`[结构轮转-近3天] account=${accountId} 锁占用跳过`)
+        return { accountId, ok: !!result.ok }
+      } catch (err) {
+        logger.warn(`[结构轮转-近3天] account=${accountId} 失败:`, err.message)
+        return { accountId, ok: false }
+      }
+    })
+  ))
+  const synced = results.filter(r => r.ok).length
   return { skipped: false, reason: null, synced }
   } finally {
     if (rotationConn) {
       try {
         await rotationConn.query(`SELECT RELEASE_LOCK(?)`, [ROTATION_GLOBAL_LOCK])
       } catch (e) {
-        logger.warn('[结构轮转] 释放全局锁失败:', e?.message)
+        logger.warn('[结构轮转-近3天] 释放全局锁失败:', e?.message)
       }
       rotationConn.release()
       rotationConn = null

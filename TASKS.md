@@ -2,9 +2,17 @@
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
 > 
-> **最新更新**：2026-02-14 - ① **多账户规则 target_by_account 优化**：evaluateRule 当 target_by_account 存在且当前 accountId 不在其中时设 targetAdIds=[] 不查全量；getRuleAccountIds/ruleAppliesToAccount 仅对「value 为非空数组」的账户执行，空数组视为不适用；GET /api/structure/objects/multi 响应 meta 增加 per_account_limit、has_more；前端 refreshScopeItems 移除不在 scope 的 targetIds。② **Thunder Client 小白验证**：`docs/Thunder_Client_小白验证步骤.md`（登录→objects/multi 带 token 与 Query→检查 meta）。详见 `项目开发过程/项目总结-2026-02-14-多账户target_by_account优化与ThunderClient验证.md`。下一优先级见 DEV_PLAN。
+> **最新更新（2026-03-07）**：**动态筛选多账户闭环（M3.5 + M4.x）完成并验收通过**：① 修复策略 B（`ERROR_OVERSIZE` 保留旧快照）：动态刷新改为 `NORMAL` 规则按 `rule_id + account_id` 原子替换，`ERROR_*` 仅更新状态不清空快照；② 单条执行路径统一到 Dispatcher（`executeSingleRule` 改走 `loadDataForAccount + evaluateRuleWithCache`），确保 `use_dynamic_scope=1` 时严格按 `rule_matched_objects(rule_id, account_id)` 取目标；③ 前后端打通动态筛选配置：规则页新增动态开关（默认开）、上限、状态展示、手动重算 TriggerC、排除名单 UI 与回显，执行语义对齐 `final = (动态 ∪ 手动) - 排除`；④ 多账户动态刷新闭环：TriggerB 保存后按规则涉及账户逐个防抖刷新，TriggerC 传 `ruleId` 自动刷新该规则全部目标账户并返回 `accountResults` 汇总；⑤ `op/operator` 双字段兼容、`act_xxx:id` 目标按账户隔离解析；⑥ 删除规则联动清理 `rule_matched_objects`，避免孤儿快照；⑦ 新增/扩展自动化测试：`ruleEngineDispatcher.test.js`（快照优先 + act:id 隔离）、`dynamicScopeService.helpers.test.js`（多账户账户解析与目标隔离）、`rules.test.js`（删规则联动清快照）。本窗口验证覆盖 TriggerB/TriggerC 多账户、A 超限 B 正常、执行与快照一致，全部通过。窗口总结见 `项目开发过程/项目总结-2026-03-07-动态筛选多账户闭环与项目收尾.md`。
 >
-> **此前进度（2026-02-13）**：campaign/adset 维度补齐、规则目标解析改造、前端状态筛选、结构索引方案 B；见 `项目开发过程/项目总结-2026-02-13-campaign_adset补齐与规则目标解析及结构统一接口.md`。
+> **此前进度（2026-03-07）**：**Track2 极速结构同步 + 全局 FB 限流 + 脏结构刷新**：① 在 `server/index.js` 实现统一三边 Batch 内核 `unifiedStructureBatch(accountId, { sinceSec, limit })`，一次请求拉取 `campaigns/adsets/ads`，支持 Unix 秒 / ISO8601 双过滤、边级别错误解析与「单 edge 回补 + ISO 回退」；② 在 `structureSyncService.js` 新增 Track2 快速同步链路：`fastSyncStructureForAccount` 与 `collectFastSyncDataForAccount` 负责单账户 Batch + 软分页补页（仅对返回 `after` 的 edge 用 `getStructurePage` 继续拉，页数上限可配置），`applyMergedFastSyncPayload` 将多账户结果合并去重并对 `structure_campaigns/structure_adsets/structure_ads` 做分块批量 upsert（默认 chunk≈300 行），同时按账户标记 `fast_dirty`；③ `structure_sync_status` 通过迁移 032/033 新增 `last_fast_sync_ts`、`last_fast_filter_since_sec`、`fast_dirty/fast_dirty_marked_at/fast_dirty_cleared_at` 列，Track2 成功后推进专用水位并在规则执行前由 `refreshStructureIfDirtyBeforeRules` 做一次「脏结构刷新」；④ `cronService.js` 增加 Track2 Fast Sync 定时任务（默认 `7,27,52 * * * *`，accounts 由白名单控制、并发 `TRACK2_FAST_SYNC_CONCURRENCY`、窗口 `sinceSec = max(last_fast_sync_sec - bufferSec, now - 3d)`，buffer 默认 4 小时，可配；Token 熔断或 `x-business-use-case-usage` 过高时本轮跳过），Track1 结构轮转改为可选复用 unified batch 内核；⑤ 在 FB 客户端 `FacebookMarketingAPI.makeRequest` 上方引入全局请求队列与优先级闸门：并发上限 `FB_GLOBAL_REQUEST_CONCURRENCY`（默认 10）、优先级顺序 `action > today > track2 > cold`、排队超时 `FB_GLOBAL_QUEUE_TIMEOUT_MS`，所有对 Facebook 的请求（包含 Today 同步、Track1/Track2 结构同步、规则动作）统一经过该队列，解决多任务叠加时的配额抢占与「止损规则被饿死」风险。详细过程与日志示例见 `项目开发过程/项目总结-2026-03-07-Track2极速结构同步与全局限流.md`。
+>
+> **此前进度（2026-03-04）**：**时区统一与执行日志显示**：① 数据库连接池统一为 Single Source of Truth（`server/db/drizzle.js` 复用 `connection.js` 的 pool，不再自建 pool）；② `server/db/connection.js` 的 createPool 增加 `timezone: '+00:00'`，与 `SET time_zone = '+00:00'` 配合，保证 mysql2 读写 Date 均为 UTC；③ 执行日志 API 用 `toUTCISO()` 统一返回 `triggered_at`/`created_at` 为带 Z 的 ISO 字符串，前端 `parseUTC` 对无 Z 字符串补 Z 后按 UTC 转北京展示；④ 冷却 debug 日志增加 `lastAtUtc` + `lastAtBj`；⑤ 文档 `docs/0时区转换解决方案.md` 已补充「已落地规范」与 SQL 查询说明（北京会话下勿对 `triggered_at` 再做 CONVERT_TZ）。验收：执行日志前端时间与本地北京时间一致；SQL（北京会话）`SELECT triggered_at` 与前端一致。历史数据未迁移。本窗口总结见 `项目开发过程/项目总结-2026-03-04-时区统一与执行日志及连接池.md`。下一窗口可继续 Step 4 体验与完整性、4.2 IM 机器人。
+>
+> **此前进度（2026-03-02）**：ROAS 规则判断一律用本地计算；ruleDataService 单日 ROAS 仅用 purchase_value/spend；验证 SQL 与执行结果已通过。本窗口总结见 `项目开发过程/项目总结-2026-03-02-ROAS本地计算与验证及窗口总结.md`。
+>
+> **此前进度（2026-02-28）**：监控范围条件「创建时间段」已落地并验证；结构同步近 3 天改造、定时 5,35,55 每次 5 账户、刷新列表仅单选；执行频率与执行时间方案七阶段已完成。
+>
+> **此前进度（2026-02-27）**：§2.5.3 采纳项已落地并验收通过；结构镜像三张表新增 created_time（迁移 029）；本窗口总结见 `项目开发过程/项目总结-2026-02-27-采纳项落地验收与教学及下一步.md`。
 
 **推荐开发顺序（按依赖与验收最短路径）**：Step 0 数据口径（today spend>0 + status=effective_status）→ Step 1 pause_ad 真闭环（3.3+3.7，Pre-Flight 本地 status、非 Dry Run 真实 POST、already-state 容错）→ Step 2 审计可复盘（4.1 最小字段）→ Step 3 Piggyback 补齐 structure_ads（1.2，失败不影响主链路）→ Step 4 体验与完整性（结构增量/定时同步、选择器优化等）。先保证数据可信，再保证能真关广告，再保证日志可解释，最后优化选择与同步体验。
 
@@ -58,9 +66,11 @@
   **验收口径**：选择器列表加载/搜索/翻页**不应穿透调用 FB**，FB 只在「同步结构」时调用。**落地顺序**：先 2.4（手动同步）→ 再 2.2（选择器查库）。
 - [x] **结构镜像表 structure_ads**：已建表并验收（迁移 `014_create_structure_ads.sql`，含 uk_account_ad、idx_account_effective_status、idx_account_name）。验收：同账户下按 name/ad_id/effective_status 查询可走索引。
 - [x] **结构镜像表 structure_campaigns / structure_adsets**：已由迁移 023/024 实现；listStructureCampaignsFromDb、listStructureAdsetsFromDb 及 GET /api/structure/:level 三层查库已落地。
-- [x] **元数据同步（定时）**：**由「每小时结构全量轮转」承接**，不再单独起 30–60min 定时任务（避免双全量并行、配额被抽干）。当前仅 ads 层级；campaigns/adsets 待后续按需添加时再纳入轮转。验收：跑完一次全量轮转后，本地 structure_ads 能覆盖 FB 后台同账户广告集合；日志有拉取/写入数量与耗时。（2026-02-05 已落地，Cron 5 * * * *）
+- [x] **结构镜像表收集创建时间 created_time**：三张表（structure_ads、structure_adsets、structure_campaigns）新增字段 `created_time`（VARCHAR(80)，存 FB 返回的 ISO8601）；迁移 `029_add_created_time_to_structure_tables.sql`。全量结构同步、Piggyback、伪增量及 Today 同步的 STRUCTURE_FIELDS/ADS_FIELDS/CAMPAIGNS_FIELDS/ADSETS_FIELDS 均含 `created_time`，写入时落库。**已用于监控范围条件「创建时间段」**：列表接口支持 scope_created_within_hours 过滤，前端 RuleManager 可选「近 24/48/72 小时」或自定义小时（见 2.5.3 创建时间段项）。（2026-02-28 创建时间段已落地）
+- [x] **结构同步近 3 天改造（2026-02-28）**：按 `docs/0结构同步任务改造—执行方案.md`：getStructurePage 映射增加 created_time；syncAccountStructureAds 对 campaigns/adsets/ads 只拉 updated_time >= since（since = 当前时间减 3 天），filtering value 优先 Unix 秒、单 edge 报错自动回退 ISO8601；doStructureAdsUpsertAndStatus 传 isFullRun: false；structure_sync_status 增加 last_filter_since_sec（迁移 030）；轮转命名/日志统一「近3天」。验收见 `docs/结构同步近3天_测试与验证指南.md`。
+- [x] **元数据同步（定时）**：**由「结构轮转（近 3 天）」承接**，不再单独起 30–60min 定时任务（避免双全量并行、配额被抽干）。campaigns/adsets/ads 均只拉 updated_time >= 3 天前；定时为每 20 分钟 :05/:35/:55（Cron: 5,35,55 * * * *），每次最多 5 账户。验收：跑完一轮后 structure_* 有近 3 天数据，created_time/updated_time 落库；日志为「结构轮转-近3天」。（2026-02-28 已落地）
 - [x] **新对象补全（跟随 today spend 同步）**：当 today insights 发现新 ad_id 时，补齐该广告元数据并 upsert 到 `structure_ads`（并尽量补齐关联 adset/campaign）。验收：新建广告一旦开始花费后，在选择器里能被 q 搜到（不依赖 FB 实时接口）。（由 Piggyback 承接，已落地）
-- [x] **手动刷新（强制同步结构）**：新增「强制同步该账户结构」的后端入口，供 UI「刷新列表」按钮调用。约束：带账户级锁 + 冷却期（例如 2 分钟，避免狂点）。验收：FB 新建/改名对象，点一次刷新后可在选择器里搜到。**落地方案**：`docs/顺序2_2.4_手动同步结构_落地方案.md`（先做 2.4 再做 2.2）。**定位**：手动刷新仍是最高优先级兜底（锁+冷却），但它是「重型全量/分页」路径；日常新鲜度主要靠**伪增量 + 低频轮转全量**。（后端 POST /api/sync/structure + 前端「刷新列表」均已接，2026-02-07）
+- [x] **手动刷新（强制同步结构）**：新增「强制同步该账户结构」的后端入口，供 UI「刷新列表」按钮调用。约束：带账户级锁 + 冷却期（例如 2 分钟，避免狂点）。验收：FB 新建/改名对象，点一次刷新后可在选择器里搜到。**落地方案**：`docs/顺序2_2.4_手动同步结构_落地方案.md`（先做 2.4 再做 2.2）。**定位**：手动刷新仍是最高优先级兜底（锁+冷却），但它是「重型全量/分页」路径；日常新鲜度主要靠**伪增量 + 低频轮转全量**。（后端 POST /api/sync/structure + 前端「刷新列表」均已接，2026-02-07）**前端（2026-02-28）**：「刷新列表」仅在选择**一个**广告账户时可点击；多选时按钮禁用并提示「仅在选择一个广告账户时可刷新列表」。
 
 - **结构同步增量化（顺序2 优化）**
   - **前提铁证**：`/act_xxx/ads` 的 filtering(updated_time > sinceISO) 在现网**不可靠**（SQL 已证伪），**禁止**再把它作为增量同步主策略或依赖其节省调用/减少返回集合。
@@ -71,7 +81,7 @@
   - **伪增量算法（写死可执行口径）**：
     - **输入**：主心跳产出的 **activeAdIds**（本轮 Insights spend>0，已由 Piggyback 在本轮完成补齐，伪增量不再处理）。
     - **状态差异检测集合 diffIds**：recentActiveIds − activeAdIds。**recentActiveIds 取数口径（写死）**：`SELECT ad_id FROM structure_ads WHERE account_id=? AND effective_status='ACTIVE' AND last_synced_at >= UTC_TIMESTAMP() - INTERVAL 24 HOUR`（时间窗口可选用 6h/12h/24h，项目选一写死）。**每账户每轮差异上限**：**maxDiffIds=200**（超过上限按 **last_synced_at 最新优先** 取前 200），保证差异检测不退化成全表轮询。
-    - **调用**：**仅对 diffIds** 调用 **resolveObjectsByIds**（fields: id, name, effective_status, status, configured_status, updated_time），只 upsert 这批 id 到 structure_ads；若 diffIds 为空则本轮伪增量不调 FB。
+    - **调用**：**仅对 diffIds** 调用 **resolveObjectsByIds**（fields: id, name, effective_status, status, configured_status, updated_time, created_time），只 upsert 这批 id 到 structure_ads；若 diffIds 为空则本轮伪增量不调 FB。
     - **游标（可选）**：structure_sync_status.last_sync_updated_ts 可记录本轮返回的 max(updated_time)，**不再作为 FB filtering 的依赖**。
   - 全量保底（方案 C）：见 1.2.1「每小时结构全量轮转」；结构全量并发**固定 1**，P0 抢占，usage 高时本小时跳过。
   - 限流与并发：手动刷新每账户 2 分钟冷却（已有）；结构全量见 1.2.1。
@@ -89,7 +99,7 @@
 ### 1.2.1 结构镜像（structure_ads）与选择器数据源（顺序2）
 
 - [x] **后端（P1 伪增量）**：每 15 分钟统一心跳之后（或心跳后置阶段），对每个账户只对 **diffIds** 做 resolveObjectsByIds 按需补全（activeAdIds 由 Piggyback 承担，同一轮只调一次）；不依赖 FB updated_time filtering。验收见上文「结构同步增量化」。（2026-02-05 已落地并验证，含 1h 降频+旋转、NULL 自愈）
-- [x] **后端（P1 每小时结构全量轮转）**：每小时结构全量轮转：**默认 6 个账户**；允许**动态上调到 12**（条件建议写死：API 使用率低 + P0 不繁忙；降级条件：usage 高/退避/429 → 本小时少跑或不跑）。**结构全量并发固定 1**。**轮转优先级（写死）**：has_full_synced=0 或 has_full_synced=1 且 last_full_count=0（未铺表）的账户必须优先处理；本地 count=0 且 has_full_synced=1 时本次直接全量修复并重置 last_full_count。**本条承接「元数据同步（定时）」**，不再另起 30–60min 全量任务。（2026-02-05 已落地，Cron 5 * * * *）
+- [x] **后端（P1 每小时结构全量轮转）**：结构轮转（近 3 天）：**每 20 分钟** :05/:35/:55（Cron: 5,35,55 * * * *），**每次最多 5 个账户**；允许**动态上调到 12**（opts.maxAccounts）。**结构全量并发固定 1**。**轮转优先级（写死）**：has_full_synced=0 或 has_full_synced=1 且 last_full_count=0（未铺表）的账户必须优先处理；本地 count=0 且 has_full_synced=1 时本次直接全量修复并重置 last_full_count。同步策略为「近 3 天」：campaigns/adsets/ads 只拉 updated_time >= since（since = 当前时间减 3 天），filtering value 优先 Unix 秒，单 edge 报错回退 ISO。**本条承接「元数据同步（定时）」**。（2026-02-28 已改为近 3 天 + 5,35,55 + 5 账户）
 - [x] **后端（P1 强制让路）**：结构全量必须为 P1 后台任务：**永远让路 P0**（主心跳/归档/回补）；撞上就跳过或延后，不抢资源。定时结构同步必须挂在统一心跳的「后置阶段」（等本轮账户热同步全部结束后再尝试），不与热同步并行。**usage 高时本小时直接跳过结构任务**。验收：先完成热同步（及规则触发），再开始结构同步；usage 高时结构全量本小时不跑。
 - [x] **后端（P2 兜底）**：保留手动刷新结构（已有账户锁+冷却+分页）作为最高优先级兜底；P1 定时结构同步不可影响 P2 手动触发。验收：在 P1 正在运行或预算已满时，手动刷新仍可用（或明确返回「锁忙+retry_after」），运营能理解并重试。（2.4 冷却已改为 structure_sync_status.last_success_at，不被 Piggyback 误伤）
 - **实现策略与验收口径**：structure_sync_status + 伪增量（Insights + 本地差异 + resolveObjectsByIds）+ 每小时全量轮转（默认 6、可上调 12、并发 1）+ 退避（x-business-use-case-usage 紧张时优先保主心跳，结构全量立即降级/停跑）；验收见「结构同步增量化」。
@@ -237,8 +247,7 @@
   - **effective_status vs status 口径**：选择器默认过滤**基于 effective_status**（更接近是否可投放/可操作）。结构镜像表里明确：**用于过滤的字段**与**用于展示的字段**，避免写了 status 但过滤用 effective_status 造成混乱。
   - **首次全量回填与可观测**：结构镜像表上线后必须有「首次全量同步」路径（否则 DB 空、选择器无数据）。实现时确保：系统启动后第一次同步能跑完；日志或健康接口能看见每账户 **last_synced_at + 数量 + 耗时 + 失败原因**。
 
-- [ ] 前端：在规则管理页面（例如 `src/views/RuleManager.vue`）中，增加级联选择控件（账户 -> 广告系列 -> 广告组 -> 广告），最终填充 `target_ids`。
-- [x] 前端：在规则编辑界面中，支持配置多个条件（metric/operator/value/time_window），并选择逻辑运算符（AND/OR）。验收示例：能配置 `spend > 1.5 AND link_clicks = 0` 并触发执行；能配置 `link_clicks > 0 AND cpc > 0.8` 并触发执行。（2026-02-12 文档同步：2.3.1 阶段 2～3 已实现 whenLines 线性列表、AND/OR 下拉、添加/删除条件）
+- [x] 前端：在规则编辑界面中，支持配置多个条件（metric/operator/value/time_window），并选择逻辑运算符（AND/OR）。验收示例：能配置 `spend > 1.5 AND link_clicks = 0` 并触发执行；能配置 `link_clicks > 0 AND cpc > 0.8` 并触发执行。（2026-02-12 文档同步：2.3.1 阶段 2～3 已实现 whenLines 线性列表、AND/OR 下拉、添加/删除条件）验收示例：能配置 `spend > 1.5 AND link_clicks = 0` 并触发执行；能配置 `link_clicks > 0 AND cpc > 0.8` 并触发执行。（2026-02-12 文档同步：2.3.1 阶段 2～3 已实现 whenLines 线性列表、AND/OR 下拉、添加/删除条件）
 - [x] 前端：增加预设 JSON 模板（止损、扩量、空耗）快捷按钮，点击后自动填充典型规则组合。（2026-02-07 已改为 v2 输出）
 - [x] **3 个规则模板（stop_loss/scale_up/zero_click）**：已改为 v2 结构输出；① **止损（stop_loss）**：`spend > 20 AND roas < 0.5` (today) → pause_ad；② **扩量（scale_up）**：`roas > 2` (last_3_days) → increase_budget；③ **空耗（zero_click）**：`spend > 0.5 AND link_clicks = 0` (today) → pause_ad。验收：点模板后进入 JSON 模式，conditions 为 `{ version: 2, groups: [...] }`，保存后为 v2 规则。（2026-02-07）
 - [x] **前端口径提示/防呆**：当用户选择 cpc/ucpc/cpa/roas 等比值指标且未同时配置对应分母条件（如 link_clicks > 0 / purchases > 0 / spend > 0）时，给出提示：「当点击为 0 时 CPC 为空，建议加条件 link_clicks > 0，或改用空耗模板（spend > X AND link_clicks = 0）」。验收：创建仅 `cpc > 0.8` 时 UI 会提示并推荐模板；可不强制阻断保存（或按产品决定是否阻断）。（2026-02-12：RuleManager 增加 ratioMetricTip 计算属性，条件区显示蓝色提示框 + 改用空耗模板按钮）
@@ -246,7 +255,7 @@
 - **比值类指标 + 模板 实现对齐自检（落地时必守）**
   - **字段名对齐**：规则条件里的 metric 与后端给 RuleEngine 的数据字段**完全一致**（如 `link_clicks` / `unique_link_clicks` / `purchases` / `spend` / `cpc` / `ucpc` / `roas` / `cpa`）。重点检查 **link_clicks** 全链路同名，禁止 `inline_link_clicks`、`clicks`、`linkClicks` 混用。
   - **比较器语义对齐**：规则引擎对 **null/undefined** 的比较结果恒为 **false**（gt/gte/lt/lte/eq 全 false），且**不把 null 当 0**；确认没有任何地方做「spend 兜底成 cpc」等伪造比值逻辑。
-  - [x] **ROAS 0 vs null 口径（方案 A，2026-02-11）**：ruleDataService 读侧统一「计算优先→API兜底→零兜底」；spend>0 且 value=0 时 roas=0.0；聚合 aggregateMultiDayMetrics 使用总分子/总分母；parseActions 保守防双算、extractPurchaseValue 白名单扩展；Warn 限流（每 syncSessionId 1 条）。
+  - [x] **ROAS 统一口径（方案 A，2026-03-02 定稿）**：规则判断**一律用本地计算**。单日：`ruleDataService.calculateSingleDayMetrics` 仅用 `purchase_value/spend`（spend=0→null，有花费无转化→0），**不再使用** DB/Facebook 的 roas 字段兜底；多日：`aggregateMultiDayMetrics` 已为总分子/总分母，与单日一致。parseActions 保守防双算、extractPurchaseValue 白名单扩展；Warn 限流（每 syncSessionId 1 条）。
   - **模板可验收性**：用**同一条广告**分别验证两条规则，证明「坏 vs 空」拆分落地：① **空耗**：`spend > 1.5 AND link_clicks = 0` 能触发 pause；② **贵点击**：`link_clicks > 0 AND cpc > 0.8` 能触发 pause。
 
 - [x] 前端：在显著位置增加免责提示文案，提醒用户在 FB 后台手动开启被系统关闭的广告前，应先在本系统暂停相关规则。（RuleManager 顶部已有 disclaimer-banner）
@@ -288,9 +297,68 @@
 - [x] **前端 refreshScopeItems**：在「仅启用」且列表加载完成后，从 `ruleForm.targetIds` 中移除不在当前 `scopeItems` 的 id，避免保留已关闭广告（RuleManager.vue）。
 - [x] **验证文档**：`docs/Thunder_Client_小白验证步骤.md`（登录拿 token → GET objects/multi 带 Query 与 Authorization → 检查 meta.per_account_limit、meta.has_more）；可选验证空数组账户不执行（改 DB 后看后端日志）。
 
----
+### 2.5.3 多账户 multi 优化与监控范围完善（2026-02-24 规划）
 
-## 3. 动作执行层（M4）
+> 依据：`docs/采纳清单与具体修改说明.md`。防恢复守护不采纳；Smart Mute 保持现状，说明见 `docs/多账户与Mute与防恢复守护_说明.md`。  
+> **2026-02-26**：五项已落地并验收通过，见 `docs/采纳项验证与测试指南.md`。  
+> **相关文档**：`docs/采纳项落地_知识点与教学说明.md`（概念与实现要点）、`docs/采纳项代码核对与修改优化计划.md`（核对与修改清单）、`docs/下一步与可选完善.md`（下一阶段与可选优化）。
+
+- [x] **multi 接口 account_ids 上限 + 管理员放宽**：在 `GET /api/structure/objects/multi` 得到 allowedIds 后校验 `allowedIds.length <= maxAccounts`（非管理员 20、管理员 50），超限返回 400、code: TOO_MANY_ACCOUNTS。
+- [x] **multi 首轮 p-limit(4)**：首轮无 after 时用 p-limit(4) 并发调用 listStructureObjectsFromDb，按 index 顺序合并 perAccountAfter 与 allItems；依赖 `p-limit`（package.json 若无则添加）。
+- [x] **名称类条件大表优化**：原则+索引确认+文档；在 structureSyncService 三个 list 方法 WHERE 构建处增加注释（先 account_id + effective_status，再 name 条件）；文档已注明名称包含/不包含大表较贵（见 `docs/监控范围条件_后端SQL过滤与优先展示方案.md`）。
+- [x] **状态不等于（scope_status_exclude）**：后端 structureSyncService 三个 list 方法支持 `opts.scope_status_exclude`（逗号分隔），在 statusList 计算后过滤排除状态；listStructureObjectsFromDb 与单账户/multi 路由透传 `scope_status_exclude`；前端 RuleManager 新增 scopeStatusExcludeFilter，applyScopeConditions 根据状态行 operator 为 equals/not_equals 分别设置 scopeStatusFilter 与 scopeStatusExcludeFilter，列表请求带 scope_status_exclude。
+- [x] **监控范围条件「创建时间段」**：按 `docs/0监控范围条件[创建时间段]—执行方案.md`：后端 structureSyncService 三 list + listStructureObjectsFromDb 支持 scope_created_within_hours（created_time >= 当前时间 − N 小时）；index.js 结构列表路由透传；前端 facebookApi getStructureObjects/getStructureObjectsMulti 传参；RuleManager 字段下拉增加「创建时间段」、操作符固定「包含」、值列 24/48/72 + 自定义 1–720 小时、校验与 applyScopeConditions/refreshScopeItems/loadMoreScopeItems 带参、多行取 min 小时。文档 `docs/监控范围条件_后端SQL过滤与优先展示方案.md` 已更新。验收：单账户/多账户、名称+创建时间段组合、SQL 核对通过。（2026-02-28 已落地）
+- [x] **验收**：按采纳清单文档「五、验收要点」执行（上限 400、p-limit 首屏变快、状态不等于列表与 SQL 一致、名称类注释与文档）。
+
+### 2.5.4 动态筛选多账户闭环（2026-03-07 完成）
+
+> 目标：在“多选广告账户 + 手动筛选 + 动态筛选”场景下，确保刷新、快照、执行三层都按账户隔离且语义一致，最终口径固定为 `finalAdIds = (dynamicMatched ∪ manualTarget) - excludeIds`。
+
+- [x] **策略 B 修复（oversize 保留旧快照）**：`dynamicScopeService` 从“按账户全删重建”改为“仅 `NORMAL` 规则按 `rule_id + account_id` 原子替换”；`ERROR_OVERSIZE/ERROR_FILTER_INVALID/ERROR_REFRESH_FAILED` 仅更新规则状态，不清快照。
+- [x] **执行口径统一**：`executeSingleRule` 改走 Dispatcher（`loadDataForAccount + evaluateRuleWithCache`），与定时调度同口径读取 `rule_matched_objects(rule_id, account_id)`。
+- [x] **前端闭环（RuleManager）**：新增动态筛选开关（默认开启）、动态上限、状态展示、TriggerC 手动重算按钮、排除名单配置与回显；规则卡片补充排除摘要并去掉技术型错误原文，保留运营可理解状态标签。
+- [x] **多账户动态刷新闭环**：
+  - TriggerB：规则保存后按规则涉及账户逐个防抖刷新；
+  - TriggerC：传 `ruleId` 时自动解析并刷新该规则全部目标账户，返回 `accountResults` 汇总；
+  - TriggerA：保持账户级入口不变（兼容既有调度路径）。
+- [x] **多账户隔离修复**：动态计算手工目标支持 `targetIds` 的 `act_xxx:id` 解析，确保只使用当前账户目标，避免跨账户串值。
+- [x] **删规则联动清快照**：删除规则时事务内同步删除 `rule_matched_objects`，避免孤儿数据。
+- [x] **观测性增强**：动态刷新日志新增 `trigger` 与结构化汇总字段：`processed/normal/inserted/oversize/invalid/refresh_failed/duration_ms`。
+- [x] **自动化测试补齐**：
+  - `server/tests/ruleEngineDispatcher.test.js`：新增“快照优先覆盖 targetIds”与“act:id 账户隔离”用例；
+  - `server/tests/dynamicScopeService.helpers.test.js`：新增规则目标账户解析与 scoped targetIds 解析用例；
+  - `server/tests/rules.test.js`：新增“删除规则联动清快照”断言。
+- [x] **手工验收结果（本窗口）**：
+  - 场景 A：TriggerB 在多账户规则保存后，两个账户各出现一条防抖刷新日志；
+  - 场景 B：TriggerC 仅传 `ruleId` 返回多账户 `accountResults` 汇总；
+  - 场景 C：A 超限、B 正常时，账户级结果互不污染，规则级汇总状态为 `ERROR_OVERSIZE`；
+  - 场景 D：执行与快照一致，单条执行不跨账户串目标。
+
+### 2.6 执行频率与执行时间（适配方案）（2026-02-28 完成）
+
+> 依据：`docs/执行频率与执行时间 — 适配方案（执行频率语义 + 移除 Smart Mute）.md`。规则执行由「每分钟 Cron」统一驱动，不再由数据同步心跳顺带触发；广告级冷却、允许执行时间段、单条执行保留，「立即运行所有规则」已移除。
+
+- [x] **阶段一：迁移与 Schema**：rules 表新增 `execution_interval_minutes`（INT NULL DEFAULT 15）、`execution_time_windows`（JSON）；新建表 `rule_ad_execution_state`（rule_id, ad_id, last_executed_at, last_status）；迁移 027、028；schema.js 已同步。**后续**：迁移 031 将冷却表主键改为 (rule_id, scope_key)，见 §2.6.1。
+- [x] **阶段二：心跳中移除规则触发**：unifiedHeartbeatSync 内移除 setImmediate 调用 executeRulesForAccount；规则执行仅由每分钟 Cron 驱动。
+- [x] **阶段三：Cron 与 executeRulesForAccount 改造**：fromScheduler=true 时读写 rule_ad_execution_state、按 execution_interval_minutes 做广告级冷却；单条执行（executeSingleRule）不参与冷却表。
+- [x] **阶段四：执行时间段与摘要**：isInExecutionWindow（北京时间）校验；不在时间段内记 skip_reason=outside_execution_window、更新冷却表避免重复触发。
+- [x] **阶段五：移除 Smart Mute 执行路径**：actionExecutorService 内移除 mute_until 跳过逻辑；保留 mute_until/mute_reason 字段与 clear-ad-mute.js 脚本用于历史排查；smartMute.test.js 改为历史逻辑与格式兼容测试。
+- [x] **阶段六：移除 execute-all**：删除 POST /rules/execute-all 路由；删除前端 executeAllRulesOffline；废弃接口 POST /api/execute-rules 文案改为「单条请用 POST /api/rules/:id/execute」；测试脚本文案更新。
+- [x] **阶段七：API 与前端**：规则创建/更新/查询支持 execution_interval_minutes、execution_time_windows；前端编辑表单「5. 执行频率与执行时间」、列表卡片展示「执行频率」「执行时间」短文案；单条「运行此规则」保留。
+- [x] **前端修复（保存后回显）**：RuleManager.vue 的 normalizeRule 补全 executionIntervalMinutes、executionTimeWindows，避免保存后再编辑恢复默认值。
+- **API 约定**：规则更新使用 **PUT /api/rules/:id**，可只传需改字段（如执行间隔、执行时间段）；**不支持 PATCH 更新规则体**，PATCH 仅用于 `/api/rules/:id/toggle`。
+
+### 2.6.1 预算冷却与 Pre-Flight 重构（scope_key + cooldownKey + 双写）（2026-03-02 前窗口完成）
+
+> 依据：`.cursor/plans/budget-cooldown-and-prefight-refactor_e251157f.plan.md`。目标：统一冷却键抽象、预算「当前=目标」时 Pre-Flight 跳过、预算按目标节点冷却，且**执行频率（execution_interval_minutes）对预算动作真正生效**（避免冷却期内每分钟仍进执行层）。
+
+- [x] **数据层（迁移 031）**：`rule_ad_execution_state` 新增 `scope_key`（VARCHAR(100) NOT NULL），主键从 `(rule_id, ad_id)` 改为 `(rule_id, scope_key)`；历史回填 `scope_key = CONCAT('ad:', ad_id)`；保留 `ad_id` 列作诊断（非 ad: 行可写空串）；Drizzle schema 已同步。
+- [x] **冷却状态服务**：新增 `server/services/ruleExecutionStateService.js`，提供 `loadRuleAdExecutionState(ruleId, scopeKeys)`、`isCooldownDue(ruleId, scopeKey, intervalMin)`、`upsertRuleAdExecutionStateBatch(entries)`；cronService 与执行层复用。
+- [x] **执行层 cooldownKey**：`actionExecutorService.executeActionsForAd` 对 pause_ad/activate_ad 设 `cooldownKey = "ad:" + adId`；对预算 ABO 设 `cooldownKey = "budget_adset:" + adsetId`、CBO 设 `cooldownKey = "budget_campaign:" + campaignId`；在返回的 results 中携带 `cooldownKey` 供调度层写冷却表。
+- [x] **预算 Pre-Flight（当前=目标跳过）**：在 ABO/CBO 分支中，若非 Dry Run 且 `currentCents === newBudgetCents`，记 status=skipped、不调 FB API、仍写审计日志；所有 skipped（含 Pre-Flight、FB already in state）在冷却上按 success 占冷却。
+- [x] **调度层双写（关键）**：`cronService.executeRulesForAccount` 在 fromScheduler 时，用执行层返回的 cooldownKey 写入一条 `(ruleId, scopeKey, lastStatus)`；**若 cooldownKey ≠ "ad:"+adId**，再额外写入一条 `(ruleId, "ad:"+adId, lastStatus)`。**修改前**：预算动作只写 `budget_campaign:`/`budget_adset:`，调度层过滤用的是 `scopeKey = "ad:"+adId`，查不到最近执行时间，导致冷却期内每分钟仍把该规则+广告送进执行。**修改后**：同时写入 ad: 冷却，下一轮 Cron 广告级过滤能正确挡住，15 分钟内不再重复执行。
+- [x] **验收**：同一规则预算执行后，`SELECT rule_id, scope_key, ad_id, last_status, last_executed_at FROM rule_ad_execution_state` 可见该 rule_id 下既有 `budget_campaign:`/`budget_adset:` 也有 `ad:` 两条；15 分钟内 Cron 不再对该规则+该广告重复执行（日志不再每分钟出现 GET 预算/Pre-Flight）。
+- [ ] **可选/待办**：单元测试与集成场景（Pre-Flight、scopeKey 冷却、多规则互不干扰）；执行层预算分支内 `isCooldownDue(ruleId, cooldownKey, intervalMin)` 精细冷却（决定单条手动执行是否也遵守冷却，可单独讨论）。
 
 > **落地顺序**：步骤 1+6 → 步骤 2 → 步骤 3 → 步骤 4 → 步骤 5。**硬口径**：run_id 采用加列（automation_logs 增加 run_id 列）；冷却采用评估即冷却。Pre-Flight **不新增**对每个广告额外 GET FB，仅用本地快照 status + FB 返回的 already-in-that-state 容错。完整说明见 `docs/M4_动作执行层落地步骤.md`；**仅按本清单执行即可完成 M4 全部落地**。
 
@@ -328,13 +396,11 @@
 - [x] 后端：`ruleDataService.queryAdSnapshots` 已选 status；`RuleEngine.evaluateRule` 构建 matchedAd 时把 `adData.status` 写入 matchedAd（若当前未带则补上）。
 - [x] 验收：按 `docs/M4_3.3_PreFlight_验收步骤.md` 执行（场景一：本地 status=PAUSED 则 skipped、无 pauseAd）。本机 2026-02-11 通过。
 
-### 3.4 步骤 4：Smart Mute 数据链路（已实现并验收，2026-02-10）
+### 3.4 步骤 4：Smart Mute 数据链路（已实现，2026-02-28 执行路径已移除）
 
 - [x] 后端：`ruleDataService.queryAdSnapshots` 已选 `mute_until`, `mute_reason`；RuleEngine 构建 matchedAd 时已写入。
-- [x] 后端：`actionExecutorService.executeActionsForAd` 入口统一检查 mute，单条规则与 cron 路径均跳过；cronService 仲裁循环内也先过滤 mute 并写 ruleToMuted。
-- [x] 后端：单条规则执行路径（executeActionsForRule + executeSingleRule）在全部因 mute 跳过时写入摘要 skip_reason=muted、skip_details 含 ad_ids/mute_until/mute_reason。
-- [x] 摘要约定：skip_reason 支持 `muted`；skip_details 含 `{ mute_until, mute_reason, ad_ids }`。
-- [x] 验收：设 mute_until 后触发规则，该 ad 无新 automation_logs；摘要有 skip_reason=muted；日志有「🔇 广告 xxx 处于 mute 期，跳过」。（本机 2026-02-10 验收通过）
+- [x] **2026-02-28 变更**：Smart Mute **执行路径已移除**（actionExecutorService 不再根据 mute_until 跳过执行）；**保留** mute_until/mute_reason 字段与 clear-ad-mute.js 脚本用于历史排查与只读展示；摘要层仍兼容 skip_reason=muted。详见 `docs/执行频率与执行时间 — 适配方案（执行频率语义 + 移除 Smart Mute）.md` 与 `docs/阶段五与阶段六_知识点与教学说明.md`。
+- [x] 此前：actionExecutorService 入口检查 mute、cronService 仲裁循环过滤 mute 并写 ruleToMuted；单条规则全部因 mute 跳过时写 skip_reason=muted。（本机 2026-02-10 验收通过）
 
 ### 3.5 步骤 5：预算单位统一为「分」（已实现并验收，2026-02-10）
 
@@ -359,6 +425,36 @@
 - [x] 后端：cronService、actionPriority 纳入 set_budget（优先级 5）。
 - [x] 前端：RuleManager.vue、AdminTemplates.vue 动作下拉增加「设置预算为固定值」；选择 set_budget 时单位固定 $、无 percent/usd 切换。
 - [x] 验收：`npm test -- --run server/tests/budgetUnitCents.test.js` 含 set_budget 用例通过；规则/模板新建 set_budget、保存、执行日志显示「设置为 $30」。
+
+### 3.5.3 预算动作护栏与前端精简（2026-03-04 完成）
+
+- [x] 后端：在 `server/utils/templateValidator.js` 中为预算动作新增上下限字段口径：
+  - `increase_budget` 仅允许 `max_daily_budget`（单位分，整数，`>=100`），禁止 `min_daily_budget`。
+  - `decrease_budget` 仅允许 `min_daily_budget`（单位分，整数，`>=100`），禁止 `max_daily_budget`。
+  - `set_budget` 禁止配置上下限字段；同一动作同时配置 max/min 直接视为无效配置。
+  - 小于 100 分或非整数的上下限一律校验失败，前端给出明确错误提示。
+- [x] 后端：完善 `server/services/actionExecutorService.js` 中 `computeNewBudgetCentsOnce` 预算语义：
+  - `increase_budget`：若 `current > max_daily_budget`，本轮保持不动；否则按步长增量并以 `max_daily_budget` 封顶。
+  - `decrease_budget`：若 `current <= min_daily_budget`，本轮保持不动；否则按步长减量并以 `min_daily_budget` 托底（同时不低于 `MIN_BUDGET_CENTS=100`）。
+  - `set_budget`：仅上调不下调——当 `current >= target` 时保持不动，否则设置为目标值（应用全局最小预算与可选上限）。
+- [x] 后端执行层：`executeActionsForAd` 预算 Pre-Flight 跳过原因细分：
+  - `increase_budget` 在「当前 > 上限」场景下返回 `skip_reason=above_max_cap`。
+  - `decrease_budget` 在「当前 <= 下限」场景下返回 `skip_reason=below_min_floor`。
+  - 其它 `currentCents === newBudgetCents` 场景统一返回 `skip_reason=budget_already_at_target`。
+  - 审计日志中的 `errorMessage`、`apiRequest/apiResponse` 带上上述 reason，便于排查。
+- [x] 测试：补充预算护栏与 Pre-Flight 单元测试：
+  - `server/tests/budgetUnitCents.test.js` 新增「超上限不动」「下限托底/下限以下不动」「set_budget 仅上调不下调」等用例。
+  - `server/tests/templateValidator.test.js` 新增上下限组合与边界值校验用例。
+  - 新增 `server/tests/budgetPreFlightReason.test.js`，验证 `above_max_cap` / `below_min_floor` / `budget_already_at_target` 三类跳过原因。
+- [x] 前端：RuleManager.vue 动作编辑 UI 精简与字段归一：
+  - `increase_budget` 仅显示「预算上限（美元，可选）」；`decrease_budget` 仅显示「预算下限（美元，可选）」；`set_budget` 不显示上下限输入。
+  - 新增 `onMinBudgetInput`，负责「下限（美元）→ 分」转换；`onActionTypeChange` 在动作切换时清理无关字段（increase 清 min、decrease 清 max、set_budget 清上下限）。
+  - `saveRule` 前端校验：上限/下限必须为整数分且 `>=100` 分；`actionsPayload` 仅对 increase 透传 `max_daily_budget`、对 decrease 透传 `min_daily_budget`，set_budget 不再透传上下限字段。
+- [x] 前端：AdminTemplates.vue 同步口径改造（不改动模板文案与业务内容）：
+  - 动作编辑区与 RuleManager 保持一致的显示与字段行为（increase 显示上限、decrease 显示下限、set 不显示上下限）。
+  - 模板编辑仅对预算护栏字段做「按动作类型归一 + 无效值清理」，不修改用户自定义模板的文案与条件逻辑。
+
+- [x] 运行时验证与 bug 修复：实盘 set_budget 规则在「当前预算 10 美元、目标固定值 7 美元」场景下发现预算仍被下调到 7 美元，排查确认根因是 cron 预计算 `resolveNewBudgetCentsForAction` 在 set_budget 分支固定以 `current=0` 调用 `computeNewBudgetCentsOnce` 得到 `_resolvedBudgetCents=target`，执行层 ABO 分支直接沿用该值，未能触发「只上调不下调」语义和 `current===new` 的 Pre-Flight skipped。已在执行层 ABO 路径对 set_budget 特殊处理：总是基于实时 `currentCents` 重新计算 newBudgetCents，从而当 `current>=target` 时返回 current、记为 `budget_already_at_target` 并跳过 FB API 调用，同时仍按成功占用冷却。
 
 ### 3.6 实现时注意（做的时候别漏）
 
@@ -424,6 +520,13 @@
   - [x] 使用 Luxon 统一将后端返回的 UTC 时间转换为北京时区（UTC+8 / Asia/Shanghai）
   - [x] 更新 `Logs.vue` 和 `SystemStatus.vue` 使用统一时区工具
   - [x] 确保无论用户浏览器在哪个时区，前端都显示一致的北京时区
+- [x] **时区统一（执行日志 + 冷却 + 连接池）（2026-03-04 完成）**
+  - [x] **Single Source of Truth**：`server/db/drizzle.js` 不再自建 pool，改为 `import pool from './connection.js'`，Drizzle 与所有 raw SQL 共用同一连接池，读写均在 UTC 会话下执行。
+  - [x] **connection.js**：createPool 增加 `timezone: '+00:00'`，与已有 `SET time_zone = '+00:00'` 配合，保证 mysql2 对 Date 的编解码按 UTC，避免执行日志写入/读取出现 8 小时偏差。
+  - [x] **执行日志 API**：`server/routes/system.js` 列表与详情接口用 `toUTCISO(triggered_at)`/`toUTCISO(created_at)` 统一返回带 Z 的 UTC ISO 字符串；前端 `parseUTC` 对无 Z 字符串补 Z 后按 UTC 解析再转北京展示。
+  - [x] **冷却 debug 日志**：`ruleExecutionStateService.isCooldownDue` 的 debug 日志同时输出 `lastAtUtc`（ISO 带 Z）和 `lastAtBj`（北京时间），便于与本地时间对照。
+  - [x] **文档**：`docs/0时区转换解决方案.md` 已补充「已落地规范」「你遇到的两种情况说明」及 SQL 查询说明（北京会话下 `triggered_at` 已是北京时区，勿再 CONVERT_TZ）。
+  - [x] **验收**：执行日志前端显示时间与本地北京时间一致；SQL（北京会话）`SELECT triggered_at` 与前端一致；历史数据未迁移（可选后续做）。
 
 ### 4.1.2 展示层权限修复与优化（2026-01-28 完成）
 

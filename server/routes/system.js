@@ -8,6 +8,19 @@ import { getCircuitBreakerStatus } from '../services/rateLimitService.js'
 
 const router = Router()
 
+/**
+ * 将 DB 返回的 triggered_at/created_at 统一转为「带 Z 的 UTC ISO 字符串」供前端按 UTC 解析后转北京展示。
+ */
+function toUTCISO(val) {
+  if (val == null) return val
+  if (val instanceof Date) return val.toISOString()
+  const s = String(val).trim()
+  if (!s) return val
+  if (s.endsWith('Z')) return s
+  const normalized = s.includes('T') ? s : s.replace(' ', 'T')
+  return normalized.includes('.') ? `${normalized}Z` : `${normalized}.000Z`
+}
+
 // ===========================
 // 审计日志端点
 // ===========================
@@ -210,9 +223,11 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     `
     const [rows] = await pool.execute(dataSql, params)
     
-    // 解析 JSON 字段
+    // 解析 JSON 字段；triggered_at/created_at 统一为 UTC ISO（带 Z），前端按 UTC 转北京展示
     const logs = rows.map(row => ({
       ...row,
+      triggered_at: toUTCISO(row.triggered_at),
+      created_at: toUTCISO(row.created_at),
       metrics_snapshot: typeof row.metrics_snapshot === 'string' 
         ? JSON.parse(row.metrics_snapshot || '{}') 
         : (row.metrics_snapshot || {}),
@@ -289,6 +304,8 @@ router.get('/automation-logs/:id', requireAuth, requireActive, async (req, res) 
     const row = rows[0]
     const log = {
       ...row,
+      triggered_at: toUTCISO(row.triggered_at),
+      created_at: toUTCISO(row.created_at),
       metrics_snapshot: typeof row.metrics_snapshot === 'string'
         ? JSON.parse(row.metrics_snapshot || '{}')
         : (row.metrics_snapshot || {}),

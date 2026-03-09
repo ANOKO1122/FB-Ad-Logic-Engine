@@ -22,14 +22,18 @@ class FacebookMarketingService {
     return resp.data.accounts || []
   }
 
-  async getStructureObjects(level, accountId, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+  async getStructureObjects(level, accountId, { q = '', limit = 50, after = null, include_paused = false, scope_status = null, scope_status_exclude = null, name_exclude = null, scope_created_within_hours = null } = {}) {
     const resp = await apiClient.get(`/structure/${level}`, {
       params: {
         account_id: accountId,
         q: q || undefined,
         limit,
         after: after || undefined,
-        include_paused: include_paused ? 1 : undefined
+        include_paused: include_paused ? 1 : undefined,
+        scope_status: scope_status || undefined,
+        scope_status_exclude: scope_status_exclude || undefined,
+        name_exclude: name_exclude || undefined,
+        scope_created_within_hours: scope_created_within_hours != null && Number.isFinite(scope_created_within_hours) && scope_created_within_hours > 0 ? scope_created_within_hours : undefined
       }
     })
     return resp.data || { items: [], paging: null }
@@ -38,7 +42,7 @@ class FacebookMarketingService {
   /**
    * 统一结构列表（方案 B）：请求 /api/structure/objects，type=campaign|adset|ad，返回统一字段 id/type/name/campaign_id/adset_id/effective_status/account_id
    */
-  async getStructureObjectsUnified(type, accountId, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+  async getStructureObjectsUnified(type, accountId, { q = '', limit = 50, after = null, include_paused = false, scope_status = null, scope_status_exclude = null, name_exclude = null, scope_created_within_hours = null } = {}) {
     const resp = await apiClient.get('/structure/objects', {
       params: {
         account_id: accountId,
@@ -46,7 +50,11 @@ class FacebookMarketingService {
         q: q || undefined,
         limit,
         after: after || undefined,
-        include_paused: include_paused ? 1 : undefined
+        include_paused: include_paused ? 1 : undefined,
+        scope_status: scope_status || undefined,
+        scope_status_exclude: scope_status_exclude || undefined,
+        name_exclude: name_exclude || undefined,
+        scope_created_within_hours: scope_created_within_hours != null && Number.isFinite(scope_created_within_hours) && scope_created_within_hours > 0 ? scope_created_within_hours : undefined
       }
     })
     return resp.data || { items: [], paging: {} }
@@ -56,10 +64,10 @@ class FacebookMarketingService {
    * 多账户结构列表（规则页多选账户）：请求 /api/structure/objects/multi，合并多个账户的对象列表
    * @param {string} type - campaign | adset | ad
    * @param {string[]} accountIds - 账户 ID 数组（有权限的）
-   * @param {Object} opts - q, limit, after, include_paused
+   * @param {Object} opts - q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours
    * @returns {Promise<{ items, paging, meta }>} 每条 item 含 account_id
    */
-  async getStructureObjectsMulti(type, accountIds, { q = '', limit = 50, after = null, include_paused = false } = {}) {
+  async getStructureObjectsMulti(type, accountIds, { q = '', limit = 50, after = null, include_paused = false, scope_status = null, scope_status_exclude = null, name_exclude = null, scope_created_within_hours = null } = {}) {
     if (!Array.isArray(accountIds) || accountIds.length === 0) {
       return { items: [], paging: {}, meta: {} }
     }
@@ -70,7 +78,11 @@ class FacebookMarketingService {
         q: q || undefined,
         limit,
         after: after || undefined,
-        include_paused: include_paused ? 1 : undefined
+        include_paused: include_paused ? 1 : undefined,
+        scope_status: scope_status || undefined,
+        scope_status_exclude: scope_status_exclude || undefined,
+        name_exclude: name_exclude || undefined,
+        scope_created_within_hours: scope_created_within_hours != null && Number.isFinite(scope_created_within_hours) && scope_created_within_hours > 0 ? scope_created_within_hours : undefined
       }
     })
     return resp.data || { items: [], paging: {}, meta: {} }
@@ -143,21 +155,20 @@ class FacebookMarketingService {
   }
 
   /**
-   * 执行所有规则（离线查询模式）
-   * 从数据库查询数据，不调用 Facebook API，避免触发频率限制
-   */
-  async executeAllRulesOffline() {
-    const resp = await apiClient.post('/rules/execute-all')
-    return resp.data || {}
-  }
-
-  /**
    * 单条规则手动执行（仅执行这一条规则）
    * @param {number} ruleId - 规则 ID
    * @returns {Promise<{ success, message, rule_id, account_id, matched_count, executed_count, failed_count, status, run_id }>}
    */
   async executeRuleById(ruleId) {
     const resp = await apiClient.post(`/rules/${ruleId}/execute`)
+    return resp.data || {}
+  }
+
+  async refreshDynamicScopeByAccount({ accountId, ruleId } = {}) {
+    const payload = {}
+    if (accountId) payload.accountId = accountId
+    if (ruleId != null) payload.ruleId = ruleId
+    const resp = await apiClient.post('/rules/dynamic-scope/refresh-account', payload)
     return resp.data || {}
   }
 }

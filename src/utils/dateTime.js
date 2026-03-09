@@ -11,13 +11,20 @@ export const DISPLAY_TIMEZONE = 'Asia/Shanghai'
 /**
  * 解析后端返回的 UTC 时间字符串
  * 支持 ISO 格式（2026-01-23T08:00:02.000Z）和 MySQL datetime 格式（2026-01-23 08:00:02）
+ * 无 Z 的字符串一律按 UTC 解析，避免被误当本地时间导致少 8 小时
  */
 export function parseUTC(dateStr) {
   if (!dateStr) return null
-  if (dateStr.includes('T') || dateStr.includes('Z')) {
-    return DateTime.fromISO(dateStr, { zone: 'utc' })
+  let s = String(dateStr).trim()
+  if (!s) return null
+  if (!s.endsWith('Z') && !s.includes('Z')) {
+    const t = s.includes('T') ? s : s.replace(' ', 'T')
+    s = t.includes('.') ? `${t}Z` : `${t}.000Z`
   }
-  return DateTime.fromSQL(dateStr, { zone: 'utc' })
+  if (s.includes('T') || s.includes('Z')) {
+    return DateTime.fromISO(s, { zone: 'utc' })
+  }
+  return DateTime.fromSQL(s, { zone: 'utc' })
 }
 
 /**

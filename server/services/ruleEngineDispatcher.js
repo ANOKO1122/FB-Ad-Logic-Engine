@@ -15,6 +15,7 @@ import { queryRuleData, getAccountTimezone } from './ruleDataService.js'
 async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = null) {
   const ruleTargetLevel = rule.targetLevel || rule.target_level
   const targetByAccount = rule.targetByAccount ?? rule.target_by_account
+  const useDynamicScope = Boolean(rule.useDynamicScope ?? rule.use_dynamic_scope)
   let ruleTargetIds = []
   let explicitEmptyForAccount = false
   if (targetByAccount && typeof targetByAccount === 'object' && accountId in targetByAccount) {
@@ -32,6 +33,25 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
   }
   let targetAdIds = []
   let queryCount = 0
+
+  if (useDynamicScope) {
+    try {
+      const [rows] = await pool.execute(
+        `SELECT object_id
+         FROM rule_matched_objects
+         WHERE account_id = ?
+           AND rule_id = ?
+           AND object_type = 'ad'`,
+        [accountId, rule.id]
+      )
+      targetAdIds = rows.map(row => String(row.object_id || '')).filter(Boolean)
+      queryCount = 1
+      return { targetAdIds, queryCount }
+    } catch (err) {
+      // 动态快照读失败时降级到旧逻辑，避免阻塞规则执行
+      logger.warn(`   [Dispatcher] 规则 ${rule.id} 读取动态快照失败，回退旧逻辑:`, err.message)
+    }
+  }
 
   if (ruleTargetLevel && ruleTargetIds.length > 0) {
     if (ruleTargetLevel === 'ad') {

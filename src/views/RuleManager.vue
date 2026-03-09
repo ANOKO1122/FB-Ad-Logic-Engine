@@ -16,9 +16,6 @@
         <button class="btn" @click="openCreateRule">
           <span class="icon">+</span> 新建规则
         </button>
-        <button class="btn secondary" @click="runRulesNow" :disabled="running">
-          {{ running ? '执行中...' : '立即运行所有规则' }}
-        </button>
       </div>
     </div>
 
@@ -56,6 +53,18 @@
             <span class="label">📊 账户:</span>
             <span class="account-id">{{ r.accountId }}</span>
           </div>
+          <div class="section dynamic-meta">
+            <span class="label">动态筛选：</span>
+            <span class="pill" :class="r.useDynamicScope ? 'dynamic-on' : 'dynamic-off'">
+              {{ r.useDynamicScope ? '已开启' : '已关闭' }}
+            </span>
+            <span v-if="r.useDynamicScope" class="pill" :class="dynamicStatusClass(r.dynamicScopeStatus)">
+              {{ dynamicStatusLabel(r.dynamicScopeStatus) }}
+            </span>
+          </div>
+          <div v-if="r.excludeSummaryText" class="hint">
+            {{ r.excludeSummaryText }}
+          </div>
           <div class="section">
             <span class="label">IF (当满足以下条件时):</span>
             <div class="conditions-list">
@@ -78,9 +87,16 @@
               </div>
             </div>
           </div>
+          <div class="section execution-meta">
+            <span class="label">执行频率：</span><span class="muted">{{ formatIntervalDisplay(r.executionIntervalMinutes ?? 15) }}</span>
+            <span class="label">执行时间：</span><span class="muted">{{ formatExecutionTimeDisplay(r.executionTimeWindows) }}</span>
+          </div>
         </div>
 
         <div class="card-footer">
+          <button class="btn-text" @click="refreshDynamicScopeForRule(r)" :disabled="refreshingRuleId === r.id || !r.id">
+            {{ refreshingRuleId === r.id ? '重算中...' : '重算动态范围' }}
+          </button>
           <button class="btn-text" @click="runThisRule(r)" :disabled="runningRuleId === r.id">
             {{ runningRuleId === r.id ? '执行中...' : '运行此规则' }}
           </button>
@@ -141,7 +157,7 @@
                 <button class="btn secondary" @click="clearAllAccounts" :disabled="!selectedAccountIds.length">
                   清空账户
                 </button>
-                <button class="btn secondary" @click="refreshScopeItemsWithSync" :disabled="!selectedAccountIds.length || scopeLoading">
+                <button class="btn secondary" @click="refreshScopeItemsWithSync" :disabled="selectedAccountIds.length !== 1 || scopeLoading" title="仅在选择一个广告账户时可刷新列表（触发该账户结构同步）">
                   {{ scopeLoading ? '加载中...' : '刷新列表' }}
                 </button>
               </div>
@@ -163,6 +179,126 @@
                 </label>
               </div>
             </div>
+
+            <div class="form-group">
+              <label>动态筛选</label>
+              <div class="form-row dynamic-scope-row">
+                <div class="switch-wrapper">
+                  <label class="switch">
+                    <input type="checkbox" v-model="ruleForm.useDynamicScope">
+                    <span class="slider round"></span>
+                  </label>
+                  <span class="switch-label">{{ ruleForm.useDynamicScope ? '开启（按监控范围自动更新目标）' : '关闭（仅使用手动勾选目标）' }}</span>
+                </div>
+                <div class="dynamic-max-wrap" v-if="ruleForm.useDynamicScope">
+                  <label>动态匹配上限</label>
+                  <input
+                    v-model.number="ruleForm.maxDynamicMatches"
+                    type="number"
+                    min="1"
+                    max="5000"
+                    class="input-number"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- 监控范围条件（可选）：按条件自动勾选下方列表中的对象 -->
+            <div class="form-group scope-condition-block">
+              <label>监控范围条件（可选）</label>
+              <div class="hint scope-condition-hint">根据下方条件自动勾选匹配的对象；不填则需手动勾选。</div>
+              <div class="conditions-container scope-condition-rows">
+                <div
+                  v-for="(row, idx) in scopeConditionRows"
+                  :key="row.id"
+                  class="condition-row scope-condition-row"
+                >
+                  <span v-if="idx > 0" class="join-label">AND</span>
+                  <span v-else class="join-placeholder"></span>
+                  <select v-model="row.field" class="select scope-field-select" @change="onScopeConditionFieldChange(row)">
+                    <option value="name">名称</option>
+                    <option value="status">状态</option>
+                    <option value="created_within">创建时间段</option>
+                  </select>
+                  <select v-model="row.operator" class="select scope-operator-select" :disabled="row.field === 'created_within'">
+                    <template v-if="row.field === 'name'">
+                      <option value="include">包含</option>
+                      <option value="exclude">不包含</option>
+                    </template>
+                    <template v-else-if="row.field === 'created_within'">
+                      <option value="include">包含</option>
+                    </template>
+                    <template v-else>
+                      <option value="equals">等于</option>
+                      <option value="not_equals">不等于</option>
+                    </template>
+                  </select>
+                  <template v-if="row.field === 'name'">
+                    <input
+                      v-model.trim="row.value"
+                      type="text"
+                      class="input-text scope-value-input"
+                      placeholder="请输入名称 (例: 优化师_项目)"
+                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                    />
+                  </template>
+                  <template v-else-if="row.field === 'created_within'">
+                    <select
+                      v-model="row.value"
+                      class="select scope-value-select"
+                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                    >
+                      <option value="">请选择</option>
+                      <option value="24">近 24 小时内</option>
+                      <option value="48">近 48 小时内</option>
+                      <option value="72">近 72 小时内</option>
+                      <option value="custom">自定义小时内</option>
+                    </select>
+                    <input
+                      v-if="row.value === 'custom'"
+                      v-model.number="row.customHours"
+                      type="number"
+                      min="1"
+                      max="720"
+                      class="input-text scope-value-input scope-custom-hours"
+                      placeholder="请输入小时数 (1–720)"
+                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                    />
+                  </template>
+                  <template v-else>
+                    <select
+                      v-model="row.value"
+                      class="select scope-value-select"
+                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                    >
+                      <option value="">请选择</option>
+                      <option value="active_only">所有投放中</option>
+                      <option value="paused_only">所有已暂停</option>
+                      <option value="active_and_paused">所有投放中和已暂停</option>
+                    </select>
+                  </template>
+                  <button
+                    v-if="scopeConditionRows.length > 1"
+                    type="button"
+                    class="btn-icon danger"
+                    title="删除"
+                    @click="removeScopeConditionRow(idx)"
+                  >×</button>
+                  <div v-if="scopeConditionRowError(row)" class="scope-row-error">{{ scopeConditionRowError(row) }}</div>
+                </div>
+                <a
+                  v-if="scopeConditionRows.length < SCOPE_CONDITION_MAX_ROWS"
+                  href="javascript:void(0)"
+                  class="link-add-scope"
+                  @click.prevent="addScopeConditionRow"
+                >添加监控范围 ({{ scopeConditionRows.length }}/{{ SCOPE_CONDITION_MAX_ROWS }})</a>
+                <span v-else class="hint">已达 {{ SCOPE_CONDITION_MAX_ROWS }} 条上限</span>
+                <div v-if="scopeApplyMessage" class="scope-apply-row">
+                  <span class="scope-apply-message">{{ scopeApplyMessage }}</span>
+                </div>
+              </div>
+            </div>
+
             <div class="form-group">
               <label>选择目标对象（可多选）</label>
               <div class="scope-filters">
@@ -171,13 +307,6 @@
                   class="input-text"
                   placeholder="搜索名称或ID"
                 />
-                <label class="scope-status-filter">
-                  <span class="scope-status-label">状态</span>
-                  <select v-model="scopeIncludePaused" class="select scope-status-select" @change="onScopeStatusChange">
-                    <option :value="false">仅启用</option>
-                    <option :value="true">包含暂停</option>
-                  </select>
-                </label>
               </div>
               <div v-if="!selectedAccountIds.length" class="empty-hint">请先选择至少一个广告账户</div>
               <div v-else class="scope-list">
@@ -206,17 +335,42 @@
                 <div v-if="scopeLoading" class="loading">正在加载列表...</div>
                 <div v-else-if="!filteredScopeItems.length" class="empty-hint">暂无可选对象</div>
                 <div v-else class="scope-items">
-                  <label v-for="item in filteredScopeItems" :key="scopeItemKey(item)" class="scope-item">
+                  <label v-for="item in filteredScopeItems" :key="scopeItemKey(item)" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
                     <input type="checkbox" :value="scopeItemValue(item)" v-model="ruleForm.targetIds">
                     <span class="name">{{ item.name || '-' }}</span>
                     <span class="id">{{ item.id }}</span>
                     <span v-if="selectedAccountIds.length > 1" class="account-badge">{{ item.account_id || '' }}</span>
                   </label>
                 </div>
-                <div v-if="scopePagingAfter && selectedAccountIds.length <= 1" class="scope-more">
+                <div v-if="scopePagingAfter" class="scope-more">
                   <button class="btn-tiny" @click="loadMoreScopeItems" :disabled="scopeLoading">
                     {{ scopeLoading ? '加载中...' : '加载更多' }}
                   </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>排除名单（可选）</label>
+              <div class="hint">命中的对象会从最终作用范围中剔除（公式：最终 = 动态 ∪ 手动 - 排除）</div>
+              <div v-if="!selectedAccountIds.length" class="empty-hint">请先选择至少一个广告账户并加载列表</div>
+              <div v-else class="scope-list">
+                <div class="scope-actions">
+                  <span>已排除 {{ ruleForm.excludeTargetIds.length }} 个</span>
+                  <div class="scope-buttons">
+                    <button class="btn-tiny" @click="selectAllExcludeScope" :disabled="!canSelectAll">全选</button>
+                    <button class="btn-tiny" @click="clearExcludeScopeSelection" :disabled="!ruleForm.excludeTargetIds.length">清空</button>
+                  </div>
+                </div>
+                <div v-if="scopeLoading" class="loading">正在加载列表...</div>
+                <div v-else-if="!filteredScopeItems.length" class="empty-hint">暂无可选对象</div>
+                <div v-else class="scope-items">
+                  <label v-for="item in filteredScopeItems" :key="`exclude-${scopeItemKey(item)}`" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
+                    <input type="checkbox" :value="scopeItemValue(item)" v-model="ruleForm.excludeTargetIds">
+                    <span class="name">{{ item.name || '-' }}</span>
+                    <span class="id">{{ item.id }}</span>
+                    <span v-if="selectedAccountIds.length > 1" class="account-badge">{{ item.account_id || '' }}</span>
+                  </label>
                 </div>
               </div>
             </div>
@@ -374,21 +528,69 @@
                 />
                 <span class="action-unit">{{ a.type === 'set_budget' || (a.value_unit || 'percent') === 'usd' ? '$' : '%' }}</span>
                 <span class="action-hint">{{ a.type === 'set_budget' ? '（设置为固定美元）' : ((a.value_unit || 'percent') === 'usd' ? '（按美元增减）' : '（按百分比增减）') }}</span>
-                <label class="budget-cap-label">预算上限（美元，可选）</label>
-                <input
-                  type="number"
-                  :value="a.max_daily_budget != null ? (a.max_daily_budget / 100) : ''"
-                  @input="onMaxBudgetInput($event, a)"
-                  class="input-number budget-cap-input"
-                  placeholder="不填则不限制"
-                  min="1"
-                  step="0.01"
-                />
+                <template v-if="a.type === 'increase_budget'">
+                  <label class="budget-cap-label">预算上限（美元，可选）</label>
+                  <input
+                    type="number"
+                    :value="a.max_daily_budget != null ? (a.max_daily_budget / 100) : ''"
+                    @input="onMaxBudgetInput($event, a)"
+                    class="input-number budget-cap-input"
+                    placeholder="不填则不限制"
+                    min="1"
+                    step="0.01"
+                  />
+                </template>
+                <template v-else-if="a.type === 'decrease_budget'">
+                  <label class="budget-cap-label">预算下限（美元，可选）</label>
+                  <input
+                    type="number"
+                    :value="a.min_daily_budget != null ? (a.min_daily_budget / 100) : ''"
+                    @input="onMinBudgetInput($event, a)"
+                    class="input-number budget-cap-input"
+                    placeholder="不填则不限制"
+                    min="1"
+                    step="0.01"
+                  />
+                </template>
               </template>
               <span v-else class="placeholder">-</span>
               <button class="btn-icon danger" @click="ruleForm.actions.splice(idx, 1)">×</button>
             </div>
             <button class="btn-add" @click="addAction">+ 添加操作</button>
+          </div>
+
+          <!-- 区块5：执行频率与执行时间（文档：执行频率与执行时间 — 适配方案） -->
+          <div class="section-block">
+            <h4 class="section-title">5. 执行频率与执行时间</h4>
+            <p class="muted">每个广告触发本规则后，至少间隔以下时间才会再次触发；执行时间未指定则全天允许。</p>
+            <div class="form-row">
+              <label class="label">执行频率（每广告）</label>
+              <select v-model="ruleForm.executionIntervalPreset" class="select">
+                <option v-for="p in INTERVAL_PRESETS" :key="p.value" :value="p.value">{{ p.label }}</option>
+              </select>
+              <input
+                v-if="ruleForm.executionIntervalPreset === 'custom'"
+                type="number"
+                v-model.number="ruleForm.executionIntervalHoursCustom"
+                class="input-number"
+                placeholder="小时数"
+                min="0.1"
+                max="720"
+                step="0.5"
+              />
+              <span v-if="ruleForm.executionIntervalPreset === 'custom'" class="muted">小时</span>
+            </div>
+            <div class="form-row">
+              <label class="label">允许执行时间（北京时间）</label>
+              <label><input type="radio" :value="true" v-model="executionTimeAllDay"> 全天</label>
+              <label><input type="radio" :value="false" v-model="executionTimeAllDay"> 指定时间段</label>
+            </div>
+            <div v-if="!executionTimeAllDay" class="form-row">
+              <label class="label">时间段</label>
+              <input type="time" v-model="executionTimeStart" class="input-text" step="1" /> —
+              <input type="time" v-model="executionTimeEnd" class="input-text" step="1" />
+              <span class="muted">（可只填一个时段，暂不支持跨日）</span>
+            </div>
           </div>
         </div>
 
@@ -422,6 +624,7 @@ export default {
     const editingRuleId = ref(null)
     const running = ref(false)
     const runningRuleId = ref(null)
+    const refreshingRuleId = ref(null)
     
     const levelOptions = [
       { label: '广告 (Ad)', value: 'ad' },
@@ -435,11 +638,32 @@ export default {
       isSimulation: false,
       targetLevel: 'ad',
       targetIds: [],
+      excludeTargetIds: [],
       logicOperator: 'AND',
       timezoneName: 'UTC',
       conditions: [],
-      actions: []
+      actions: [],
+      executionIntervalMinutes: 15,
+      executionIntervalPreset: '15m',
+      executionIntervalHoursCustom: null,
+      executionTimeWindows: [],
+      useDynamicScope: true,
+      maxDynamicMatches: 1000
     })
+
+    const INTERVAL_PRESETS = [
+      { value: '15m', label: '15 分钟', minutes: 15 },
+      { value: '30m', label: '30 分钟', minutes: 30 },
+      { value: '60m', label: '1 小时', minutes: 60 },
+      { value: '180m', label: '3 小时', minutes: 180 },
+      { value: '360m', label: '6 小时', minutes: 360 },
+      { value: 'custom', label: '自定义（小时）', minutes: null }
+    ]
+    const mapMinutesToPreset = (minutes) => {
+      const m = Number(minutes)
+      const found = INTERVAL_PRESETS.find(p => p.minutes === m)
+      return found ? found.value : 'custom'
+    }
 
     // 表单数据
     const ruleForm = ref(createEmptyRule())
@@ -450,12 +674,35 @@ export default {
     const accountToAdd = ref('') // 用于「添加账户」下拉，选完后加入 selectedAccountIds 并清空
     const scopeItems = ref([])
     const scopeSearch = ref('')
-    const scopeIncludePaused = ref(false)  // 状态筛选：false=仅启用，true=包含暂停
+    const scopeIncludePaused = ref(true)  // 固定为 true：默认显示开启+暂停，不再提供状态下拉
     const scopeLoading = ref(false)
     const scopeReady = ref(false)
     const scopeRequestId = ref(0)
     const scopePagingAfter = ref(null)
     const resolvedSelectedMap = ref(new Map()) // id -> {id,name,...}
+    // 监控范围条件（作用对象区）：名称/状态 多行 AND，用于按条件勾选下方列表
+    const SCOPE_CONDITION_MAX_ROWS = 3
+    const createDefaultScopeConditionRow = () => ({
+      id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      field: 'name',
+      operator: 'include',
+      value: '',
+      customHours: null  // 创建时间段选「自定义」时的小时数（1–720）
+    })
+    const scopeConditionRows = ref([createDefaultScopeConditionRow()])
+    const scopeApplyMessage = ref('') // 应用条件后的提示，如「已勾选 N 个对象」
+    const isApplyingScopeConditions = ref(false) // 为 true 时 watch(scopeSearch) 不触发
+    /** 执行时间（北京时间）：全天 vs 指定时段，与 ruleForm.executionTimeWindows 双向同步 */
+    const executionTimeAllDay = ref(true)
+    const executionTimeStart = ref('09:00')
+    const executionTimeEnd = ref('18:00')
+    /** 监控范围条件对应的 API 过滤：后端 SQL 只返回匹配项 */
+    const scopeStatusFilter = ref('')   // '' | active_only | paused_only | active_and_paused
+    const scopeStatusExcludeFilter = ref('') // 状态「不等于」时传：ACTIVE | PAUSED | ACTIVE,PAUSED
+    const scopeNameExclude = ref('')   // 名称不包含关键词
+    const scopeCreatedWithinHours = ref(null) // 创建时间段：近 N 小时内（数字或 null），传给后端 scope_created_within_hours
+    /** 结构列表每页条数上限（首屏与加载更多共用） */
+    const SCOPE_PAGE_LIMIT = 500
     // 2.3.1 方案B：线性条件列表状态（全局时间窗口 + whenLines）
     const whenLines = ref([])            // [{ join, metric, operator, value }]，首行 join=null
     const whenTimeWindow = ref('today')  // 全局 time_window
@@ -505,6 +752,142 @@ export default {
       return []
     }
 
+    const parseScopeFilters = (val, fallbackLevel = 'ad') => {
+      const parsed = parseJson(val)
+      if (!parsed || typeof parsed !== 'object') {
+        return { level: fallbackLevel, conditions: [] }
+      }
+      const level = ['ad', 'adset', 'campaign'].includes(parsed.level) ? parsed.level : fallbackLevel
+      const conditions = Array.isArray(parsed.conditions) ? parsed.conditions : []
+      return { level, conditions }
+    }
+
+    const buildScopeFiltersFromRows = (rows, level) => {
+      const conditions = []
+      for (const row of rows || []) {
+        const err = scopeConditionRowError(row)
+        if (err) continue
+        if (row.field === 'name') {
+          conditions.push({
+            field: 'name',
+            operator: row.operator === 'exclude' ? 'not_contains' : 'contains',
+            value: String(row.value || '').trim()
+          })
+        } else if (row.field === 'status') {
+          const val = String(row.value || '').trim()
+          const mapped = val === 'active_only'
+            ? ['ACTIVE']
+            : val === 'paused_only'
+              ? ['PAUSED']
+              : ['ACTIVE', 'PAUSED']
+          conditions.push({
+            field: 'effective_status',
+            operator: row.operator === 'not_equals' ? 'not_in' : 'in',
+            value: mapped
+          })
+        } else if (row.field === 'created_within') {
+          let hours = null
+          if (row.value === '24' || row.value === '48' || row.value === '72') {
+            hours = Number(row.value)
+          } else if (row.value === 'custom') {
+            const h = Number(row.customHours)
+            if (Number.isFinite(h) && h >= 1 && h <= 720) hours = h
+          }
+          if (Number.isFinite(hours) && hours > 0) {
+            conditions.push({
+              field: 'created_time',
+              operator: 'within_hours',
+              value: hours
+            })
+          }
+        }
+      }
+      return {
+        level: ['ad', 'adset', 'campaign'].includes(level) ? level : 'ad',
+        conditions
+      }
+    }
+
+    const buildScopeRowsFromFilters = (scopeFilters) => {
+      const parsed = parseScopeFilters(scopeFilters, 'ad')
+      const rows = []
+      for (const c of parsed.conditions || []) {
+        if (!c || typeof c !== 'object') continue
+        if (c.field === 'name' && (c.operator === 'contains' || c.operator === 'not_contains')) {
+          rows.push({
+            id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            field: 'name',
+            operator: c.operator === 'not_contains' ? 'exclude' : 'include',
+            value: String(c.value || ''),
+            customHours: null
+          })
+        } else if (c.field === 'effective_status' && (c.operator === 'in' || c.operator === 'not_in')) {
+          const arr = Array.isArray(c.value) ? c.value.map(v => String(v).toUpperCase()) : []
+          let value = 'active_and_paused'
+          if (arr.length === 1 && arr[0] === 'ACTIVE') value = 'active_only'
+          else if (arr.length === 1 && arr[0] === 'PAUSED') value = 'paused_only'
+          rows.push({
+            id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            field: 'status',
+            operator: c.operator === 'not_in' ? 'not_equals' : 'equals',
+            value,
+            customHours: null
+          })
+        } else if (c.field === 'created_time' && c.operator === 'within_hours') {
+          const h = Number(c.value)
+          if (!Number.isFinite(h) || h <= 0) continue
+          let value = 'custom'
+          let customHours = h
+          if (h === 24 || h === 48 || h === 72) {
+            value = String(h)
+            customHours = null
+          }
+          rows.push({
+            id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            field: 'created_within',
+            operator: 'include',
+            value,
+            customHours
+          })
+        }
+      }
+      return rows.length ? rows.slice(0, SCOPE_CONDITION_MAX_ROWS) : [createDefaultScopeConditionRow()]
+    }
+
+    const normalizeExcludeTargetIds = (excludeIds, level) => {
+      const obj = parseJson(excludeIds)
+      if (!obj || typeof obj !== 'object') return []
+      if (level === 'campaign') return Array.isArray(obj.campaign_ids) ? obj.campaign_ids.map(v => String(v)).filter(Boolean) : []
+      if (level === 'adset') return Array.isArray(obj.adset_ids) ? obj.adset_ids.map(v => String(v)).filter(Boolean) : []
+      return Array.isArray(obj.ad_ids) ? obj.ad_ids.map(v => String(v)).filter(Boolean) : []
+    }
+
+    const formatExcludeSummary = (excludeIds) => {
+      const obj = parseJson(excludeIds)
+      if (!obj || typeof obj !== 'object') return ''
+      const adCount = Array.isArray(obj.ad_ids) ? obj.ad_ids.length : 0
+      const adsetCount = Array.isArray(obj.adset_ids) ? obj.adset_ids.length : 0
+      const campaignCount = Array.isArray(obj.campaign_ids) ? obj.campaign_ids.length : 0
+      const total = adCount + adsetCount + campaignCount
+      if (total <= 0) return ''
+      const parts = []
+      if (adCount > 0) parts.push(`广告 ${adCount}`)
+      if (adsetCount > 0) parts.push(`广告组 ${adsetCount}`)
+      if (campaignCount > 0) parts.push(`广告系列 ${campaignCount}`)
+      return `排除名单：${parts.join(' / ')}`
+    }
+
+    const buildExcludeIdsPayload = (excludeTargetIds, level) => {
+      const safeLevel = ['ad', 'adset', 'campaign'].includes(level) ? level : 'ad'
+      const uniq = [...new Set((excludeTargetIds || []).map(v => {
+        const s = String(v || '').trim()
+        if (!s) return ''
+        const idx = s.indexOf(':')
+        return idx >= 0 ? s.slice(idx + 1) : s
+      }).filter(Boolean))]
+      return uniq.map(id => ({ level: safeLevel, id }))
+    }
+
     const normalizeRule = (r) => {
       const raw = parseJson(r.conditions)
       const isV2 = isV2Conditions(raw)
@@ -523,7 +906,18 @@ export default {
         logicOperator: r.logicOperator || r.logic_operator || 'AND',
         timezoneName: r.timezoneName || r.timezone_name || 'UTC',
         isSimulation: r.isSimulation ?? r.is_simulation ?? false,
-        accountId: r.accountId || r.account_id || ''
+        accountId: r.accountId || r.account_id || '',
+        excludeTargetIds: normalizeExcludeTargetIds(r.excludeIds ?? r.exclude_ids, r.targetLevel || r.target_level || 'ad'),
+        executionIntervalMinutes: r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15,
+        executionTimeWindows: (r.executionTimeWindows ?? r.execution_time_windows) && Array.isArray(r.executionTimeWindows ?? r.execution_time_windows) ? (r.executionTimeWindows ?? r.execution_time_windows) : [],
+        useDynamicScope: r.useDynamicScope ?? r.use_dynamic_scope ?? false,
+        scopeFilters: parseScopeFilters(r.scopeFilters ?? r.scope_filters, r.targetLevel || r.target_level || 'ad'),
+        excludeIds: parseJson(r.excludeIds ?? r.exclude_ids) || null,
+        excludeSummaryText: formatExcludeSummary(r.excludeIds ?? r.exclude_ids),
+        maxDynamicMatches: r.maxDynamicMatches ?? r.max_dynamic_matches ?? 1000,
+        dynamicScopeStatus: String(r.dynamicScopeStatus ?? r.dynamic_scope_status ?? 'NORMAL'),
+        dynamicScopeErrorMsg: r.dynamicScopeErrorMsg ?? r.dynamic_scope_error_msg ?? '',
+        dynamicScopeUpdatedAt: r.dynamicScopeUpdatedAt ?? r.dynamic_scope_updated_at ?? null
       }
     }
 
@@ -559,6 +953,7 @@ export default {
         selectedAccountIds.value = []
         scopeItems.value = []
         ruleForm.value.targetIds = []
+        ruleForm.value.excludeTargetIds = []
       } finally {
         accountLoading.value = false
       }
@@ -612,13 +1007,56 @@ export default {
       return base
     }
 
+    /** 列表展示：执行时间段 → 「全天」或「09:00–18:00, 21:00–23:30」（文档 §8.2） */
+    const formatExecutionTimeDisplay = (windows) => {
+      if (!windows || !Array.isArray(windows) || windows.length === 0) return '全天'
+      return windows.map(w => {
+        const s = (w.start || '').toString().slice(0, 5)
+        const e = (w.end || '').toString().slice(0, 5)
+        return s && e ? `${s}–${e}` : (s || e || '')
+      }).filter(Boolean).join(', ')
+    }
+
+    /** 列表展示：执行间隔（分钟）→ 可读文案 */
+    const formatIntervalDisplay = (minutes) => {
+      const m = Number(minutes)
+      if (!Number.isFinite(m) || m < 0) return '15 分钟'
+      if (m === 60) return '1 小时'
+      if (m === 180) return '3 小时'
+      if (m === 360) return '6 小时'
+      if (m >= 60 && m % 60 === 0) return `${m / 60} 小时`
+      return `${m} 分钟`
+    }
+
+    const dynamicStatusLabel = (status) => {
+      const s = String(status || 'NORMAL')
+      if (s === 'NORMAL') return '状态正常'
+      if (s === 'ERROR_OVERSIZE') return '超出上限'
+      if (s === 'ERROR_FILTER_INVALID') return '条件无效'
+      if (s === 'ERROR_REFRESH_FAILED') return '刷新失败'
+      return s
+    }
+
+    const dynamicStatusClass = (status) => {
+      const s = String(status || 'NORMAL')
+      if (s === 'NORMAL') return 'dynamic-status-normal'
+      if (s === 'ERROR_OVERSIZE') return 'dynamic-status-warn'
+      return 'dynamic-status-error'
+    }
+
     const filteredScopeItems = computed(() => {
       const key = String(scopeSearch.value || '').trim().toLowerCase()
-      if (!key) return scopeItems.value
-      return scopeItems.value.filter(item =>
-        String(item.name || '').toLowerCase().includes(key) ||
-        String(item.id || '').toLowerCase().includes(key)
-      )
+      const list = !key
+        ? scopeItems.value
+        : scopeItems.value.filter(item =>
+            String(item.name || '').toLowerCase().includes(key) ||
+            String(item.id || '').toLowerCase().includes(key)
+          )
+      // 开启(ACTIVE)在前，暂停(PAUSED)在后
+      return [...list].sort((a, b) => {
+        const order = (x) => (x.effective_status === 'ACTIVE' ? 0 : 1)
+        return order(a) - order(b)
+      })
     })
 
     /** 多选时用 account_id:id 作为唯一键与表单值；单选时用 id（兼容旧逻辑） */
@@ -692,6 +1130,11 @@ export default {
       scopeSearch.value = ''
       scopePagingAfter.value = null
       resolvedSelectedMap.value = new Map()
+      scopeConditionRows.value = [createDefaultScopeConditionRow()]
+      scopeStatusFilter.value = ''
+      scopeStatusExcludeFilter.value = ''
+      scopeNameExclude.value = ''
+      scopeCreatedWithinHours.value = null
       ruleForm.value = {
         ...createEmptyRule(),
         actions: [{ type: 'pause_ad', value: null }]
@@ -699,17 +1142,49 @@ export default {
       whenLines.value = [createDefaultWhenLine(null)]
       whenTimeWindow.value = 'today'
       whenCustomRange.value = null
+      scopeConditionRows.value = [createDefaultScopeConditionRow()]
+      executionTimeAllDay.value = true
+      executionTimeStart.value = '09:00'
+      executionTimeEnd.value = '18:00'
       loadTemplates()
       showRuleModal.value = true
     }
 
-    /** 兜底归一化：加载时若 max_daily_budget < 100 分则清空（旧数据/手工改库/脚本导入） */
-    const normalizeInvalidMaxBudget = (actions) => {
+    /**
+     * 兜底归一化：预算护栏字段与动作类型对齐
+     * - increase 仅允许 max_daily_budget
+     * - decrease 仅允许 min_daily_budget
+     * - set_budget 不允许 max/min
+     * - 小于 100 分的上下限一律清空
+     */
+    const normalizeBudgetGuardsByAction = (actions) => {
       let n = 0
       for (const a of actions || []) {
         if (a?.max_daily_budget != null && Number(a.max_daily_budget) < 100) {
           a.max_daily_budget = undefined
           n++
+        }
+        if (a?.min_daily_budget != null && Number(a.min_daily_budget) < 100) {
+          a.min_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'increase_budget' && a?.min_daily_budget != null) {
+          a.min_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'decrease_budget' && a?.max_daily_budget != null) {
+          a.max_daily_budget = undefined
+          n++
+        }
+        if (a?.type === 'set_budget') {
+          if (a?.max_daily_budget != null) {
+            a.max_daily_budget = undefined
+            n++
+          }
+          if (a?.min_daily_budget != null) {
+            a.min_daily_budget = undefined
+            n++
+          }
         }
       }
       return n
@@ -738,6 +1213,11 @@ export default {
       scopeItems.value = []
       scopeSearch.value = ''
       scopePagingAfter.value = null
+      scopeConditionRows.value = [createDefaultScopeConditionRow()]
+      scopeStatusFilter.value = ''
+      scopeStatusExcludeFilter.value = ''
+      scopeNameExclude.value = ''
+      scopeCreatedWithinHours.value = null
 
       ruleForm.value = JSON.parse(JSON.stringify({
         name: r.name || '',
@@ -745,13 +1225,21 @@ export default {
         isSimulation: r.isSimulation || false,
         targetLevel: r.targetLevel || 'ad',
         targetIds: r.targetIds || [],
+        excludeTargetIds: r.excludeTargetIds || [],
         logicOperator: r.logicOperator || 'AND',
         timezoneName: r.timezoneName || 'UTC',
-        actions: r.actions || []
+        actions: r.actions || [],
+        executionIntervalMinutes: r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15,
+        executionIntervalPreset: mapMinutesToPreset(r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15),
+        executionIntervalHoursCustom: mapMinutesToPreset(r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15) === 'custom' ? ((r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15) / 60) : null,
+        executionTimeWindows: (r.executionTimeWindows ?? r.execution_time_windows) && Array.isArray(r.executionTimeWindows ?? r.execution_time_windows) ? (r.executionTimeWindows ?? r.execution_time_windows) : [],
+        useDynamicScope: r.useDynamicScope !== false,
+        maxDynamicMatches: Number(r.maxDynamicMatches ?? r.max_dynamic_matches ?? 1000) || 1000
       }))
-      const normalizedCount = normalizeInvalidMaxBudget(ruleForm.value.actions)
+      scopeConditionRows.value = buildScopeRowsFromFilters(r.scopeFilters || r.scope_filters || null)
+      const normalizedCount = normalizeBudgetGuardsByAction(ruleForm.value.actions)
       if (normalizedCount > 0) {
-        console.info(`[规则编辑] 已自动清空 ${normalizedCount} 个无效的预算上限（<1美元）`)
+        console.info(`[规则编辑] 已自动归一化 ${normalizedCount} 个预算护栏字段（动作与上下限口径对齐）`)
       }
 
       if (r.conditionsVersion === 2) {
@@ -765,7 +1253,11 @@ export default {
         whenTimeWindow.value = timeWindow
         whenCustomRange.value = customRange
       }
-      // 回显：已选对象解析成可读标签。targetIds 可能为 "act_xxx:id"，后端 resolve 只认纯 id，故只传 id 部分
+      const win = (r.executionTimeWindows ?? r.execution_time_windows) && Array.isArray(r.executionTimeWindows ?? r.execution_time_windows) ? (r.executionTimeWindows ?? r.execution_time_windows) : []
+      executionTimeAllDay.value = win.length === 0
+      executionTimeStart.value = win[0]?.start ? String(win[0].start).slice(0, 5) : '09:00'
+      executionTimeEnd.value = win[0]?.end ? String(win[0].end).slice(0, 5) : '18:00'
+      // 回显：已选对象解析成可读标签。多账户时 targetIds 持久化为 act_xxx:id，后端 resolve 只认纯 id，故拆出 id 部分去请求
       resolvedSelectedMap.value = new Map()
       if (ruleForm.value.targetIds?.length) {
         const rawIds = ruleForm.value.targetIds
@@ -799,9 +1291,19 @@ export default {
       if (a.type === 'set_budget') {
         a.value_unit = 'usd'
         if (a.value == null || a.value === '' || a.value < 0.01) a.value = 30
+        a.max_daily_budget = undefined
+        a.min_daily_budget = undefined
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
+        if (a.type === 'increase_budget') {
+          a.min_daily_budget = undefined
+        } else if (a.type === 'decrease_budget') {
+          a.max_daily_budget = undefined
+        }
+      } else {
+        a.max_daily_budget = undefined
+        a.min_daily_budget = undefined
       }
     }
 
@@ -834,6 +1336,14 @@ export default {
               return alert('百分比模式下 value 须为 1–100 的整数')
             }
           }
+          if (a.type === 'increase_budget' && a.max_daily_budget != null) {
+            const m = Number(a.max_daily_budget)
+            if (!Number.isInteger(m) || m < 100) return alert('预算上限需为 >= 1 美元')
+          }
+          if (a.type === 'decrease_budget' && a.min_daily_budget != null) {
+            const m = Number(a.min_daily_budget)
+            if (!Number.isInteger(m) || m < 100) return alert('预算下限需为 >= 1 美元')
+          }
         }
       }
       ensureWhenLinesNonEmpty()
@@ -843,6 +1353,17 @@ export default {
         const cr = whenCustomRange.value
         if (!cr?.since || !cr?.until) return alert('自定义范围请填写起始和截止日期')
         if (cr.since > cr.until) return alert('起始日期不能晚于截止日期')
+      }
+
+      const maxDynamicMatches = Number(ruleForm.value.maxDynamicMatches ?? 1000)
+      if (ruleForm.value.useDynamicScope) {
+        if (!Number.isFinite(maxDynamicMatches) || maxDynamicMatches < 1 || maxDynamicMatches > 5000) {
+          return alert('动态匹配上限必须在 1~5000 之间')
+        }
+        const validScopeRows = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+        if (validScopeRows.length === 0) {
+          return alert('开启动态筛选时，至少需要一条完整的监控范围条件')
+        }
       }
 
       const conditionsPayload = linesToV2Groups(
@@ -855,14 +1376,16 @@ export default {
         const out = { type: a.type, value: a.value }
         if (a.type === 'set_budget') {
           out.value_unit = 'usd'
-          if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
-        } else if (a.type?.includes('budget')) {
+        } else if (a.type === 'increase_budget') {
           out.value_unit = a.value_unit || 'percent'
           if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
+        } else if (a.type === 'decrease_budget') {
+          out.value_unit = a.value_unit || 'percent'
+          if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
         }
         return out
       })
-      // 方案 B：按账户分组目标 ID，供后端 target_by_account 落库与执行按账户取
+      // 方案 B：按账户分组目标 ID，供后端 target_by_account 落库与执行按账户取。多账户时 targetIds 以 act_xxx:id 持久化，避免跨账户 ID 歧义
       const ids = ruleForm.value.targetIds || []
       const byAccount = {}
       const accountSet = new Set(selectedAccountIds.value)
@@ -893,7 +1416,15 @@ export default {
         target_by_account: Object.keys(byAccount).length ? byAccount : null,
         logicOperator: ruleForm.value.logicOperator,
         timezoneName: ruleForm.value.timezoneName,
-        isSimulation: ruleForm.value.isSimulation
+        isSimulation: ruleForm.value.isSimulation,
+        useDynamicScope: !!ruleForm.value.useDynamicScope,
+        scopeFilters: buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel),
+        excludeIds: buildExcludeIdsPayload(ruleForm.value.excludeTargetIds, ruleForm.value.targetLevel),
+        maxDynamicMatches: Math.floor(maxDynamicMatches),
+        executionIntervalMinutes: ruleForm.value.executionIntervalPreset === 'custom'
+          ? Math.round(Number(ruleForm.value.executionIntervalHoursCustom) * 60) || 15
+          : (INTERVAL_PRESETS.find(p => p.value === ruleForm.value.executionIntervalPreset)?.minutes ?? 15),
+        executionTimeWindows: executionTimeAllDay.value ? null : [{ start: (executionTimeStart.value || '09:00').slice(0, 5) + ':00', end: (executionTimeEnd.value || '18:00').slice(0, 5) + ':00' }]
       }
 
       const submit = editingRuleId.value
@@ -943,25 +1474,6 @@ export default {
         .catch((e) => alert(`操作失败：${e.message}`))
     }
 
-    const runRulesNow = async () => {
-      // 使用离线查询模式执行规则（从数据库查询，不调用 Facebook API）
-      if (!confirm('即将执行所有启用的规则（离线查询模式），确定吗？')) return
-
-      running.value = true
-      try {
-        const res = await facebookApi.executeAllRulesOffline()
-        alert(res?.message || '已触发规则执行，请查看执行日志页面查看结果')
-      } catch (e) {
-        if (e.response?.data?.code === 'ALREADY_RUNNING') {
-          alert('规则正在执行中，请稍后再试')
-        } else {
-          alert('执行失败: ' + (e.response?.data?.error || e.message))
-        }
-      } finally {
-        running.value = false
-      }
-    }
-
     const runThisRule = async (r) => {
       if (!confirm(`确定立即执行规则「${r.name}」吗？`)) return
       runningRuleId.value = r.id
@@ -985,6 +1497,29 @@ export default {
         }
       } finally {
         runningRuleId.value = null
+      }
+    }
+
+    const refreshDynamicScopeForRule = async (r) => {
+      if (!r?.id) return
+      refreshingRuleId.value = r.id
+      try {
+        const res = await facebookApi.refreshDynamicScopeByAccount({ ruleId: r.id })
+        const info = res?.result || {}
+        if (Array.isArray(info.accountResults)) {
+          const processedAccounts = info.processedAccounts ?? info.accountResults.length
+          const totalInserted = info.accountResults.reduce((sum, x) => sum + Number(x?.updated || 0), 0)
+          const totalOversize = info.accountResults.reduce((sum, x) => sum + Number(x?.oversize || 0), 0)
+          const totalInvalid = info.accountResults.reduce((sum, x) => sum + Number(x?.invalid || 0), 0)
+          alert(`重算完成：accounts=${processedAccounts}, inserted=${totalInserted}, oversize=${totalOversize}, invalid=${totalInvalid}`)
+        } else {
+          alert(`重算完成：processed=${info.processed ?? 0}, inserted=${info.inserted ?? 0}, oversize=${info.oversize ?? 0}, invalid=${info.invalid ?? 0}`)
+        }
+        await loadRules()
+      } catch (e) {
+        alert(`重算失败：${e.response?.data?.error || e.message}`)
+      } finally {
+        refreshingRuleId.value = null
       }
     }
 
@@ -1038,9 +1573,13 @@ export default {
           const promises = [
             facebookApi.getStructureObjects(levelKey, ids[0], {
               q: keyword,
-              limit: 50,
+              limit: SCOPE_PAGE_LIMIT,
               after: null,
-              include_paused: scopeIncludePaused.value
+              include_paused: scopeIncludePaused.value,
+              scope_status: scopeStatusFilter.value || undefined,
+              scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+              name_exclude: scopeNameExclude.value || undefined,
+              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
             })
           ]
           if (isIdSearch) promises.push(facebookApi.resolveObjectsByIds(keyword).catch(() => []))
@@ -1058,19 +1597,24 @@ export default {
         } else {
           const result = await facebookApi.getStructureObjectsMulti(type, ids, {
             q: keyword,
-            limit: 50,
+            limit: SCOPE_PAGE_LIMIT,
             after: null,
-            include_paused: scopeIncludePaused.value
+            include_paused: scopeIncludePaused.value,
+            scope_status: scopeStatusFilter.value || undefined,
+            scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+            name_exclude: scopeNameExclude.value || undefined,
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
           })
           if (requestId !== scopeRequestId.value) return
           scopeItems.value = result.items || []
           scopePagingAfter.value = result.paging?.after ?? null
         }
-        // 「仅启用」时：已选目标中只保留当前列表中的项（当前列表=仅 ACTIVE），避免保留之前「包含暂停」时选的已关闭广告
-        if (!scopeIncludePaused.value && scopeItems.value.length > 0) {
+        // 层级/账户变更或刷新后：已选目标中只保留当前列表中的项，保证已选 ⊆ 当前列表（多账户用 act:id，单账户用 id）
+        if (scopeItems.value.length > 0) {
           const multi = selectedAccountIds.value.length > 1
           const allowedSet = new Set(scopeItems.value.map(it => multi ? `${it.account_id || ''}:${it.id}` : String(it.id)))
           ruleForm.value.targetIds = ruleForm.value.targetIds.filter(id => allowedSet.has(String(id)))
+          ruleForm.value.excludeTargetIds = ruleForm.value.excludeTargetIds.filter(id => allowedSet.has(String(id)))
         }
         scopeReady.value = true
       } catch (e) {
@@ -1085,26 +1629,53 @@ export default {
 
     const loadMoreScopeItems = async () => {
       const ids = selectedAccountIds.value
-      if (!ids?.length || !scopePagingAfter.value) return
-      if (ids.length > 1) return // 多账户时后端暂未实现 after，不展示加载更多
+      if (!ids?.length || !scopePagingAfter.value) return false
       scopeLoading.value = true
       const requestId = ++scopeRequestId.value
       try {
         const level = ruleForm.value.targetLevel
+        const type = level
         const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
-        const resp = await facebookApi.getStructureObjects(levelKey, ids[0], {
-          q: String(scopeSearch.value || '').trim(),
-          limit: 50,
-          after: scopePagingAfter.value,
-          include_paused: scopeIncludePaused.value
-        })
-        if (requestId !== scopeRequestId.value) return
-        scopeItems.value = [...scopeItems.value, ...(resp.items || [])]
-        scopePagingAfter.value = resp?.paging?.after || null
+        if (ids.length === 1) {
+          const resp = await facebookApi.getStructureObjects(levelKey, ids[0], {
+            q: String(scopeSearch.value || '').trim(),
+            limit: SCOPE_PAGE_LIMIT,
+            after: scopePagingAfter.value,
+            include_paused: scopeIncludePaused.value,
+            scope_status: scopeStatusFilter.value || undefined,
+            scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+            name_exclude: scopeNameExclude.value || undefined,
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+          })
+          if (requestId !== scopeRequestId.value) return false
+          scopeItems.value = [...scopeItems.value, ...(resp.items || [])]
+          scopePagingAfter.value = resp?.paging?.after || null
+        } else {
+          const result = await facebookApi.getStructureObjectsMulti(type, ids, {
+            q: String(scopeSearch.value || '').trim(),
+            limit: SCOPE_PAGE_LIMIT,
+            after: scopePagingAfter.value,
+            include_paused: scopeIncludePaused.value,
+            scope_status: scopeStatusFilter.value || undefined,
+            scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+            name_exclude: scopeNameExclude.value || undefined,
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+          })
+          if (requestId !== scopeRequestId.value) return false
+          scopeItems.value = [...scopeItems.value, ...(result.items || [])]
+          scopePagingAfter.value = result.paging?.after ?? null
+          // 非后台拉全量时，加载更多后对当前列表重新应用勾选；后台拉全量时在结束时统一应用
+          if (!isApplyingScopeConditions.value) {
+            const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+            if (completed.length > 0) applyScopeConditionsToCurrentList(completed, true)
+          }
+        }
         scopeReady.value = true
+        return true
       } catch (e) {
-        if (requestId !== scopeRequestId.value) return
+        if (requestId !== scopeRequestId.value) return false
         alert(`加载更多失败：${e.message}`)
+        return false
       } finally {
         if (requestId === scopeRequestId.value) scopeLoading.value = false
       }
@@ -1118,8 +1689,12 @@ export default {
       ruleForm.value.targetIds = []
     }
 
-    const onScopeStatusChange = () => {
-      refreshScopeItems()
+    const selectAllExcludeScope = () => {
+      ruleForm.value.excludeTargetIds = filteredScopeItems.value.map(item => scopeItemValue(item))
+    }
+
+    const clearExcludeScopeSelection = () => {
+      ruleForm.value.excludeTargetIds = []
     }
 
     const onAddAccount = (e) => {
@@ -1148,12 +1723,14 @@ export default {
         scopeReady.value = false
         scopePagingAfter.value = null
         if (!isEditing.value) ruleForm.value.targetIds = []
+        if (!isEditing.value) ruleForm.value.excludeTargetIds = []
         return
       }
       scopeItems.value = []
       scopeReady.value = false
       scopePagingAfter.value = null
       if (!isEditing.value) ruleForm.value.targetIds = []
+      if (!isEditing.value) ruleForm.value.excludeTargetIds = []
       refreshScopeItems()
     }, { deep: true })
 
@@ -1164,12 +1741,14 @@ export default {
       scopePagingAfter.value = null
       // 切换层级：新建规则清空；编辑规则保留并提示“可能有失效对象”
       if (!isEditing.value) ruleForm.value.targetIds = []
+      if (!isEditing.value) ruleForm.value.excludeTargetIds = []
       refreshScopeItems()
     })
 
     // 输入搜索词时改为“服务端搜索”（避免只在当前页过滤）
     let searchTimer = null
     watch(scopeSearch, () => {
+      if (isApplyingScopeConditions.value) return
       if (!selectedAccountIds.value?.length) return
       if (searchTimer) clearTimeout(searchTimer)
       searchTimer = setTimeout(() => {
@@ -1201,6 +1780,188 @@ export default {
       ensureWhenLinesNonEmpty()
     }
 
+    const addScopeConditionRow = () => {
+      if (scopeConditionRows.value.length >= SCOPE_CONDITION_MAX_ROWS) return
+      scopeConditionRows.value.push(createDefaultScopeConditionRow())
+    }
+    const removeScopeConditionRow = (idx) => {
+      scopeConditionRows.value.splice(idx, 1)
+      if (scopeConditionRows.value.length === 0) {
+        scopeConditionRows.value = [createDefaultScopeConditionRow()]
+      }
+    }
+    const onScopeConditionFieldChange = (row) => {
+      if (row.field === 'name') {
+        row.operator = 'include'
+        row.value = ''
+      } else if (row.field === 'created_within') {
+        row.operator = 'include'
+        row.value = ''
+        row.customHours = null
+      } else {
+        row.operator = 'equals'
+        row.value = ''
+      }
+    }
+    const scopeConditionRowError = (row) => {
+      const v = String(row.value || '').trim()
+      if (row.field === 'status' && !v) return '数据不能为空'
+      if (row.field === 'name' && !v) return '数据不能为空'
+      if (row.field === 'created_within') {
+        if (v === '24' || v === '48' || v === '72') return null
+        if (v === 'custom') {
+          const h = row.customHours
+          if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请选择时间范围或填写小时数'
+          return null
+        }
+        return '请选择时间范围或填写小时数'
+      }
+      return null
+    }
+
+    /** 应用监控范围条件。有名称/状态/创建时间段条件时用后端 SQL 过滤，只拉匹配项；单账户与多账户均拉全量匹配项并全部勾选。 */
+    const applyScopeConditions = async () => {
+      scopeApplyMessage.value = ''
+      const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+      if (completed.length === 0) {
+        scopeApplyMessage.value = '请至少填写一行完整条件'
+        return
+      }
+      if (!selectedAccountIds.value.length) {
+        scopeApplyMessage.value = '请先选择账户并加载列表'
+        return
+      }
+
+      const multi = selectedAccountIds.value.length > 1
+      const nameIncludeRow = completed.find(r => r.field === 'name' && r.operator === 'include' && String(r.value || '').trim())
+      const nameIncludeKeyword = nameIncludeRow ? String(nameIncludeRow.value || '').trim() : ''
+      const nameExcludeRow = completed.find(r => r.field === 'name' && r.operator === 'exclude' && String(r.value || '').trim())
+      const nameExcludeKeyword = nameExcludeRow ? String(nameExcludeRow.value || '').trim() : ''
+      const statusRow = completed.find(r => r.field === 'status' && String(r.value || '').trim())
+      const scopeStatus = statusRow ? String(statusRow.value || '').trim() : '' // active_only | paused_only | active_and_paused
+      const hasStatusCondition = !!scopeStatus
+      // 创建时间段：多行取最短窗口（AND 语义）
+      const resolveHoursFromRow = (r) => {
+        if (r.field !== 'created_within') return null
+        const val = r.value
+        if (val === '24' || val === '48' || val === '72') return parseInt(val, 10)
+        if (val === 'custom' && r.customHours != null && Number.isFinite(r.customHours) && r.customHours >= 1 && r.customHours <= 720) return r.customHours
+        return null
+      }
+      const createdRows = completed.filter(r => r.field === 'created_within')
+      const hoursList = createdRows.map(r => resolveHoursFromRow(r)).filter(h => Number.isFinite(h) && h > 0)
+      const effectiveCreatedWithinHours = hoursList.length ? Math.min(...hoursList) : null
+      scopeCreatedWithinHours.value = effectiveCreatedWithinHours
+
+      // 状态「等于」传 scope_status；状态「不等于」传 scope_status_exclude（后端枚举 ACTIVE | PAUSED | ACTIVE,PAUSED）
+      if (statusRow) {
+        const excludeBackend = scopeStatus === 'active_only' ? 'ACTIVE' : scopeStatus === 'paused_only' ? 'PAUSED' : scopeStatus === 'active_and_paused' ? 'ACTIVE,PAUSED' : ''
+        if (statusRow.operator === 'not_equals') {
+          scopeStatusExcludeFilter.value = excludeBackend
+          scopeStatusFilter.value = ''
+        } else {
+          scopeStatusFilter.value = scopeStatus
+          scopeStatusExcludeFilter.value = ''
+        }
+      } else {
+        scopeStatusFilter.value = ''
+        scopeStatusExcludeFilter.value = ''
+      }
+
+      const hasCreatedWithinCondition = effectiveCreatedWithinHours != null
+      const needFetchAll = !!nameIncludeKeyword || !!nameExcludeKeyword || hasStatusCondition || hasCreatedWithinCondition
+
+      if (needFetchAll) {
+        scopeApplyMessage.value = '正在拉取匹配结果…'
+        scopeSearch.value = nameIncludeKeyword
+        scopeNameExclude.value = nameExcludeKeyword || ''
+        if (hasStatusCondition) scopeIncludePaused.value = true
+        isApplyingScopeConditions.value = true
+        let pageCount = 1
+        try {
+          await refreshScopeItems()
+          // 单账户与多账户均拉全量匹配项（后端 SQL 已过滤，每页仅返回匹配项，循环直到无下一页）
+          while (scopePagingAfter.value) {
+            await loadMoreScopeItems()
+            pageCount += 1
+            scopeApplyMessage.value = `正在按条件加载第 ${pageCount} 页，已加载 ${scopeItems.value.length} 条…`
+            await new Promise(r => setTimeout(r, 0))
+          }
+        } finally {
+          isApplyingScopeConditions.value = false
+        }
+      } else if (!scopeItems.value.length) {
+        scopeApplyMessage.value = '请先选择账户并加载列表'
+        return
+      }
+
+      applyScopeConditionsToCurrentList(completed, multi)
+    }
+
+    /** 按当前 scopeItems 与已完成的条件行，做 match 并写回 targetIds（供 applyScopeConditions 与加载更多后复用） */
+    function applyScopeConditionsToCurrentList(completed, multi) {
+      const match = (item) => {
+        for (const row of completed) {
+          if (row.field === 'created_within') continue // 后端已按 created_time 过滤，前端视为通过
+          if (row.field === 'name') {
+            const name = String(item.name || '').toLowerCase()
+            const keyword = String(row.value || '').trim().toLowerCase()
+            if (row.operator === 'include') {
+              if (!keyword || !name.includes(keyword)) return false
+            } else {
+              if (keyword && name.includes(keyword)) return false
+            }
+          } else {
+            const status = item.effective_status || item.status || ''
+            const statusMatch = (val) => {
+              if (val === 'active_only') return status === 'ACTIVE'
+              if (val === 'paused_only') return status === 'PAUSED'
+              if (val === 'active_and_paused') return ['ACTIVE', 'PAUSED'].includes(status)
+              return false
+            }
+            if (row.operator === 'equals') {
+              if (!statusMatch(row.value)) return false
+            } else if (row.operator === 'not_equals') {
+              if (statusMatch(row.value)) return false
+            }
+          }
+        }
+        return true
+      }
+      const matched = scopeItems.value.filter(match)
+      ruleForm.value.targetIds = matched.map(item => (multi ? `${item.account_id || ''}:${item.id}` : item.id))
+      const total = scopeItems.value.length
+      if (multi && scopePagingAfter.value) {
+        scopeApplyMessage.value = matched.length
+          ? `已勾选 ${matched.length} 个（当前已加载 ${total} 条）。点击「加载更多」可继续加载并自动更新勾选`
+          : `当前已加载 ${total} 条中无匹配项。点击「加载更多」可继续加载`
+      } else {
+        scopeApplyMessage.value = matched.length ? `已勾选 ${matched.length} 个对象` : '当前列表无匹配项'
+      }
+    }
+
+    // 监控范围条件 / 已选账户 / 目标层级 任一变更：① 无「名称 包含」有值时清空搜索栏；② 有完整行且已选账户时 2 秒防抖后自动应用
+    let scopeAutoApplyTimer = null
+    watch(
+      [scopeConditionRows, selectedAccountIds, () => ruleForm.value.targetLevel],
+      () => {
+        const hasNameIncludeValue = scopeConditionRows.value.some(
+          r => r.field === 'name' && r.operator === 'include' && String(r.value || '').trim()
+        )
+        if (!hasNameIncludeValue) scopeSearch.value = ''
+        const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+        if (scopeAutoApplyTimer) clearTimeout(scopeAutoApplyTimer)
+        scopeAutoApplyTimer = null
+        if (completed.length > 0 && selectedAccountIds.value.length > 0) {
+          scopeAutoApplyTimer = setTimeout(() => {
+            scopeAutoApplyTimer = null
+            applyScopeConditions()
+          }, 2000)
+        }
+      },
+      { deep: true }
+    )
+
     const addAction = () => {
       ruleForm.value.actions.push({ type: 'pause_ad', value: null })
     }
@@ -1231,6 +1992,25 @@ export default {
       a.max_daily_budget = Math.round(yuan * 100)
     }
 
+    /** 预算下限输入（美元 → 分）：展示用美元，后端存分；输入 0 视为未设置 */
+    const onMinBudgetInput = (e, a) => {
+      const raw = e.target.value
+      if (raw === '' || raw == null) {
+        a.min_daily_budget = undefined
+        return
+      }
+      const yuan = parseFloat(raw)
+      if (Number.isNaN(yuan) || yuan < 0) {
+        a.min_daily_budget = undefined
+        return
+      }
+      if (yuan === 0) {
+        a.min_daily_budget = undefined
+        return
+      }
+      a.min_daily_budget = Math.round(yuan * 100)
+    }
+
     const applyTemplate = (template) => {
       if (!template || !confirm('这将覆盖当前条件设置，确定吗？')) return
       const lines = Array.isArray(template.when_lines) ? template.when_lines : []
@@ -1256,21 +2036,25 @@ export default {
     }
 
     return {
-      rules, showRuleModal, editingRuleId, ruleForm, running, runningRuleId,
+      rules, showRuleModal, editingRuleId, ruleForm, running, runningRuleId, refreshingRuleId,
       whenLines, whenTimeWindow, whenCustomRange,
       linesToV2Groups, v2ToLines, v1ToLines,
       createDefaultWhenLine, ensureWhenLinesNonEmpty, getDefaultWhenCustomRange,
       accounts, selectedAccountIds, accountToAdd, accountsFilteredForAdd, accountLabel, onAddAccount, removeAccount, selectAllAccounts, clearAllAccounts,
-      scopeItems, scopeSearch, scopeIncludePaused, onScopeStatusChange, scopeLoading, scopeReady, filteredScopeItems, scopeItemKey, scopeItemValue,
+      scopeItems, scopeSearch, scopeLoading, scopeReady, filteredScopeItems, scopeItemKey, scopeItemValue,
       accountLoading, accountError, loadAccounts,
       canSelectAll, selectedTargetPreview,
       scopePagingAfter, loadMoreScopeItems, missingSelectedCount, resolvedSelectedMap,
       levelOptions, hasBudgetAction,
       loadRules, loadTemplates, templates, zeroClickTemplate, metricLabel, opLabel, actionLabel, getActionClass, timeWindowLabel,
+      formatExecutionTimeDisplay, formatIntervalDisplay, dynamicStatusLabel, dynamicStatusClass,
       ratioMetricTip,
-      openCreateRule, openEditRule, saveRule, deleteRule, toggleRule, runRulesNow, runThisRule,
-      refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection,
-      addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange
+      openCreateRule, openEditRule, saveRule, deleteRule, toggleRule, runThisRule, refreshDynamicScopeForRule,
+      refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection, selectAllExcludeScope, clearExcludeScopeSelection,
+      addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange,
+      scopeConditionRows, SCOPE_CONDITION_MAX_ROWS, addScopeConditionRow, removeScopeConditionRow, onScopeConditionFieldChange,
+      scopeConditionRowError, scopeApplyMessage,
+      executionTimeAllDay, executionTimeStart, executionTimeEnd, INTERVAL_PRESETS
     }
   }
 }
@@ -1376,6 +2160,9 @@ export default {
 .account-id { font-size: 12px; color: var(--primary); font-family: monospace; background: var(--bg-secondary); padding: 2px 6px; border-radius: 4px; }
 .arrow { text-align: center; color: var(--text-secondary); margin: 4px 0; font-size: 12px; }
 
+.execution-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font-size: 12px; }
+.execution-meta .label { display: inline; margin-bottom: 0; }
+
 .pill {
   display: inline-block;
   padding: 4px 10px;
@@ -1390,6 +2177,13 @@ export default {
 .action.danger { background: #FFF5F5; color: var(--danger-color); border-color: #FED7D7; }
 .action.success { background: #F0FFF4; color: var(--secondary-color); border-color: #C6F6D5; }
 .val { font-weight: 400; opacity: 0.9; }
+.dynamic-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dynamic-on { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+.dynamic-off { background: #f3f4f6; color: #6b7280; border-color: #d1d5db; }
+.dynamic-status-normal { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+.dynamic-status-warn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+.dynamic-status-error { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
+.dynamic-error { color: #b45309; }
 
 .card-footer {
   padding: 12px 16px;
@@ -1480,6 +2274,9 @@ input:checked + .slider:before { transform: translateX(16px); }
 .form-row { display: flex; gap: 16px; }
 .flex-1 { flex: 1; }
 .flex-2 { flex: 2; }
+.dynamic-scope-row { align-items: center; justify-content: space-between; }
+.dynamic-max-wrap { display: flex; align-items: center; gap: 8px; }
+.dynamic-max-wrap label { margin: 0; font-size: 13px; color: var(--text-secondary); }
 
 .radio-group { display: flex; gap: 16px; }
 .radio-label { display: flex; align-items: center; gap: 6px; font-size: 14px; cursor: pointer; }
@@ -1493,6 +2290,18 @@ input:checked + .slider:before { transform: translateX(16px); }
 .when-line-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .join-select { flex: 0 0 60px; }
 .join-placeholder { flex: 0 0 60px; display: inline-block; }
+.join-label { flex: 0 0 60px; font-size: 13px; color: var(--primary-color); font-weight: 500; }
+.scope-condition-block { margin-top: 8px; }
+.scope-condition-hint { margin-bottom: 8px; }
+.scope-condition-rows .scope-condition-row { flex-wrap: wrap; }
+.scope-condition-row .scope-value-input { min-width: 180px; flex: 1; }
+.scope-condition-row .scope-value-select { min-width: 160px; }
+.scope-row-error { flex: 0 0 100%; width: 100%; margin-top: 4px; margin-left: 68px; font-size: 12px; color: var(--danger-color); }
+.link-add-scope { color: var(--primary-color); font-size: 13px; text-decoration: none; }
+.link-add-scope:hover { text-decoration: underline; }
+.scope-apply-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.scope-apply-message { font-size: 12px; color: var(--text-secondary); }
+.input-error { border-color: var(--danger-color) !important; }
 
 .btn-tiny {
   padding: 2px 8px;
@@ -1593,6 +2402,8 @@ input:checked + .slider:before { transform: translateX(16px); }
 .scope-item:hover { background: #f9fafb; }
 .scope-item .name { font-size: 13px; color: var(--text-primary); }
 .scope-item .id { font-size: 12px; color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.scope-item-active { border-left: 3px solid #2563eb; }
+.scope-item-paused { border-left: 3px solid #9ca3af; }
 </style>
 
 

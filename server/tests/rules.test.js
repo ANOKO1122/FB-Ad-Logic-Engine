@@ -453,6 +453,11 @@ describe('规则 API 测试', () => {
         })
 
       const ruleId = createRes.body.rule.id
+      await pool.execute(
+        `INSERT INTO rule_matched_objects (rule_id, account_id, object_id, object_type)
+         VALUES (?, ?, ?, 'ad')`,
+        [ruleId, TEST_ACCOUNT_ID, 'test_ad_for_delete']
+      )
 
       // 删除规则
       const res = await request(app)
@@ -468,6 +473,13 @@ describe('规则 API 测试', () => {
         [ruleId]
       )
       expect(rows.length).toBe(0)
+
+      // 验证动态快照已被联动清理（避免孤儿数据）
+      const [snapshotRows] = await pool.execute(
+        'SELECT * FROM rule_matched_objects WHERE rule_id = ?',
+        [ruleId]
+      )
+      expect(snapshotRows.length).toBe(0)
     })
   })
 })

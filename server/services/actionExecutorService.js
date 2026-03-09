@@ -17,6 +17,7 @@ import { db } from '../db/drizzle.js'
 import { automationLogs } from '../db/schema.js'
 import pool from '../db/connection.js'
 import { FacebookMarketingAPI } from '../index.js'
+import { isCooldownDue } from './ruleExecutionStateService.js'
 
 // Facebook API Token（从环境变量读取）
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -26,6 +27,28 @@ const MIN_BUDGET_CENTS = 100
 
 /** value_unit 合法值：percent=百分比，usd=固定美元 */
 const VALID_VALUE_UNITS = ['percent', 'usd']
+
+/**
+ * 预算 Pre-Flight 跳过原因细分：
+ * - increase 且 current > max: above_max_cap
+ * - decrease 且 current <= min: below_min_floor
+ * - 其它 current===new: budget_already_at_target
+ */
+function inferBudgetSkipReason(action, currentCents, newBudgetCents) {
+  if (action?.type === 'increase_budget' && action?.max_daily_budget != null) {
+    const cap = Math.max(Math.round(Number(action.max_daily_budget)), MIN_BUDGET_CENTS)
+    if (currentCents > cap && currentCents === newBudgetCents) {
+      return 'above_max_cap'
+    }
+  }
+  if (action?.type === 'decrease_budget' && action?.min_daily_budget != null) {
+    const floor = Math.max(Math.round(Number(action.min_daily_budget)), MIN_BUDGET_CENTS)
+    if (currentCents <= floor && currentCents === newBudgetCents) {
+      return 'below_min_floor'
+    }
+  }
+  return 'budget_already_at_target'
+}
 
 /**
  * 【教学】M4 步骤 2：预算幂等——纯函数「只算一次」
@@ -39,6 +62,8 @@ const VALID_VALUE_UNITS = ['percent', 'usd']
  * @returns {number} 新预算（美分，整数）
  */
 export function computeNewBudgetCentsOnce(currentBudgetCents, action) {
+  const cents = Math.round(Number(currentBudgetCents) || 0)
+
   // set_budget：直接设置为固定美元值，无需 GET 当前预算
   if (action?.type === 'set_budget') {
     const v = Number(action?.value)
@@ -50,12 +75,33 @@ export function computeNewBudgetCentsOnce(currentBudgetCents, action) {
       const capEffective = Math.max(cap, MIN_BUDGET_CENTS)
       targetCents = Math.min(targetCents, capEffective)
     }
+    // set_budget 新语义：仅上调，不下调
+    if (cents > 0 && cents >= targetCents) {
+      return cents
+    }
     return targetCents
   }
 
-  const cents = Math.round(Number(currentBudgetCents) || 0)
   const unit = VALID_VALUE_UNITS.includes(action?.value_unit) ? action.value_unit : 'percent'
   const isIncrease = action?.type === 'increase_budget'
+  const isDecrease = action?.type === 'decrease_budget'
+
+  if (isIncrease && action?.max_daily_budget != null) {
+    const cap = Math.round(Number(action.max_daily_budget))
+    const capEffective = Math.max(cap, MIN_BUDGET_CENTS)
+    // increase 新语义：若当前预算已高于上限，保持不动
+    if (cents > capEffective) {
+      return cents
+    }
+  }
+  if (isDecrease && action?.min_daily_budget != null) {
+    const floor = Math.round(Number(action.min_daily_budget))
+    const floorEffective = Math.max(floor, MIN_BUDGET_CENTS)
+    // decrease 新语义：若当前预算在下限或以下，保持不动
+    if (cents <= floorEffective) {
+      return cents
+    }
+  }
 
   let newCents
   if (unit === 'usd') {
@@ -77,6 +123,11 @@ export function computeNewBudgetCentsOnce(currentBudgetCents, action) {
     const cap = Math.round(Number(action.max_daily_budget))
     const capEffective = Math.max(cap, MIN_BUDGET_CENTS)
     newCents = Math.min(newCents, capEffective)
+  }
+  if (isDecrease && action?.min_daily_budget != null) {
+    const floor = Math.round(Number(action.min_daily_budget))
+    const floorEffective = Math.max(floor, MIN_BUDGET_CENTS)
+    newCents = Math.max(newCents, floorEffective)
   }
   return newCents
 }
@@ -126,18 +177,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     return results
   }
 
-  // M4 3.4 Smart Mute：统一在执行层入口检查，单条规则执行与 cron 仲裁路径均生效
-  const mu = matchedAd.mute_until
-  if (mu != null && new Date() < new Date(mu)) {
-    logger.info(`   🔇 广告 ${matchedAd.ad_id} 处于 mute 期 (until ${mu})，跳过执行`)
-    results.push({
-      actionType: 'muted',
-      status: 'skipped',
-      errorMessage: `mute_until: ${mu}, mute_reason: ${matchedAd.mute_reason || ''}`,
-      durationMs: 0
-    })
-    return results
-  }
+  // Smart Mute 已移除：不再根据 mute_until 跳过执行；mute_until/mute_reason 仍由数据层写入，仅保留用于历史排查与脚本（如 clear-ad-mute.js）
 
   // 判断是否为 Dry Run 模式
   const isSimulation = rule.isSimulation || rule.is_simulation || false
@@ -158,6 +198,9 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     purchases: matchedAd.purchases || 0,
     link_clicks: matchedAd.link_clicks ?? 0,
     unique_link_clicks: matchedAd.unique_link_clicks ?? 0,
+    add_to_cart_count: matchedAd.add_to_cart_count ?? 0,
+    initiate_checkout_count: matchedAd.initiate_checkout_count ?? 0,
+    add_payment_info_count: matchedAd.add_payment_info_count ?? 0,
     ad_id: matchedAd.ad_id,
     ad_name: matchedAd.ad_name,
     status: matchedAd.status ?? null
@@ -170,6 +213,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     let errorMessage = null
     let apiRequest = null
     let apiResponse = null
+    let cooldownKey = null  // 冷却键：供 cron 写 rule_ad_execution_state(scope_key)
 
     try {
       if (isSimulation) {
@@ -217,6 +261,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               apiResponse = JSON.stringify({ skipped: true, reason: 'already_paused' })
               break
             }
+            cooldownKey = `ad:${matchedAd.ad_id}`
             logger.info(`    🔧 执行: 暂停广告 ${matchedAd.ad_id}`)
             apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'PAUSED' } })
             try {
@@ -255,6 +300,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               apiResponse = JSON.stringify({ skipped: true, reason: 'cannot_activate' })
               break
             }
+            cooldownKey = `ad:${matchedAd.ad_id}`
             logger.info(`    🔧 执行: 激活广告 ${matchedAd.ad_id}`)
             apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'ACTIVE' } })
             try {
@@ -281,6 +327,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               logger.warn(`    ⚠️  无法调整预算：广告 ${matchedAd.ad_id} 没有 adset_id`)
               status = 'fail'
               errorMessage = 'adset_id 不存在，无法调整预算'
+              cooldownKey = `ad:${matchedAd.ad_id}` // 作用域缺失时按广告冷却，避免空键
               break
             }
 
@@ -298,6 +345,9 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
             }
             const isABO = adsetDetail && ((adsetDetail.daily_budget || 0) > 0 || (adsetDetail.lifetime_budget || 0) > 0)
 
+            // 规则级执行间隔（分钟），与 cronService 中保持一致
+            const intervalMin = rule.executionIntervalMinutes ?? rule.execution_interval_minutes ?? 15
+
             let newBudgetCents
             let targetNodeId
             let targetLabel
@@ -308,9 +358,37 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               targetLabel = '广告组'
               const currentCents = (adsetDetail.daily_budget || 0) > 0 ? adsetDetail.daily_budget : adsetDetail.lifetime_budget
               isDaily = (adsetDetail.daily_budget || 0) > 0
-              newBudgetCents = (action._resolvedBudgetCents != null && Number.isInteger(action._resolvedBudgetCents))
-                ? action._resolvedBudgetCents
-                : computeNewBudgetCentsOnce(currentCents, action)
+              // 方案 A：set_budget 始终按实时 current 预算重算，避免使用基于 current=0 预计算的 _resolvedBudgetCents
+              if (isSetBudget) {
+                newBudgetCents = computeNewBudgetCentsOnce(currentCents, action)
+              } else {
+                newBudgetCents = (action._resolvedBudgetCents != null && Number.isInteger(action._resolvedBudgetCents))
+                  ? action._resolvedBudgetCents
+                  : computeNewBudgetCentsOnce(currentCents, action)
+              }
+              cooldownKey = `budget_adset:${adsetId}`
+              // 精细冷却：按预算目标节点（广告组）检查是否到期，未到期则直接跳过本轮预算动作
+              if (!isSimulation && intervalMin > 0) {
+                const due = await isCooldownDue(rule.id, cooldownKey, intervalMin)
+                if (!due) {
+                  logger.info(`    🕒 预算冷却未到期，跳过${targetLabel} ${targetNodeId} (${cooldownKey})`)
+                  status = 'skipped'
+                  errorMessage = '预算冷却未到期'
+                  apiRequest = JSON.stringify({ preFlight: true, cooldownKey, reason: 'cooldown_not_reached' })
+                  apiResponse = JSON.stringify({ skipped: true, reason: 'cooldown_not_reached' })
+                  break
+                }
+              }
+              // Pre-Flight：当前预算已等于目标预算则跳过，不调 FB API
+              if (!isSimulation && currentCents === newBudgetCents) {
+                const skipReason = inferBudgetSkipReason(action, currentCents, newBudgetCents)
+                logger.info(`    ⏭️  Pre-Flight: 广告组 ${adsetId} 当前预算=${currentCents} 分=目标，跳过`)
+                status = 'skipped'
+                errorMessage = `目标已达成（${skipReason}）`
+                apiRequest = JSON.stringify({ preFlight: true, currentCents, newBudgetCents, reason: skipReason })
+                apiResponse = JSON.stringify({ skipped: true, reason: skipReason })
+                break
+              }
               if (isSimulation) {
                 logger.info(`    🔧 [Dry Run] ${adjustDirection}${targetLabel} ${adsetId} 预算 ${paramLabel} → ${newBudgetCents} 分`)
               } else {
@@ -325,11 +403,25 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
                 logger.warn(`    ⚠️  CBO 广告系列但无 campaign_id，无法调整预算`)
                 status = 'fail'
                 errorMessage = 'CBO 广告系列缺少 campaign_id，无法调整系列预算'
+                cooldownKey = `ad:${matchedAd.ad_id}` // 作用域缺失时按广告冷却，避免空键
                 break
               }
               targetNodeId = campaignId
               targetLabel = '广告系列(CBO)'
+              cooldownKey = `budget_campaign:${campaignId}`
               let currentCents = 0
+              // 精细冷却：按预算目标节点（广告系列）检查是否到期，未到期则直接跳过本轮预算动作
+              if (!isSimulation && intervalMin > 0) {
+                const due = await isCooldownDue(rule.id, cooldownKey, intervalMin)
+                if (!due) {
+                  logger.info(`    🕒 预算冷却未到期，跳过${targetLabel} ${targetNodeId} (${cooldownKey})`)
+                  status = 'skipped'
+                  errorMessage = '预算冷却未到期'
+                  apiRequest = JSON.stringify({ preFlight: true, cooldownKey, reason: 'cooldown_not_reached' })
+                  apiResponse = JSON.stringify({ skipped: true, reason: 'cooldown_not_reached' })
+                  break
+                }
+              }
               if (isSimulation) {
                 if (action.type === 'set_budget') {
                   newBudgetCents = computeNewBudgetCentsOnce(0, action)
@@ -343,6 +435,17 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
                 currentCents = (campaignDetail.daily_budget || 0) > 0 ? campaignDetail.daily_budget : campaignDetail.lifetime_budget
                 isDaily = (campaignDetail.daily_budget || 0) > 0
                 newBudgetCents = computeNewBudgetCentsOnce(currentCents, action)
+                cooldownKey = `budget_campaign:${campaignId}`
+                // Pre-Flight：当前预算已等于目标预算则跳过
+                if (currentCents === newBudgetCents) {
+                  const skipReason = inferBudgetSkipReason(action, currentCents, newBudgetCents)
+                  logger.info(`    ⏭️  Pre-Flight: 广告系列 ${campaignId} 当前预算=${currentCents} 分=目标，跳过`)
+                  status = 'skipped'
+                  errorMessage = `目标已达成（${skipReason}）`
+                  apiRequest = JSON.stringify({ preFlight: true, currentCents, newBudgetCents, reason: skipReason })
+                  apiResponse = JSON.stringify({ skipped: true, reason: skipReason })
+                  break
+                }
                 logger.info(`    🔧 执行: ${adjustDirection}${targetLabel} ${campaignId} 预算 ${paramLabel}`)
                 logger.info(`      当前预算: ${currentCents} 分，新预算: ${newBudgetCents} 分`)
                 await api.updateCampaignBudget(campaignId, newBudgetCents, isDaily)
@@ -383,7 +486,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
       apiResponse = JSON.stringify({ error: error.message })
     }
 
-    // ===== 写入审计日志（M4：写入 run_id，triggered_at 为 Date，DB session 已 UTC）=====
+    // ===== 写入审计日志（M4：写入 run_id；triggered_at 存 UTC，由前端按 UTC 解析后转北京展示）=====
     const now = new Date()
     try {
       await db.insert(automationLogs).values({
@@ -414,7 +517,8 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
       actionType: action.type,
       status,
       errorMessage,
-      durationMs: Date.now() - startTime
+      durationMs: Date.now() - startTime,
+      ...(cooldownKey != null && { cooldownKey })
     })
   }
 
@@ -475,22 +579,7 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
     }
   }
 
-  // M4 3.4：单条规则路径若全部因 mute 跳过，带上 skipReason/skipDetails 供上层写摘要
-  if (
-    matchedAds.length > 0 &&
-    stats.successCount === 0 &&
-    stats.failCount === 0 &&
-    stats.skippedCount === matchedAds.length &&
-    stats.results.every(r => r.results?.[0]?.actionType === 'muted')
-  ) {
-    const first = matchedAds[0]
-    stats.skipReason = 'muted'
-    stats.skipDetails = {
-      ad_ids: matchedAds.map(m => m.ad_id),
-      mute_until: first?.mute_until ?? null,
-      mute_reason: first?.mute_reason ?? null
-    }
-  }
+  // Smart Mute 已移除：不再因 mute 跳过，故不再设置 skipReason='muted'
 
   return stats
 }

@@ -86,11 +86,14 @@ describe('M4 3.5 预算单位统一', () => {
       expect(result).toBe(100)
     })
 
-    it('set_budget 不依赖当前预算（currentBudgetCents 被忽略）', () => {
-      const r1 = computeNewBudgetCentsOnce(0, { type: 'set_budget', value: 20 })
-      const r2 = computeNewBudgetCentsOnce(10000, { type: 'set_budget', value: 20 })
-      expect(r1).toBe(2000)
-      expect(r2).toBe(2000)
+    it('set_budget 仅上调不下调：current=7000,target=5000 -> 7000', () => {
+      const result = computeNewBudgetCentsOnce(7000, { type: 'set_budget', value: 50, value_unit: 'usd' })
+      expect(result).toBe(7000)
+    })
+
+    it('set_budget 仅上调：current=4000,target=5000 -> 5000', () => {
+      const result = computeNewBudgetCentsOnce(4000, { type: 'set_budget', value: 50, value_unit: 'usd' })
+      expect(result).toBe(5000)
     })
 
     it('set_budget $30 + max_daily_budget=0 → 100 分（cap 有效化）', () => {
@@ -98,9 +101,29 @@ describe('M4 3.5 预算单位统一', () => {
       expect(result).toBe(100)
     })
 
-    it('increase_budget 10% + max_daily_budget=0 → 100 分（cap 有效化）', () => {
+    it('increase_budget 10% + max_daily_budget=0：current 已超 capEffective 时保持不动', () => {
       const result = computeNewBudgetCentsOnce(1000, { type: 'increase_budget', value: 10, max_daily_budget: 0 })
-      expect(result).toBe(100)
+      expect(result).toBe(1000)
+    })
+
+    it('increase_budget 超上限不动：current=9000,max=7000 -> 9000', () => {
+      const result = computeNewBudgetCentsOnce(9000, { type: 'increase_budget', value: 10, max_daily_budget: 7000 })
+      expect(result).toBe(9000)
+    })
+
+    it('increase_budget 封顶：current=6500,max=7000,step=10 -> 7000', () => {
+      const result = computeNewBudgetCentsOnce(6500, { type: 'increase_budget', value: 10, max_daily_budget: 7000 })
+      expect(result).toBe(7000)
+    })
+
+    it('decrease_budget 下限托底（usd）：current=3600,min=3000,step=$10 -> 3000', () => {
+      const result = computeNewBudgetCentsOnce(3600, { type: 'decrease_budget', value: 10, value_unit: 'usd', min_daily_budget: 3000 })
+      expect(result).toBe(3000)
+    })
+
+    it('decrease_budget 下限以下不动：current=1000,min=3000 -> 1000', () => {
+      const result = computeNewBudgetCentsOnce(1000, { type: 'decrease_budget', value: 10, min_daily_budget: 3000 })
+      expect(result).toBe(1000)
     })
 
     it('返回值为整数（四舍五入）', () => {

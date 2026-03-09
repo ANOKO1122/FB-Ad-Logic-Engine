@@ -15,9 +15,15 @@ import {
   unifiedHeartbeatSync,
   cleanupAdSnapshots
 } from './ingestorService.js'
+import { getCircuitBreakerStatus, getLastUsageRate } from './rateLimitService.js'
 import { executeActionsForRule, executeActionsForAd, resolveNewBudgetCentsForAction } from './actionExecutorService.js'
 import { pickSingleCandidateAction, getActionPriority } from '../utils/actionPriority.js'
 import { loadDataForAccount, evaluateRuleWithCache } from './ruleEngineDispatcher.js'
+import {
+  loadRuleAdExecutionState,
+  isCooldownDue,
+  upsertRuleAdExecutionStateBatch
+} from './ruleExecutionStateService.js'
 
 // M4 Pre-Flight 刷新：执行前批量拉取 FB effective_status，解决 ad_snapshots 滞后导致误 POST
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -44,17 +50,50 @@ async function refreshEffectiveStatusForAds(adIds) {
   return result
 }
 import { syncAccountsFromFacebook } from './accountSyncService.js'
-import { runHourlyStructureFullRotation } from './structureSyncService.js'
+import { runHourlyStructureFullRotation, fastSyncStructureForAccount, collectFastSyncDataForAccount, applyMergedFastSyncPayload } from './structureSyncService.js'
+import { refreshDynamicTargetsForAccount, isDynamicScopeFeatureEnabled } from './dynamicScopeService.js'
 import { 
   insertRuleExecutionSummary, 
   sanitizeErrorMessage, 
   generateRunId 
 } from './ruleExecutionSummaryService.js'
+import { DateTime } from 'luxon'
+import pLimit from 'p-limit'
 
 // ============================================
-// AdsPolar 账户级锁机制（带超时保险丝）
+// 执行频率与执行时间（文档：执行频率与执行时间 — 适配方案）
 // ============================================
-// 锁超时时间：5分钟（如果规则执行超过5分钟，强制断开连接释放锁）
+
+/** 北京时区 */
+const ZONE_BJ = 'Asia/Shanghai'
+
+/**
+ * 判断当前北京时间是否落在规则的允许执行时间段内
+ * @param {Object} rule - 规则（含 execution_time_windows / executionTimeWindows）
+ * @param {import('luxon').DateTime} nowBJ - 当前北京时间（Luxon DateTime, zone=Asia/Shanghai）
+ * @returns {boolean} 空/NULL/非数组视为全天允许 → true
+ */
+function isInExecutionWindow(rule, nowBJ) {
+  const windows = rule.executionTimeWindows ?? rule.execution_time_windows
+  if (windows == null || !Array.isArray(windows) || windows.length === 0) return true
+  const hour = nowBJ.hour
+  const minute = nowBJ.minute
+  const second = nowBJ.second
+  const currentSec = hour * 3600 + minute * 60 + second
+  for (const w of windows) {
+    const start = w.start || ''
+    const end = w.end || ''
+    const [sh, sm, ss] = start.split(':').map(Number)
+    const [eh, em, es] = end.split(':').map(Number)
+    const startSec = (sh || 0) * 3600 + (sm || 0) * 60 + (ss || 0)
+    const endSec = (eh || 0) * 3600 + (em || 0) * 60 + (es || 0)
+    if (startSec >= endSec) continue
+    if (currentSec >= startSec && currentSec <= endSec) return true
+  }
+  return false
+}
+
+// 锁超时时间：5分钟（如果规则执行超过5分钟，强制断开连接释放锁）5分钟（如果规则执行超过5分钟，强制断开连接释放锁）
 const RULE_LOCK_TIMEOUT_MS = 5 * 60 * 1000
 
 // 执行状态跟踪（用于手动触发和状态查询）
@@ -62,6 +101,88 @@ let lastExecutionTime = null
 let lastExecutionResult = null
 /** 全局：正在执行的规则任务数（executeAllRules 与 executeSingleRule 共用），用于 409/ALREADY_RUNNING 与 UI；对外仍用 isRunning = runningCount > 0 */
 let runningCount = 0
+const dirtyRefreshBackoffUntil = new Map() // accountId -> epoch ms
+
+function getTrack2RuntimeOptionsFromEnv() {
+  const limitRaw = Number(process.env.TRACK2_FAST_SYNC_LIMIT ?? 500)
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(Math.floor(limitRaw), 500)) : 500
+  const maxPagesRaw = Number(process.env.TRACK2_FAST_SYNC_MAX_SOFT_PAGES ?? 20)
+  const maxSoftPages = Number.isFinite(maxPagesRaw) ? Math.max(1, Math.min(Math.floor(maxPagesRaw), 100)) : 20
+  const bufferRaw = Number(process.env.TRACK2_FAST_SYNC_BUFFER_SEC ?? 14400)
+  const bufferSec = Number.isFinite(bufferRaw) ? Math.max(0, Math.min(Math.floor(bufferRaw), 86400)) : 14400
+  return { limit, maxSoftPages, bufferSec }
+}
+
+/**
+ * Dirty 预检查：若 account 的 fast_dirty=1，则在规则评估前先刷新一次结构快照
+ * - 成功：清 fast_dirty，记录 fast_dirty_cleared_at
+ * - 失败：保留 dirty，并设置内存退避，避免每分钟打爆
+ */
+async function refreshStructureIfDirtyBeforeRules(accountId) {
+  const now = Date.now()
+  const backoffUntil = dirtyRefreshBackoffUntil.get(accountId) || 0
+  if (now < backoffUntil) {
+    return { attempted: false, skipped: true, reason: 'backoff' }
+  }
+
+  const [rows] = await pool.execute(
+    `SELECT fast_dirty, UNIX_TIMESTAMP(last_fast_sync_ts) AS last_fast_sync_sec
+     FROM structure_sync_status
+     WHERE account_id = ?`,
+    [accountId]
+  )
+  const row = rows?.[0]
+  const isDirty = Number(row?.fast_dirty ?? 0) === 1
+  if (!isDirty) return { attempted: false, skipped: true, reason: 'clean' }
+
+  const token = process.env.FACEBOOK_ACCESS_TOKEN
+  if (!token) {
+    dirtyRefreshBackoffUntil.set(accountId, now + 5 * 60 * 1000)
+    logger.warn(`[DirtyPreCheck] account=${accountId} dirty=1 但缺少 FACEBOOK_ACCESS_TOKEN，5分钟后重试`)
+    return { attempted: false, skipped: true, reason: 'no_token' }
+  }
+
+  const { limit, maxSoftPages, bufferSec } = getTrack2RuntimeOptionsFromEnv()
+  const nowSec = Math.floor(now / 1000)
+  const threeDaysAgoSec = nowSec - 3 * 24 * 60 * 60
+  const lastFastSyncSecRaw = row?.last_fast_sync_sec
+  const lastFastSyncSec = lastFastSyncSecRaw != null && Number.isFinite(Number(lastFastSyncSecRaw))
+    ? Number(lastFastSyncSecRaw)
+    : null
+  const sinceSec = lastFastSyncSec != null
+    ? Math.max(lastFastSyncSec - bufferSec, threeDaysAgoSec)
+    : threeDaysAgoSec
+
+  try {
+    const api = new FacebookMarketingAPI(token)
+    const result = await fastSyncStructureForAccount(accountId, api, {
+      sinceSec,
+      limit,
+      maxSoftPagesPerEdge: maxSoftPages,
+      markDirtyOnChange: false
+    })
+    if (!result?.ok) {
+      dirtyRefreshBackoffUntil.set(accountId, now + 5 * 60 * 1000)
+      logger.warn(`[DirtyPreCheck] account=${accountId} 刷新未成功 reason=${result?.reason || 'unknown'}，保留dirty并5分钟后重试`)
+      return { attempted: true, ok: false, reason: result?.reason || 'refresh_failed' }
+    }
+    await pool.execute(
+      `UPDATE structure_sync_status
+       SET fast_dirty = 0,
+           fast_dirty_cleared_at = NOW(),
+           updated_at = NOW()
+       WHERE account_id = ?`,
+      [accountId]
+    )
+    dirtyRefreshBackoffUntil.delete(accountId)
+    logger.info(`[DirtyPreCheck] account=${accountId} 刷新成功，dirty 已清空`)
+    return { attempted: true, ok: true, reason: 'refreshed' }
+  } catch (err) {
+    dirtyRefreshBackoffUntil.set(accountId, now + 5 * 60 * 1000)
+    logger.warn(`[DirtyPreCheck] account=${accountId} 刷新异常: ${err.message}，保留dirty并5分钟后重试`)
+    return { attempted: true, ok: false, reason: 'error' }
+  }
+}
 
 /**
  * AdsPolar 风格的 MySQL 锁实现（带超时保险丝）
@@ -246,15 +367,17 @@ function arbitrateByAdId(matchesPerRule) {
 }
 
 /**
- * 仲裁后按规则写摘要：同一规则可既有 executed_count/failed_count 又有 skip_details.suppressed_for_ads
+ * 仲裁后按规则写摘要：同一规则可既有 executed_count/failed_count 又有 skip_details.suppressed_for_ads / outside_execution_window
  *
  * @param {string} runId
  * @param {Array<{ rule: Object, matchedAds: Array }>} matchesPerRule
  * @param {Map<string, { winnerRule, winnerAction, matchedAd, suppressedRules }>} arbitrated
  * @param {Object} executionResultsByAd - ad_id -> { success, fail }
  * @param {string} accountId
+ * @param {Map<number, Array>} ruleToMuted - ruleId -> [{ ad_id, mute_until, mute_reason }]（Smart Mute 已移除，通常为空）
+ * @param {Map<number, Array>} ruleToOutsideWindow - ruleId -> [{ ad_id, windows }] 不在执行时间段内的广告
  */
-async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated, executionResultsByAd, accountId, ruleToMuted = new Map()) {
+async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated, executionResultsByAd, accountId, ruleToMuted = new Map(), ruleToOutsideWindow = new Map()) {
   const ruleToExecuted = new Map()   // ruleId -> { executed, failed }
   const ruleToSuppressed = new Map() // ruleId -> Array<{ ad_id, winner_rule_id }>
   for (const [adId, meta] of arbitrated) {
@@ -273,10 +396,13 @@ async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated,
     const exec = ruleToExecuted.get(rule.id) || { executed: 0, failed: 0 }
     const supp = ruleToSuppressed.get(rule.id) || []
     const muted = ruleToMuted.get(rule.id) || []
+    const outsideList = ruleToOutsideWindow.get(rule.id) || []
     const totalMatched = matchedAds.length
-    const status = supp.length > 0 && (exec.executed + exec.failed) === 0 && muted.length === 0 ? 'skipped' : (exec.executed + exec.failed > 0 ? 'matched' : muted.length > 0 ? 'skipped' : 'no_match')
-    const skipReason = muted.length > 0 ? 'muted' : (supp.length > 0 ? 'suppressed_by_priority' : (totalMatched === 0 ? 'no_match' : null))
-    const skipDetails = muted.length > 0 ? { mute_until: muted[0]?.mute_until, mute_reason: muted[0]?.mute_reason, ad_ids: muted.map(m => m.ad_id) } : (supp.length > 0 ? { suppressed_for_ads: supp } : null)
+    const status = (exec.executed + exec.failed) > 0 ? 'matched' : (outsideList.length > 0 ? 'skipped' : (supp.length > 0 ? 'skipped' : (muted.length > 0 ? 'skipped' : 'no_match')))
+    const skipReason = muted.length > 0 ? 'muted' : (outsideList.length > 0 ? 'outside_execution_window' : (supp.length > 0 ? 'suppressed_by_priority' : (totalMatched === 0 ? 'no_match' : null)))
+    const skipDetails = muted.length > 0
+      ? { mute_until: muted[0]?.mute_until, mute_reason: muted[0]?.mute_reason, ad_ids: muted.map(m => m.ad_id) }
+      : (outsideList.length > 0 ? { windows: outsideList[0]?.windows, ad_ids: outsideList.map(o => o.ad_id) } : (supp.length > 0 ? { suppressed_for_ads: supp } : null))
     await insertRuleExecutionSummary({
       runId,
       ruleId: rule.id,
@@ -300,7 +426,7 @@ async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated,
 
 /**
  * 判断规则是否作用于指定账户（与 getRuleAccountIds 口径一致：仅「有目标」的账户才适用）
- * - target_by_account[accountId] 为非空数组时返回 true；空数组视为该账户无目标，返回 false，避免无谓评估
+ * - target_by_account[accountId] 为非空数组时返回 true；空数组视为该账户无目标，返回 false，避免无谓评估与锁
  */
 function ruleAppliesToAccount(rule, accountId) {
   if (rule.accountId === accountId) return true
@@ -333,18 +459,21 @@ function getRuleAccountIds(rule) {
 /**
  * AdsPolar 流水线架构：为单个账户执行规则
  * 账户级锁 + 超时保险丝，彻底解决僵尸锁问题
- * 
+ *
  * @param {string} accountId - 广告账户ID
  * @param {Object} options - 执行选项
- * @param {boolean} options.force - 是否强制执行（忽略冷却期）
+ * @param {boolean} options.force - 是否强制执行（忽略规则级冷却，仅非调度路径有效）
+ * @param {string} [options.runId] - 运行批次 ID
+ * @param {boolean} [options.fromScheduler=false] - 是否来自「每分钟 Cron」调度；为 true 时使用广告级冷却表与执行时间段，为 false 时（含单条规则执行）不读不写 rule_ad_execution_state
  * @returns {Promise<Object>} 执行统计
- * 
- * 注意：此函数已导出，供事件驱动模式使用（数据同步完成后立即触发规则）
+ *
+ * 调度路径：仅当 fromScheduler=true（* * * * * Cron 调用）时读写 rule_ad_execution_state、做执行时间段检查。
+ * 单条规则执行走 executeSingleRule，不调用本函数，故不参与冷却表。
  */
 export async function executeRulesForAccount(accountId, options = {}) {
-  const { force = false, runId = null } = options
+  const { force = false, runId = null, fromScheduler = false } = options
   
-  // ✅ 如果没有传入 runId（事件触发场景），生成新的
+  // ✅ 如果没有传入 runId，生成新的
   const currentRunId = runId || generateRunId()
   
   // 统计信息
@@ -355,16 +484,29 @@ export async function executeRulesForAccount(accountId, options = {}) {
 
   // 使用账户级锁执行规则
   await executeRulesWithLock(accountId, async (lockedAccountId) => {
+    if (fromScheduler) {
+      await refreshStructureIfDirtyBeforeRules(lockedAccountId)
+      // TriggerA：规则调度前预检查完成后，刷新该账户动态快照（失败不阻塞执行）
+      if (isDynamicScopeFeatureEnabled()) {
+        try {
+          await refreshDynamicTargetsForAccount(lockedAccountId, { trigger: 'dirty_precheck' })
+        } catch (e) {
+          logger.warn(`[DynamicScope] trigger=dirty_precheck account=${lockedAccountId} 刷新失败(不阻塞规则执行): ${e.message}`)
+        }
+      }
+    }
+
     // 1. 从数据库获取所有启用的规则
     const enabledRules = await db
       .select()
       .from(rules)
       .where(eq(rules.enabled, true))
     
-    // 2. 过滤出满足冷却期条件的规则（强制模式下跳过冷却期检查）
-    const cooledDownRules = force 
-      ? enabledRules 
-      : enabledRules.filter(isRuleCooledDown)
+    // 调度路径（每分钟 Cron）：不做规则级冷却过滤，改用广告级冷却表
+    // 非调度路径（如历史/强制）：保留规则级冷却
+    const cooledDownRules = fromScheduler
+      ? enabledRules
+      : (force ? enabledRules : enabledRules.filter(isRuleCooledDown))
     
     // 调试日志：显示规则数量
     if (enabledRules.length === 0) {
@@ -372,26 +514,25 @@ export async function executeRulesForAccount(accountId, options = {}) {
       return
     }
     
-    if (cooledDownRules.length === 0) {
-      // 调试日志：显示冷却期过滤详情
+    if (cooledDownRules.length === 0 && !fromScheduler) {
       const neverExecuted = enabledRules.filter(r => !r.lastExecutedAt).length
       const inCooldown = enabledRules.length - neverExecuted
       logger.info(`   ⏸️  [${lockedAccountId}] 所有规则都在冷却期内，跳过执行（总规则: ${enabledRules.length}, 冷却中: ${inCooldown}, 从未执行: ${neverExecuted}）`)
-      return // 没有到期的规则，静默退出
+      return
     }
     
-    // 调试日志：显示冷却期过滤结果
-    if (enabledRules.length > cooledDownRules.length) {
+    if (cooledDownRules.length === 0) return
+    
+    if (!fromScheduler && enabledRules.length > cooledDownRules.length) {
       const skippedCount = enabledRules.length - cooledDownRules.length
       logger.info(`   📊 [${lockedAccountId}] 冷却期过滤: ${enabledRules.length} 条规则 → ${cooledDownRules.length} 条可执行（跳过 ${skippedCount} 条）`)
     }
 
-    // 调试日志：显示可执行规则数量
     if (cooledDownRules.length > 0) {
       logger.info(`   📋 [${lockedAccountId}] 找到 ${cooledDownRules.length} 条可执行规则`)
     }
 
-    // M4：只处理「作用于本账户」的规则（单账户 rule.account_id 或 多账户 target_account_ids / target_by_account）
+    // M4：只处理「作用于本账户」的规则
     const rulesForAccount = cooledDownRules.filter(r => ruleAppliesToAccount(r, lockedAccountId))
     const rulesByUser = {}
     for (const rule of rulesForAccount) {
@@ -466,7 +607,51 @@ export async function executeRulesForAccount(accountId, options = {}) {
     logger.info(`   📋 [${lockedAccountId}] M4 汇总 ${allRulesForAccount.length} 条规则，开始评估 → 仲裁 → 执行`)
 
     // 全量评估 → 按 ad_id 仲裁 → 执行（每 ad 只执行一次赢家动作）
-    const matchesPerRule = await collectAllMatchesForAccount(ruleEngine, allRulesForAccount, lockedAccountId)
+    let matchesPerRule = await collectAllMatchesForAccount(ruleEngine, allRulesForAccount, lockedAccountId)
+
+    // 调度路径：广告级冷却过滤 + 冷却表读写
+    if (fromScheduler) {
+      const nowUtc = Date.now()
+      const pairs = [] // { ruleId, scopeKey, intervalMin, rule, matchedAd }[]（调度层非预算统一用 ad: 冷却键）
+      for (const { rule, matchedAds } of matchesPerRule) {
+        const intervalMin = rule.executionIntervalMinutes ?? rule.execution_interval_minutes ?? 15
+        for (const ad of matchedAds || []) {
+          const adId = String(ad?.ad_id ?? '').trim()
+          if (!adId) continue
+          pairs.push({ ruleId: rule.id, scopeKey: `ad:${adId}`, intervalMin, rule, matchedAd: ad })
+        }
+      }
+      // 按 ruleId 分组批量查冷却表（scope_key）
+      const ruleToScopeKeys = new Map()
+      for (const p of pairs) {
+        if (!ruleToScopeKeys.has(p.ruleId)) ruleToScopeKeys.set(p.ruleId, [])
+        ruleToScopeKeys.get(p.ruleId).push(p.scopeKey)
+      }
+      const stateByRule = new Map() // ruleId -> Map(scopeKey -> last_executed_at)
+      for (const [ruleId, scopeKeys] of ruleToScopeKeys) {
+        const uniq = [...new Set(scopeKeys)]
+        const state = await loadRuleAdExecutionState(ruleId, uniq)
+        stateByRule.set(ruleId, state)
+      }
+      // 过滤：只保留冷却到期的 (rule, ad)
+      const dueByRule = new Map() // ruleId -> [matchedAd, ...]
+      for (const { ruleId, scopeKey, intervalMin, rule, matchedAd } of pairs) {
+        const lastAt = stateByRule.get(ruleId)?.get(scopeKey)
+        const diffMin = lastAt ? (nowUtc - lastAt.getTime()) / 60000 : Infinity
+        if (diffMin >= intervalMin) {
+          if (!dueByRule.has(ruleId)) dueByRule.set(ruleId, [])
+          dueByRule.get(ruleId).push(matchedAd)
+        }
+      }
+      matchesPerRule = allRulesForAccount
+        .map(rule => ({ rule, matchedAds: dueByRule.get(rule.id) || [] }))
+        .filter(m => m.matchedAds.length > 0)
+      if (matchesPerRule.length === 0) {
+        logger.info(`   ⏸️  [${lockedAccountId}] 广告级冷却：无到期匹配，跳过仲裁与执行`)
+        return
+      }
+    }
+
     const arbitrated = arbitrateByAdId(matchesPerRule)
 
     // M4 Pre-Flight 刷新：对 pause/activate 且非 Dry Run 的广告，批量拉取 FB effective_status
@@ -488,19 +673,35 @@ export async function executeRulesForAccount(accountId, options = {}) {
     }
 
     const executionResultsByAd = {}
-    const ruleToMuted = new Map()  // M4 Smart Mute: ruleId -> [{ ad_id, mute_until, mute_reason }]
-    let budgetApi = null  // M4 3.2 预算幂等：按需创建，预计算 newBudgetCents 时只 GET 一次
+    const ruleToMuted = new Map()  // 保留结构，Smart Mute 已移除，不再写入
+    const ruleToOutsideWindow = new Map()  // ruleId -> [{ ad_id, windows }]
+    const stateUpdates = []  // 调度路径：{ ruleId, scopeKey, lastStatus }[]
+    let budgetApi = null
     for (const [adId, meta] of arbitrated) {
-      const mu = meta.matchedAd?.mute_until
-      if (mu != null && new Date() < new Date(mu)) {
-        logger.info(`   🔇 [${lockedAccountId}] 广告 ${adId} 处于 mute 期 (until ${mu})，跳过`)
-        const list = ruleToMuted.get(meta.winnerRule.id) || []
-        list.push({ ad_id: adId, mute_until: mu, mute_reason: meta.matchedAd?.mute_reason || null })
-        ruleToMuted.set(meta.winnerRule.id, list)
-        executionResultsByAd[adId] = { success: 0, fail: 0 }
-        continue
+      // 调度路径：执行时间段检查（文档 §4.2）
+      if (fromScheduler) {
+        const nowBJ = DateTime.utc().setZone(ZONE_BJ)
+        const inWindow = isInExecutionWindow(meta.winnerRule, nowBJ)
+        const triggeredRulesForAd = [meta.winnerRule, ...(meta.suppressedRules || [])]
+        if (!inWindow) {
+          logger.info(`   🕐 [${lockedAccountId}] 广告 ${adId} 不在执行时间段内，跳过执行`)
+          executionResultsByAd[adId] = { success: 0, fail: 0 }
+          const list = ruleToOutsideWindow.get(meta.winnerRule.id) || []
+          list.push({ ad_id: adId, windows: meta.winnerRule.executionTimeWindows ?? meta.winnerRule.execution_time_windows })
+          ruleToOutsideWindow.set(meta.winnerRule.id, list)
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'outside_window' })
+          for (const r of meta.suppressedRules || []) {
+            stateUpdates.push({ ruleId: r.id, scopeKey: `ad:${adId}`, lastStatus: 'suppressed' })
+          }
+          continue
+        }
+        // 在执行时间段内：suppressed 先写入；winner 状态在执行完后按结果写入
+        for (const r of meta.suppressedRules || []) {
+          stateUpdates.push({ ruleId: r.id, scopeKey: `ad:${adId}`, lastStatus: 'suppressed' })
+        }
       }
-      // M4 3.2 预算幂等：预算类动作在调用方预计算一次 newBudgetCents，传 action 副本 _resolvedBudgetCents，重试时执行层不再 GET
+
+      // M4 3.2 预算幂等：预算类动作在调用方预计算一次 newBudgetCents
       let actionToPass = meta.winnerAction
       const isBudgetAction = actionToPass && ['increase_budget', 'decrease_budget', 'set_budget'].includes(actionToPass.type)
       const isSim = meta.winnerRule?.isSimulation ?? meta.winnerRule?.is_simulation ?? false
@@ -517,8 +718,9 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
       let success = 0
       let fail = 0
+      let results = []
       try {
-        const results = await executeActionsForAd({
+        results = await executeActionsForAd({
           rule: meta.winnerRule,
           matchedAd: meta.matchedAd,
           accountId: lockedAccountId,
@@ -539,13 +741,31 @@ export async function executeRulesForAccount(accountId, options = {}) {
         logger.error(`   ❌ [${lockedAccountId}] ad ${adId} 执行失败:`, err.message)
       }
       executionResultsByAd[adId] = { success, fail }
+      if (fromScheduler) {
+        // 使用执行层返回的 cooldownKey（预算为 budget_adset:/budget_campaign:，否则 ad:）；所有 skipped（含 Pre-Flight、预算幂等、FB already in state）均按 success 占冷却
+        const statusForCooldown = fail > 0 ? 'fail' : 'success'
+        const cooldownKey = (Array.isArray(results) && results[0]?.cooldownKey) ? results[0].cooldownKey : `ad:${adId}`
+        // 精细冷却：按预算目标节点或广告本身
+        stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: statusForCooldown })
+        // 粗粒度冷却：始终为当前广告写一条 ad: 冷却，供下轮 Cron 过滤使用
+        const adScopeKey = `ad:${adId}`
+        if (adScopeKey !== cooldownKey) {
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: adScopeKey, lastStatus: statusForCooldown })
+        }
+      }
     }
 
-    await writeSummariesAfterArbitration(currentRunId, matchesPerRule, arbitrated, executionResultsByAd, lockedAccountId, ruleToMuted)
+    await writeSummariesAfterArbitration(currentRunId, matchesPerRule, arbitrated, executionResultsByAd, lockedAccountId, ruleToMuted, ruleToOutsideWindow)
 
-    // 评估即冷却：本轮被评估的规则都更新 last_executed_at
-    for (const rule of allRulesForAccount) {
-      await updateRuleLastExecutedAt(rule.id)
+    // 调度路径：写入规则×广告冷却表；不更新 rules.last_executed_at（冷却由冷却表负责）
+    if (fromScheduler && stateUpdates.length > 0) {
+      await upsertRuleAdExecutionStateBatch(stateUpdates)
+    }
+    // 非调度路径：评估即冷却，更新规则级 last_executed_at
+    if (!fromScheduler) {
+      for (const rule of allRulesForAccount) {
+        await updateRuleLastExecutedAt(rule.id)
+      }
     }
 
     const noMatchCount = matchesPerRule.filter(m => !m.matchedAds || m.matchedAds.length === 0).length
@@ -590,6 +810,7 @@ export async function executeSingleRule(rule, options = {}) {
       errorMessage: null,
       lockSkippedAccounts: []
     }
+    const perAccountSummaries = []
 
     for (const accountId of accountIds) {
       const oneResult = await executeRulesWithLock(accountId, async (lockedAccountId) => {
@@ -613,7 +834,10 @@ export async function executeSingleRule(rule, options = {}) {
         }
         let matchedAds = []
         try {
-          matchedAds = await ruleEngine.evaluateRule(ruleToEval, lockedAccountId)
+          // 单条执行与调度执行统一走 Dispatcher：
+          // 目标集合来源与口径保持一致（含 use_dynamic_scope=1 时从 rule_matched_objects 读取）
+          const loadResult = await loadDataForAccount(lockedAccountId, [ruleToEval], ruleEngine)
+          matchedAds = evaluateRuleWithCache(ruleEngine, ruleToEval, loadResult)
         } catch (err) {
           summary.status = 'error'
           summary.skipReason = 'error'
@@ -687,6 +911,7 @@ export async function executeSingleRule(rule, options = {}) {
         aggregated.lockSkippedAccounts.push(accountId)
         continue
       }
+      perAccountSummaries.push(oneResult.summary)
       aggregated.matchedCount += oneResult.matched_count || 0
       aggregated.executedCount += oneResult.executed_count || 0
       aggregated.failedCount += oneResult.failed_count || 0
@@ -695,7 +920,9 @@ export async function executeSingleRule(rule, options = {}) {
       else if (oneResult.status === 'error') aggregated.status = 'error'
       else if (oneResult.status === 'matched' || oneResult.status === 'skipped') aggregated.status = oneResult.status
     }
-
+    for (const s of perAccountSummaries) {
+      await insertRuleExecutionSummary(s)
+    }
     const summary = {
       runId,
       ruleId: rule.id,
@@ -731,148 +958,6 @@ export async function executeSingleRule(rule, options = {}) {
 }
 
 /**
- * 执行所有账户的规则（用于手动触发或批量执行）
- * AdsPolar 模式：账户级并发，每个账户独立锁
- * 
- * @param {Object} options - 执行选项
- * @param {boolean} options.force - 是否强制执行（忽略冷却期）
- * @param {Array<string>} options.accountIds - 指定账户ID列表（可选，不指定则执行所有账户）
- * @param {number} options.ownerId - 负责人ID（可选）；传入时只执行该负责人下的账户（用于非 admin 用户「立即运行所有规则」）
- */
-export async function executeAllRules(options = {}) {
-  const { force = false, accountIds = null, ownerId = null } = options
-
-  if (runningCount > 0) {
-    logger.info('⚠️  规则正在执行中，跳过本次 executeAllRules（由路由返回 409）')
-    return
-  }
-
-  runningCount++
-  const runId = generateRunId()
-  logger.info(`🆔 本次规则执行 run_id: ${runId}`)
-  const startTime = Date.now()
-
-  try {
-    // 1. 获取目标账户列表
-    let targetAccountIds = accountIds
-    if (!targetAccountIds) {
-      // 优化：先查询所有启用的规则，分析哪些账户需要执行
-      const enabledRules = await db
-        .select()
-        .from(rules)
-        .where(eq(rules.enabled, true))
-      
-      // 获取所有规则指定的账户ID（去重）
-      const ruleAccountIds = [...new Set(
-        enabledRules
-          .map(rule => rule.accountId)
-          .filter(id => id != null)
-      )]
-      
-      if (ruleAccountIds.length > 0) {
-        // 如果规则指定了账户，只在这些账户上执行（性能优化）
-        const placeholders = ruleAccountIds.map(() => '?').join(',')
-        const [rows] = await pool.execute(
-          `SELECT DISTINCT fb_account_id FROM account_mappings 
-           WHERE is_active = 1 AND fb_account_id IN (${placeholders})`,
-          ruleAccountIds
-        )
-        targetAccountIds = rows.map(row => row.fb_account_id)
-        logger.info(`📊 规则分析: ${enabledRules.length} 条规则，${ruleAccountIds.length} 个指定账户，${targetAccountIds.length} 个活跃账户需要执行`)
-      } else {
-        // 如果规则没有指定账户，在所有账户上执行
-        const [rows] = await pool.execute(
-          `SELECT DISTINCT fb_account_id FROM account_mappings WHERE is_active = 1`
-        )
-        targetAccountIds = rows.map(row => row.fb_account_id)
-        logger.info(`📊 规则分析: ${enabledRules.length} 条规则，未指定账户，在所有 ${targetAccountIds.length} 个账户上执行`)
-      }
-    }
-
-    if (targetAccountIds.length === 0) {
-      logger.info('⚠️  没有找到活跃账户，跳过规则执行')
-      return
-    }
-
-    // 方案B：非 admin 只跑自己负责人下的账户
-    if (ownerId != null) {
-      const placeholders = targetAccountIds.map(() => '?').join(',')
-      const [rows] = await pool.execute(
-        `SELECT fb_account_id FROM account_mappings 
-         WHERE is_active = 1 AND owner_id = ? AND fb_account_id IN (${placeholders})`,
-        [ownerId, ...targetAccountIds]
-      )
-      targetAccountIds = rows.map(row => row.fb_account_id)
-      logger.info(`📋 按负责人过滤: owner_id=${ownerId}，执行 ${targetAccountIds.length} 个账户`)
-    }
-
-    if (targetAccountIds.length === 0) {
-      logger.info('⚠️  该负责人下没有活跃账户，跳过规则执行')
-      return
-    }
-
-    logger.info('')
-    logger.info('='.repeat(50))
-    logger.info(`🔄 开始执行${force ? '【强制】' : '定时'}规则任务（AdsPolar 账户级锁模式）`)
-    logger.info('⏰ 执行时间:', new Date().toLocaleString('zh-CN'))
-    logger.info('📊 数据源: 数据库（ad_snapshots + daily_stats）')
-    logger.info(`📋 目标账户: ${targetAccountIds.length} 个`)
-    logger.info('='.repeat(50))
-
-    // 2. 并发执行所有账户的规则（账户级锁保证不会冲突）
-    const results = await Promise.allSettled(
-      targetAccountIds.map(accountId => executeRulesForAccount(accountId, { force, runId }))
-    )
-
-    // 3. 统计结果
-    let totalMatched = 0
-    let totalExecuted = 0
-    let totalSkipped = 0
-    let totalErrors = 0
-
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        const stats = result.value
-        totalMatched += stats.matched
-        totalExecuted += stats.executed
-        totalSkipped += stats.skipped
-        totalErrors += stats.errors
-      } else {
-        logger.error(`❌ 账户 ${targetAccountIds[index]} 规则执行失败:`, result.reason?.message)
-        totalErrors++
-      }
-    })
-
-    const duration = Date.now() - startTime
-    logger.info('')
-    logger.info('='.repeat(50))
-    logger.info(`✅ 规则执行完成（AdsPolar 账户级锁模式）`)
-    logger.info(`📊 统计:`)
-    logger.info(`   - 匹配广告: ${totalMatched} 个`)
-    logger.info(`   - 执行规则: ${totalExecuted} 条（有匹配广告）`)
-    logger.info(`   - 跳过规则: ${totalSkipped} 条（无匹配广告）`)
-    logger.info(`   - 错误: ${totalErrors} 次`)
-    logger.info(`⏱️  耗时: ${duration}ms`)
-    logger.info('='.repeat(50))
-    logger.info('')
-
-    lastExecutionTime = new Date()
-    lastExecutionResult = { 
-      totalMatched, 
-      totalExecuted, 
-      totalSkipped, 
-      totalErrors, 
-      durationMs: duration 
-    }
-  } catch (error) {
-    logger.error('❌ 规则执行失败:', error)
-    logger.error('❌ 错误堆栈:', error.stack)
-  } finally {
-    runningCount = Math.max(0, runningCount - 1)
-  }
-}
-
-/**
  * 启动定时任务（AdsPolar 流水线架构）
  * - 采用 AdsPolar 模式：数据同步完成后触发规则执行（链式反应）
  * - 每 15 分钟执行一次数据同步，同步完成后立即触发规则执行
@@ -880,49 +965,82 @@ export async function executeAllRules(options = {}) {
  * - 零空转：只有数据更新了，规则才执行
  */
 export function startCronJob() {
+  const enableTrack2FastSync = process.env.ENABLE_TRACK2_FAST_SYNC === '1' || process.env.ENABLE_TRACK2_FAST_SYNC === 'true'
+  const enableUnifiedStructureBatch = process.env.ENABLE_UNIFIED_STRUCTURE_BATCH === '1' || process.env.ENABLE_UNIFIED_STRUCTURE_BATCH === 'true'
+  const track2AccountWhitelist = String(process.env.TRACK2_FAST_SYNC_ACCOUNT_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+  const track2ConcurrencyRaw = Number(process.env.TRACK2_FAST_SYNC_CONCURRENCY ?? 3)
+  const track2Concurrency = Number.isFinite(track2ConcurrencyRaw) ? Math.max(1, Math.min(Math.floor(track2ConcurrencyRaw), 10)) : 3
+  const track2LimitRaw = Number(process.env.TRACK2_FAST_SYNC_LIMIT ?? 500)
+  const track2Limit = Number.isFinite(track2LimitRaw) ? Math.max(1, Math.min(Math.floor(track2LimitRaw), 500)) : 500
+  const track2MaxPagesRaw = Number(process.env.TRACK2_FAST_SYNC_MAX_SOFT_PAGES ?? 20)
+  const track2MaxSoftPages = Number.isFinite(track2MaxPagesRaw) ? Math.max(1, Math.min(Math.floor(track2MaxPagesRaw), 100)) : 20
+  const track2BufferRaw = Number(process.env.TRACK2_FAST_SYNC_BUFFER_SEC ?? 14400)
+  const track2BufferSec = Number.isFinite(track2BufferRaw) ? Math.max(0, Math.min(Math.floor(track2BufferRaw), 86400)) : 14400
+  const track2UsageSkipRaw = Number(process.env.TRACK2_FAST_SYNC_USAGE_SKIP_THRESHOLD ?? 85)
+  const track2UsageSkipThreshold = Number.isFinite(track2UsageSkipRaw)
+    ? Math.max(1, Math.min(Math.floor(track2UsageSkipRaw), 99))
+    : 85
+  const track2MergedUpsert = process.env.TRACK2_FAST_SYNC_MERGED_UPSERT !== '0' && process.env.TRACK2_FAST_SYNC_MERGED_UPSERT !== 'false'
+
   logger.info('')
   logger.info('='.repeat(50))
   logger.info('⏰ 启动定时任务服务（AdsPolar 流水线架构）')
   logger.info('📅 任务列表:')
-  logger.info('  1. 统一心跳: 每 15 分钟 (Cron: */15 * * * *) [数据同步 → 规则执行]')
+  logger.info('  1. 统一心跳: 每 15 分钟 (Cron: */15 * * * *) [仅数据同步 + 归档，规则由「每分钟 Cron」驱动]')
   logger.info('     - 数据同步: 根据账户时区自动选择 Today/last_3d/last_7d/last_14d')
   logger.info('     - 双窗口归档: ≥02:00 ARCHIVED，≥12:00 FINALIZED')
-  logger.info('     - 规则执行: 数据同步完成后触发（账户级锁，并发执行）')
-  logger.info('  2. 账户列表同步: 每小时 (Cron: 0 * * * *) [从 FB 同步账户到 DB]')
-  logger.info('  3. 结构全量轮转: 每小时 (Cron: 5 * * * *) [默认 6 账户，并发 1，usage 高跳过]')
-  logger.info('  4. 热表清理: 每日 04:00 (Cron: 0 4 * * *) [删除 ad_snapshots 超过 2 天的快照]')
+  logger.info('     - 规则执行: 不再由心跳触发，改由「每分钟规则 Cron」统一驱动')
+  logger.info('  2. 规则执行: 每分钟 (Cron: * * * * *) [广告级冷却 + 执行时间段，rule_ad_execution_state]')
+  logger.info('  3. 账户列表同步: 每小时 (Cron: 0 * * * *) [从 FB 同步账户到 DB]')
+  logger.info(`  4. Track2 Fast Sync: 每小时 3 次 (Cron: 7,27,52 * * * *) [flag=${enableTrack2FastSync ? 'on' : 'off'}, 并发=${track2Concurrency}, 白名单=${track2AccountWhitelist.length}, bufferSec=${track2BufferSec}, usageSkip>=${track2UsageSkipThreshold}%, mergedUpsert=${track2MergedUpsert ? 'on' : 'off'}]`)
+  logger.info(`  5. Track1 结构轮转（近3天）: 每小时 :12 (Cron: 12 * * * *) [每次 6 账户，账户并发 5，usage 高跳过，unifiedBatch=${enableUnifiedStructureBatch ? 'on' : 'off'}]`)
+  logger.info('  6. 热表清理: 每日 04:00 (Cron: 0 4 * * *) [删除 ad_snapshots 超过 2 天的快照]')
   logger.info('')
   logger.info('🔒 锁机制: 账户级锁（rule:account:xxx）+ 5分钟超时保险丝')
   logger.info('⚡ 优势: 零空转、高并发、无僵尸锁')
   logger.info('='.repeat(50))
   logger.info('')
 
-  // 1. 统一心跳：每 15 分钟执行一次（AdsPolar 流水线架构）
-  // 数据同步完成后，立即触发规则执行（链式反应）
+  // 规则执行：每分钟执行（文档：执行频率与执行时间 — 适配方案 §4.1）
+  const ruleCronLimit = pLimit(4)
+  cron.schedule('* * * * *', async () => {
+    if (runningCount > 0) return
+    try {
+      const [rows] = await pool.execute(
+        `SELECT DISTINCT fb_account_id FROM account_mappings WHERE is_active = 1 ORDER BY fb_account_id`
+      )
+      const accountIds = (rows || []).map(r => r.fb_account_id).filter(Boolean)
+      if (accountIds.length === 0) return
+      await Promise.all(
+        accountIds.map(accountId =>
+          ruleCronLimit(() => executeRulesForAccount(accountId, { fromScheduler: true }))
+        )
+      )
+    } catch (err) {
+      logger.error('❌ 每分钟规则 Cron 失败:', err.message)
+    }
+  })
+
+  // 1. 统一心跳：每 15 分钟（仅数据同步 + 归档，不触发规则）
+  // 1. 统一心跳：每 15 分钟（仅数据同步 + 归档；规则执行由「每分钟 Cron」驱动）
   cron.schedule('*/15 * * * *', async () => {
     try {
-      // 执行数据同步
       const syncResult = await unifiedHeartbeatSync()
-      
-      // AdsPolar 事件驱动优化：规则执行已在数据同步时触发（顺手触发模式）
-      // 这里不再需要批量触发，因为每个账户同步完成后已经立即触发了规则执行
-      // 保留此逻辑作为兜底机制（如果事件驱动失败，可以手动触发）
       if (syncResult && syncResult.syncedAccountIds && syncResult.syncedAccountIds.length > 0) {
         logger.info('')
         logger.info('='.repeat(50))
-        logger.info('✅ 数据同步完成（规则执行已在同步时触发，AdsPolar 事件驱动模式）')
+        logger.info('✅ 数据同步完成（规则由每分钟 Cron 独立驱动）')
         logger.info(`📋 有数据更新的账户: ${syncResult.syncedAccountIds.length} 个`)
         logger.info('='.repeat(50))
         logger.info('')
-        
-        // 注意：规则执行已在数据同步时通过事件驱动模式触发
-        // 这里不再批量执行，避免重复执行和资源浪费
-        // 如果需要批量执行，可以使用 executeAllRules({ accountIds: syncResult.syncedAccountIds })
       } else {
         if (syncResult && syncResult.skipped) {
-          logger.info(`⚠️  统一心跳被跳过（原因: ${syncResult.skipReason}），跳过规则执行`)
+          logger.info(`⚠️  统一心跳被跳过（原因: ${syncResult.skipReason}）`)
         } else {
-          logger.info('⚠️  没有账户有数据更新，跳过规则执行（零空转）')
+          logger.info('⚠️  没有账户有数据更新')
         }
       }
     } catch (error) {
@@ -930,7 +1048,127 @@ export function startCronJob() {
     }
   })
 
-  // 6. 每小时同步一次账户列表（从 FB API 同步到 account_mappings）
+  // 4. Track2 Fast Sync（灰度）：每小时 :07/:27/:52 执行（避开 :45 热数据同步）
+  // 默认关闭（ENABLE_TRACK2_FAST_SYNC=false）。可配白名单账户，避免直接全量。
+  cron.schedule('7,27,52 * * * *', async () => {
+    if (!enableTrack2FastSync) return
+
+    const token = process.env.FACEBOOK_ACCESS_TOKEN
+    if (!token) {
+      logger.warn('[Track2 FastSync] 跳过：FACEBOOK_ACCESS_TOKEN 缺失')
+      return
+    }
+    const breakerStatus = getCircuitBreakerStatus()
+    if (breakerStatus?.isLocked) {
+      logger.info('[Track2 FastSync] 跳过：Token 熔断中')
+      return
+    }
+    const usage = getLastUsageRate()
+    if (usage != null && Number.isFinite(Number(usage)) && Number(usage) >= track2UsageSkipThreshold) {
+      logger.info(`[Track2 FastSync] 跳过：API 使用率 ${Number(usage)}% >= ${track2UsageSkipThreshold}%`)
+      return
+    }
+
+    try {
+      const [rows] = await pool.execute(
+        `SELECT DISTINCT fb_account_id FROM account_mappings WHERE is_active = 1 ORDER BY fb_account_id`
+      )
+      let accountIds = (rows || []).map(r => String(r.fb_account_id || '').trim()).filter(Boolean)
+      if (track2AccountWhitelist.length > 0) {
+        const whiteSet = new Set(track2AccountWhitelist)
+        accountIds = accountIds.filter(id => whiteSet.has(id))
+      }
+      if (accountIds.length === 0) {
+        logger.info('[Track2 FastSync] 本轮无可执行账户，跳过')
+        return
+      }
+
+      const api = new FacebookMarketingAPI(token)
+      const accountLimit = pLimit(track2Concurrency)
+      const nowSec = Math.floor(Date.now() / 1000)
+      const threeDaysAgoSec = nowSec - 3 * 24 * 60 * 60
+
+      logger.info(`[Track2 FastSync] 开始：accounts=${accountIds.length}, concurrency=${track2Concurrency}, limit=${track2Limit}, maxSoftPages=${track2MaxSoftPages}`)
+
+      const results = await Promise.all(accountIds.map((accountId) =>
+        accountLimit(async () => {
+          let sinceSec = threeDaysAgoSec
+          let lastFastSyncSec = null
+          try {
+            const [statusRows] = await pool.execute(
+              `SELECT COALESCE(UNIX_TIMESTAMP(last_fast_sync_ts), UNIX_TIMESTAMP(last_success_at)) AS last_fast_sync_sec
+               FROM structure_sync_status
+               WHERE account_id = ?`,
+              [accountId]
+            )
+            const lastFastSyncSecRaw = statusRows[0]?.last_fast_sync_sec
+            lastFastSyncSec = lastFastSyncSecRaw != null && Number.isFinite(Number(lastFastSyncSecRaw))
+              ? Number(lastFastSyncSecRaw)
+              : null
+            if (lastFastSyncSec != null) {
+              sinceSec = Math.max(lastFastSyncSec - track2BufferSec, threeDaysAgoSec)
+            }
+          } catch (err) {
+            logger.warn(`[Track2 FastSync] account=${accountId} 读取上次同步时间失败，回退3天窗口: ${err.message}`)
+          }
+
+          logger.info(
+            `[Track2 FastSync] account=${accountId} nowSec=${nowSec} threeDaysAgoSec=${threeDaysAgoSec} `
+            + `lastFastSyncSec=${lastFastSyncSec ?? 'null'} bufferSec=${track2BufferSec} sinceSec=${sinceSec}`
+          )
+
+          try {
+            if (track2MergedUpsert) {
+              const collected = await collectFastSyncDataForAccount(accountId, api, {
+                sinceSec,
+                limit: track2Limit,
+                maxSoftPagesPerEdge: track2MaxSoftPages
+              })
+              if (!collected?.ok) {
+                return { accountId, ok: false, reason: collected?.reason || 'collect_failed', synced_ads: 0, collected: null }
+              }
+              return {
+                accountId,
+                ok: true,
+                reason: null,
+                synced_ads: Array.isArray(collected.ads) ? collected.ads.length : 0,
+                collected
+              }
+            }
+
+            const result = await fastSyncStructureForAccount(accountId, api, {
+              sinceSec,
+              limit: track2Limit,
+              maxSoftPagesPerEdge: track2MaxSoftPages
+            })
+            return { accountId, ok: !!result?.ok, reason: result?.reason || null, synced_ads: result?.synced_ads || 0, collected: null }
+          } catch (err) {
+            logger.warn(`[Track2 FastSync] account=${accountId} 执行失败: ${err.message}`)
+            return { accountId, ok: false, reason: 'error', synced_ads: 0, collected: null }
+          }
+        })
+      ))
+
+      if (track2MergedUpsert) {
+        const collectedPayloads = results.map(r => r.collected).filter(Boolean)
+        if (collectedPayloads.length > 0) {
+          const mergedResult = await applyMergedFastSyncPayload(collectedPayloads, { markDirtyOnChange: true, chunkSize: 300 })
+          logger.info(
+            `[Track2 FastSync] mergedUpsert 完成：accounts=${mergedResult.accounts}, campaigns=${mergedResult.campaigns}, adsets=${mergedResult.adsets}, ads=${mergedResult.ads}, dirtyMarked=${mergedResult.dirtyMarked}`
+          )
+        }
+      }
+
+      const successCount = results.filter(r => r.ok).length
+      const lockBusyCount = results.filter(r => r.reason === 'lock_busy').length
+      const adsTouched = results.reduce((sum, r) => sum + (Number(r.synced_ads) || 0), 0)
+      logger.info(`[Track2 FastSync] 完成：success=${successCount}/${results.length}, lock_busy=${lockBusyCount}, synced_ads=${adsTouched}`)
+    } catch (err) {
+      logger.error('[Track2 FastSync] 任务失败:', err.message)
+    }
+  })
+
+  // 6. 每小时同步一次账户列表
   cron.schedule('0 * * * *', async () => {
     logger.info('')
     logger.info('='.repeat(50))
@@ -964,17 +1202,28 @@ export function startCronJob() {
     }
   })
 
-  // 7. 每小时结构全量轮转（P1，让路 P0；usage 高/熔断时本小时跳过；并发 1）
-  cron.schedule('5 * * * *', async () => {
+  // 7. Track1 结构轮转（近3天）：每小时 :12 执行，每次最多 6 个账户（P1，让路 P0；usage 高/熔断时跳过；账户并发 5）
+  // 通过环境变量 PAUSE_STRUCTURE_SYNC=1 可暂停，便于补数/限流恢复后再开启
+  cron.schedule('12 * * * *', async () => {
+    if (process.env.PAUSE_STRUCTURE_SYNC === '1' || process.env.PAUSE_STRUCTURE_SYNC === 'true') {
+      logger.info('[结构轮转] 已暂停（PAUSE_STRUCTURE_SYNC=1），跳过')
+      return
+    }
     const token = process.env.FACEBOOK_ACCESS_TOKEN
     if (!token) return
     try {
       const api = new FacebookMarketingAPI(token)
-      const result = await runHourlyStructureFullRotation(api)
+      const result = await runHourlyStructureFullRotation(api, {
+        maxAccounts: 6,
+        accountConcurrency: 5,
+        useUnifiedBatch: enableUnifiedStructureBatch,
+        unifiedLimit: track2Limit,
+        unifiedMaxSoftPages: track2MaxSoftPages
+      })
       if (result.skipped) {
-        logger.info(`[结构轮转] 本小时跳过: ${result.reason}`)
+        logger.info(`[结构轮转] 本轮跳过: ${result.reason}`)
       } else if (result.synced > 0) {
-        logger.info(`[结构轮转] 本小时完成: ${result.synced} 个账户`)
+        logger.info(`[结构轮转] 本轮完成: ${result.synced} 个账户`)
       }
     } catch (err) {
       logger.warn('[结构轮转] 失败:', err.message)
@@ -995,15 +1244,14 @@ export async function stopCronJob() {
 }
 
 /**
- * 手动触发规则执行（用于测试 / 规则页「立即运行所有规则」）
- * @param {boolean} force - 是否强制执行（忽略冷却期），默认 true
- * @param {Object} options - 可选
- * @param {number} options.ownerId - 传入时只执行该负责人下的账户（非 admin 用户传 req.user.owner_id）
+ * 已移除：规则改由「每分钟 Cron」统一驱动，不再提供「立即运行所有规则」入口（文档：执行频率与执行时间 — 适配方案 §7）
  */
-export async function manualExecute(force = true, options = {}) {
-  const { ownerId } = options
-  logger.info(`🔧 手动触发规则执行（${force ? '强制模式' : '正常模式'}${ownerId != null ? `，仅负责人 ${ownerId} 的账户` : ''}）`)
-  await executeAllRules({ force, ownerId: ownerId ?? null })
+export async function manualExecute(_force = true, _options = {}) {
+  logger.info('⚠️  manualExecute 已废弃（规则由每分钟 Cron 驱动），忽略调用')
+}
+
+export async function executeAllRules(_options = {}) {
+  logger.info('⚠️  executeAllRules 已废弃（规则由每分钟 Cron 驱动），忽略调用')
 }
 
 export function getCronStatus() {

@@ -35,6 +35,7 @@ import {
   resolveStructureByIds
 } from './services/structureSyncService.js'
 import { assertAccountAccess, hasAccountAccess } from './utils/accountAccess.js'
+import pLimit from 'p-limit'
 import {
   normalizeConditionsToV2,
   getAllConditionsFromV2,
@@ -89,6 +90,89 @@ async function detectProxyProtocol(host, port) {
 const FACEBOOK_API_VERSION = 'v24.0'
 const FACEBOOK_API_BASE = `https://graph.facebook.com/${FACEBOOK_API_VERSION}`
 
+// FB 全局请求调度：优先级 + 并发上限 + 排队超时监控
+const FB_PRIORITY_LEVEL = {
+  action: 1, // 规则动作（pause/activate/预算更新）最高优先
+  today: 2,  // Today 热数据
+  track2: 3, // 结构同步
+  cold: 4    // 冷数据/归档/异步报表
+}
+const FB_GLOBAL_REQUEST_CONCURRENCY_RAW = Number(process.env.FB_GLOBAL_REQUEST_CONCURRENCY ?? 10)
+const FB_GLOBAL_REQUEST_CONCURRENCY = Number.isFinite(FB_GLOBAL_REQUEST_CONCURRENCY_RAW)
+  ? Math.max(1, Math.min(Math.floor(FB_GLOBAL_REQUEST_CONCURRENCY_RAW), 50))
+  : 10
+const FB_GLOBAL_QUEUE_TIMEOUT_MS_RAW = Number(process.env.FB_GLOBAL_QUEUE_TIMEOUT_MS ?? 30000)
+const FB_GLOBAL_QUEUE_TIMEOUT_MS = Number.isFinite(FB_GLOBAL_QUEUE_TIMEOUT_MS_RAW)
+  ? Math.max(1000, Math.min(Math.floor(FB_GLOBAL_QUEUE_TIMEOUT_MS_RAW), 120000))
+  : 30000
+
+let fbQueueSeq = 0
+let fbRunningCount = 0
+const fbPendingQueue = []
+
+function normalizeFbPriority(priority) {
+  if (typeof priority === 'string') return FB_PRIORITY_LEVEL[priority] ?? FB_PRIORITY_LEVEL.track2
+  if (Number.isFinite(Number(priority))) return Math.max(1, Math.min(Math.floor(Number(priority)), 9))
+  return FB_PRIORITY_LEVEL.track2
+}
+
+function drainFbQueue() {
+  while (fbRunningCount < FB_GLOBAL_REQUEST_CONCURRENCY && fbPendingQueue.length > 0) {
+    fbPendingQueue.sort((a, b) => (a.priority - b.priority) || (a.seq - b.seq))
+    const task = fbPendingQueue.shift()
+    if (!task || task.cancelled) continue
+
+    task.started = true
+    if (task.timeoutHandle) clearTimeout(task.timeoutHandle)
+    fbRunningCount += 1
+
+    const waitMs = Date.now() - task.enqueuedAt
+    if (waitMs >= 3000 || task.priority === FB_PRIORITY_LEVEL.action) {
+      logger.info(`[FBQueue] 开始执行 label=${task.label} priority=${task.priority} wait_ms=${waitMs} running=${fbRunningCount}/${FB_GLOBAL_REQUEST_CONCURRENCY} pending=${fbPendingQueue.length}`)
+    }
+
+    Promise.resolve()
+      .then(task.run)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        fbRunningCount = Math.max(0, fbRunningCount - 1)
+        drainFbQueue()
+      })
+  }
+}
+
+function enqueueFacebookRequest({ priority, label, queueTimeoutMs }, run) {
+  return new Promise((resolve, reject) => {
+    const task = {
+      seq: ++fbQueueSeq,
+      priority: normalizeFbPriority(priority),
+      label: label || 'fb_request',
+      enqueuedAt: Date.now(),
+      queueTimeoutMs: Number.isFinite(Number(queueTimeoutMs)) ? Math.max(1000, Math.min(Math.floor(Number(queueTimeoutMs)), 120000)) : FB_GLOBAL_QUEUE_TIMEOUT_MS,
+      run,
+      resolve,
+      reject,
+      started: false,
+      cancelled: false,
+      timeoutHandle: null
+    }
+
+    task.timeoutHandle = setTimeout(() => {
+      if (task.started || task.cancelled) return
+      task.cancelled = true
+      const idx = fbPendingQueue.findIndex(t => t.seq === task.seq)
+      if (idx >= 0) fbPendingQueue.splice(idx, 1)
+      const waitMs = Date.now() - task.enqueuedAt
+      logger.warn(`[FBQueue] 排队超时 label=${task.label} priority=${task.priority} wait_ms=${waitMs} queue_timeout_ms=${task.queueTimeoutMs}`)
+      reject(new Error(`FB queue timeout before request start (${waitMs}ms)`))
+      drainFbQueue()
+    }, task.queueTimeoutMs)
+
+    fbPendingQueue.push(task)
+    drainFbQueue()
+  })
+}
+
 // Facebook API 客户端类
 class FacebookMarketingAPI {
   constructor(accessToken) {
@@ -110,7 +194,10 @@ class FacebookMarketingAPI {
     if (after) params.after = after
     if (filtering) params.filtering = JSON.stringify(filtering)
 
-    const data = await this.makeRequest(url, params, 'GET')
+    const data = await this.makeRequest(url, params, 'GET', null, {
+      requestPriority: 'track2',
+      requestLabel: `structure_page:${edge}`
+    })
     if (data.error) {
       throw new Error(`Facebook API Error: ${data.error.message}`)
     }
@@ -123,7 +210,8 @@ class FacebookMarketingAPI {
       configured_status: x.configured_status,
       campaign_id: x.campaign_id,
       adset_id: x.adset_id,
-      updated_time: x.updated_time || null
+      updated_time: x.updated_time || null,
+      created_time: x.created_time || null
     })).filter(x => x.id)
 
     const afterCursor = data?.paging?.cursors?.after || null
@@ -154,7 +242,9 @@ class FacebookMarketingAPI {
     }
     const response = await this.makeRequest(batchUrl, batchParams, 'POST', null, {
       returnHeaders: true,
-      timeout: 60000
+      timeout: 60000,
+      requestPriority: 'track2',
+      requestLabel: 'structure_batch_ads'
     })
     const responseData = (response && typeof response === 'object' && 'data' in response) ? response.data : response
     const responseHeaders = (response && typeof response === 'object' && 'headers' in response) ? response.headers : {}
@@ -181,7 +271,8 @@ class FacebookMarketingAPI {
             configured_status: x.configured_status,
             campaign_id: x.campaign_id,
             adset_id: x.adset_id,
-            updated_time: x.updated_time || null
+            updated_time: x.updated_time || null,
+            created_time: x.created_time || null
           })).filter(x => x.id)
           const afterCursor = bodyData?.paging?.cursors?.after || null
           results.push({ accountId, items, after: afterCursor })
@@ -203,11 +294,182 @@ class FacebookMarketingAPI {
   }
 
   /**
+   * 统一 Batch：单账户一次请求拉 campaigns/adsets/ads 三个 edge
+   * - 最简版：sinceSec 用 Unix 秒，不做 ISO 回退
+   * - 每个 edge 独立解析与容错，任一 edge 失败不影响其他 edge
+   * - 重点：FB Batch item.body 是双重转义 JSON 字符串，必须 JSON.parse(item.body)
+   *
+   * @param {string} adAccountId
+   * @param {{
+   *   sinceSec: number,
+   *   limit?: number,
+   *   campaignsFields?: string,
+   *   adsetsFields?: string,
+   *   adsFields?: string
+   * }} opts
+   * @returns {Promise<{
+   *   campaigns: { items: Array, after: string|null, code: number|null, error: string|null },
+   *   adsets: { items: Array, after: string|null, code: number|null, error: string|null },
+   *   ads: { items: Array, after: string|null, code: number|null, error: string|null }
+   * }>}
+   */
+  async unifiedStructureBatch(adAccountId, opts = {}) {
+    const accountId = String(adAccountId || '').trim()
+    if (!accountId) throw new Error('unifiedStructureBatch: adAccountId 不能为空')
+
+    const sinceSec = Number(opts.sinceSec)
+    if (!Number.isFinite(sinceSec)) {
+      throw new Error('unifiedStructureBatch: sinceSec 必须是有效数字（Unix 秒）')
+    }
+
+    const limitRaw = Number(opts.limit ?? 500)
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 500)) : 500
+
+    const campaignsFields = opts.campaignsFields || 'id,name,status,effective_status,updated_time,created_time'
+    const adsetsFields = opts.adsetsFields || 'id,name,status,effective_status,updated_time,created_time,campaign_id'
+    const adsFields = opts.adsFields || 'id,name,status,effective_status,configured_status,updated_time,created_time,adset_id,campaign_id'
+
+    const buildFilteringValue = (val) => [{ field: 'updated_time', operator: 'GREATER_THAN', value: String(val) }]
+    const filtering = JSON.stringify(buildFilteringValue(Math.floor(sinceSec)))
+    const makeRelativeUrl = (edge, fields) =>
+      `${accountId}/${edge}?fields=${encodeURIComponent(fields)}&limit=${limit}&filtering=${encodeURIComponent(filtering)}`
+    const edgeFields = { campaigns: campaignsFields, adsets: adsetsFields, ads: adsFields }
+
+    const batchRequests = [
+      { method: 'GET', relative_url: makeRelativeUrl('campaigns', campaignsFields) },
+      { method: 'GET', relative_url: makeRelativeUrl('adsets', adsetsFields) },
+      { method: 'GET', relative_url: makeRelativeUrl('ads', adsFields) }
+    ]
+
+    const batchUrl = `${FACEBOOK_API_BASE}/`
+    const response = await this.makeRequest(
+      batchUrl,
+      { batch: JSON.stringify(batchRequests), access_token: this.accessToken },
+      'POST',
+      null,
+      {
+        returnHeaders: true,
+        timeout: 60000,
+        requestPriority: 'track2',
+        requestLabel: 'structure_batch_unified'
+      }
+    )
+
+    const responseData = (response && typeof response === 'object' && 'data' in response) ? response.data : response
+    if (responseData?.error) {
+      throw new Error(`Batch API Error: ${responseData.error?.message || 'unknown'}`)
+    }
+
+    const batchResponses = Array.isArray(responseData) ? responseData : []
+    const edgeNames = ['campaigns', 'adsets', 'ads']
+    const result = {
+      campaigns: { items: [], after: null, code: null, error: null },
+      adsets: { items: [], after: null, code: null, error: null },
+      ads: { items: [], after: null, code: null, error: null }
+    }
+
+    const mapItem = (x) => ({
+      id: String(x.id || ''),
+      name: x.name || '',
+      status: x.status,
+      effective_status: x.effective_status,
+      configured_status: x.configured_status,
+      campaign_id: x.campaign_id,
+      adset_id: x.adset_id,
+      updated_time: x.updated_time || null,
+      created_time: x.created_time || null
+    })
+
+    const formatBodyError = (bodyData) => {
+      const err = bodyData?.error
+      if (!err) return null
+      const msg = err.message || 'edge_error'
+      const code = err.code != null ? ` code=${err.code}` : ''
+      const subcode = err.error_subcode != null ? ` subcode=${err.error_subcode}` : ''
+      return `${msg}${code}${subcode}`
+    }
+
+    const tryParseBodyJson = (rawBody) => {
+      if (!rawBody) return null
+      try { return JSON.parse(rawBody) } catch { return null }
+    }
+
+    const fallbackFetchEdgeFirstPage = async (edge) => {
+      const unixValue = String(Math.floor(sinceSec))
+      const isoValue = new Date(Math.floor(sinceSec) * 1000).toISOString()
+      const candidates = [unixValue, isoValue]
+      let lastErr = null
+      for (let i = 0; i < candidates.length; i++) {
+        const filteringObj = buildFilteringValue(candidates[i])
+        try {
+          const page = await this.getStructurePage(accountId, edge, {
+            fields: edgeFields[edge],
+            limit,
+            after: null,
+            filtering: filteringObj
+          })
+          result[edge].items = Array.isArray(page?.items) ? page.items : []
+          result[edge].after = page?.paging?.after || null
+          result[edge].code = 200
+          result[edge].error = null
+          if (i === 1) {
+            logger.warn(`[UnifiedBatch] account=${accountId} edge=${edge} 已回退 ISO filtering 成功`)
+          } else {
+            logger.warn(`[UnifiedBatch] account=${accountId} edge=${edge} 已通过单 edge 回补成功`)
+          }
+          return
+        } catch (err) {
+          lastErr = err
+        }
+      }
+      result[edge].error = lastErr?.message || result[edge].error || 'edge_refetch_failed'
+    }
+
+    for (let i = 0; i < edgeNames.length; i++) {
+      const edge = edgeNames[i]
+      const item = batchResponses[i]
+      result[edge].code = item?.code ?? null
+
+      if (item?.code !== 200 || !item?.body) {
+        const bodyData = tryParseBodyJson(item?.body)
+        const detail = formatBodyError(bodyData)
+        result[edge].error = detail || (item?.body ? `HTTP_${item?.code ?? 'N/A'}` : 'empty_body')
+        logger.warn(`[UnifiedBatch] account=${accountId} edge=${edge} 非成功响应 code=${item?.code ?? 'N/A'} error=${result[edge].error}`)
+        continue
+      }
+
+      try {
+        const bodyData = JSON.parse(item.body)
+        if (bodyData?.error) {
+          result[edge].error = formatBodyError(bodyData) || 'edge_error'
+          logger.warn(`[UnifiedBatch] account=${accountId} edge=${edge} API错误: ${result[edge].error}`)
+          continue
+        }
+        const data = Array.isArray(bodyData?.data) ? bodyData.data : []
+        result[edge].items = data.map(mapItem).filter(x => x.id)
+        result[edge].after = bodyData?.paging?.cursors?.after || null
+      } catch (err) {
+        result[edge].error = err.message || 'parse_error'
+        logger.warn(`[UnifiedBatch] account=${accountId} edge=${edge} 解析失败: ${result[edge].error}`)
+      }
+    }
+
+    // 单个 edge 在 batch 里失败时，按 edge 回补第一页（先 Unix 秒，再 ISO）
+    for (const edge of edgeNames) {
+      if (result[edge].error) {
+        await fallbackFetchEdgeFirstPage(edge)
+      }
+    }
+
+    return result
+  }
+
+  /**
    * 通用：根据对象 IDs 解析名称/状态（用于“回显”与 structure_ads 写库）
    * Graph 支持：GET /?ids=id1,id2&fields=...
    * 当 fields 含 adset_id,campaign_id,updated_time 时会一并映射到返回对象（供结构镜像表使用）。
    */
-  async resolveObjectsByIds(ids, { fields = 'id,name,effective_status,status,configured_status' } = {}) {
+  async resolveObjectsByIds(ids, { fields = 'id,name,effective_status,status,configured_status', requestPriority = 'track2', requestLabel = 'resolve_objects' } = {}) {
     const list = (Array.isArray(ids) ? ids : String(ids || '').split(','))
       .map(s => String(s || '').trim())
       .filter(Boolean)
@@ -225,7 +487,10 @@ class FacebookMarketingAPI {
         fields,
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'GET')
+      const data = await this.makeRequest(url, params, 'GET', null, {
+        requestPriority,
+        requestLabel
+      })
       if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
 
       for (const id of chunk) {
@@ -241,6 +506,7 @@ class FacebookMarketingAPI {
         if (obj.adset_id !== undefined) item.adset_id = obj.adset_id
         if (obj.campaign_id !== undefined) item.campaign_id = obj.campaign_id
         if (obj.updated_time !== undefined) item.updated_time = obj.updated_time || null
+        if (obj.created_time !== undefined) item.created_time = obj.created_time || null
         all.push(item)
       }
     }
@@ -334,7 +600,10 @@ class FacebookMarketingAPI {
       logger.info(`📡 获取账户 ${accountId} 的时区...`)
       
       // 第4-5行：发送请求
-      const data = await this.makeRequest(url, params, 'GET')
+      const data = await this.makeRequest(url, params, 'GET', null, {
+        requestPriority: 'today',
+        requestLabel: 'account_timezone'
+      })
       
       // 第6-7行：检查错误
       if (data.error) {
@@ -359,117 +628,212 @@ class FacebookMarketingAPI {
   // @param {Object} params - 请求参数
   // @param {string} method - HTTP 方法（GET/POST）
   // @param {Object|null} body - 请求体（POST 请求）
-  // @param {Object} options - 选项：{ returnHeaders: boolean, timeout: number }
+  // @param {Object} options - 选项：{ returnHeaders, timeout, requestPriority, requestLabel, queueTimeoutMs }
   // @returns {Promise<Object|{data: Object, headers: Object}>} 响应数据或包含响应头的对象
   async makeRequest(url, params, method = 'GET', body = null, options = {}) {
-    const { returnHeaders = false, timeout = 45000 } = options
-    const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy
-    
-    // 检查 Token 熔断器状态（使用静态导入，避免动态导入导致的问题）
-    const breakerStatus = getCircuitBreakerStatus()
-    if (breakerStatus.isLocked) {
-      throw new Error('Token 已失效，系统已自动锁定。请检查 Token 配置并手动重置熔断器。')
-    }
+    const {
+      returnHeaders = false,
+      timeout = 45000,
+      requestPriority = 'track2',
+      requestLabel = 'fb_request',
+      queueTimeoutMs = FB_GLOBAL_QUEUE_TIMEOUT_MS
+    } = options
 
-    // 方法1: 如果配置了代理，则先探测该端口到底是 SOCKS5 还是 HTTP 代理，避免 protocol mismatch
-    if (proxyUrl) {
-      const info = parseProxyUrl(proxyUrl)
-      if (!info) {
-        logger.warn('⚠️ 代理解析失败，跳过代理，尝试后续方式:', proxyUrl)
-      } else {
-        let scheme = info.scheme
-        if (scheme === 'auto') {
-          scheme = await detectProxyProtocol(info.host, info.port)
-          logger.info(`🔎 代理协议探测结果: ${info.host}:${info.port} => ${scheme}`)
+    return enqueueFacebookRequest(
+      { priority: requestPriority, label: requestLabel, queueTimeoutMs },
+      async () => {
+        const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy
+        
+        // 检查 Token 熔断器状态（使用静态导入，避免动态导入导致的问题）
+        const breakerStatus = getCircuitBreakerStatus()
+        if (breakerStatus.isLocked) {
+          throw new Error('Token 已失效，系统已自动锁定。请检查 Token 配置并手动重置熔断器。')
         }
 
-        if (scheme === 'socks5' || scheme === 'socks4') {
-          const socksUrl = info.raw.startsWith('socks') ? info.raw : `socks5://${info.host}:${info.port}`
-          // 只重试「TLS 未建立前」的高置信瞬态错误，避免误重试 ECONNRESET/socket hang up（可能发生在请求已发送后）
-          const isTransientSocksError = (err) => {
-            const msg = (err?.message || err?.code || '') + ''
-            return /Client network socket disconnected before secure TLS connection was established/i.test(msg) ||
-              /收到空响应/i.test(msg)
-          }
-          try {
-            logger.info(`🔄 使用SOCKS代理: ${socksUrl}`)
-            for (let attempt = 1; attempt <= 2; attempt++) {
+        // 方法1: 如果配置了代理，则先探测该端口到底是 SOCKS5 还是 HTTP 代理，避免 protocol mismatch
+        if (proxyUrl) {
+          const info = parseProxyUrl(proxyUrl)
+          if (!info) {
+            logger.warn('⚠️ 代理解析失败，跳过代理，尝试后续方式:', proxyUrl)
+          } else {
+            let scheme = info.scheme
+            if (scheme === 'auto') {
+              scheme = await detectProxyProtocol(info.host, info.port)
+              logger.info(`🔎 代理协议探测结果: ${info.host}:${info.port} => ${scheme}`)
+            }
+
+            if (scheme === 'socks5' || scheme === 'socks4') {
+              const socksUrl = info.raw.startsWith('socks') ? info.raw : `socks5://${info.host}:${info.port}`
+              // 只重试「TLS 未建立前」的高置信瞬态错误，避免误重试 ECONNRESET/socket hang up（可能发生在请求已发送后）
+              const isTransientSocksError = (err) => {
+                const msg = (err?.message || err?.code || '') + ''
+                return /Client network socket disconnected before secure TLS connection was established/i.test(msg) ||
+                  /收到空响应/i.test(msg)
+              }
               try {
-                return await requestViaSocks5(url, params, socksUrl, method, body)
-              } catch (e) {
-                if (attempt === 1 && isTransientSocksError(e)) {
-                  const jitter = 200 + Math.floor(Math.random() * 301) // 200-500ms
-                  logger.info(`⚠️ 瞬态错误，${jitter}ms 后重试: ${e.message}`)
-                  await new Promise(r => setTimeout(r, jitter))
-                  continue
+                logger.info(`🔄 使用SOCKS代理: ${socksUrl}`)
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                  try {
+                    return await requestViaSocks5(url, params, socksUrl, method, body)
+                  } catch (e) {
+                    if (attempt === 1 && isTransientSocksError(e)) {
+                      const jitter = 200 + Math.floor(Math.random() * 301) // 200-500ms
+                      logger.info(`⚠️ 瞬态错误，${jitter}ms 后重试: ${e.message}`)
+                      await new Promise(r => setTimeout(r, jitter))
+                      continue
+                    }
+                    throw e
+                  }
                 }
-                throw e
+              } catch (socks5Error) {
+                logger.warn('⚠️ 原生SOCKS实现失败:', socks5Error.message)
+                // 只有在明确是 socks URL 时才允许 socks-proxy-agent 兜底，避免对 HTTP 端口造成 protocol mismatch
+                try {
+                  logger.info(`🔄 尝试使用socks-proxy-agent: ${socksUrl}`)
+                  const agent = new SocksProxyAgent(socksUrl, { timeout: timeout })
+                  const config = { params, httpsAgent: agent, httpAgent: agent, timeout: timeout }
+                  
+                  const requestPromise = method === 'POST' 
+                    ? axios.post(url, body, config) 
+                    : axios.get(url, config)
+                  
+                  const resp = await fetchWithTimeout(requestPromise, timeout)
+                  
+                  // 检查 Token 错误
+                  if (resp.data?.error) {
+                    checkTokenError(resp.data)
+                  } else {
+                    recordSuccess()
+                  }
+                  
+                  // 解析响应头并动态休眠（如果返回响应头）
+                  if (returnHeaders && resp.headers) {
+                    const usageHeader = resp.headers['x-business-use-case-usage'] || resp.headers['x-business-use-case-usage'.toLowerCase()]
+                    if (usageHeader) {
+                      const usageInfo = parseUsageHeader(usageHeader)
+                      await sleepBasedOnUsage(usageInfo)
+                    }
+                  }
+                  
+                  logger.info('✅ socks-proxy-agent 请求成功')
+                  return returnHeaders ? { data: resp.data, headers: resp.headers } : resp.data
+                } catch (socksError) {
+                  // 检查是否是 Token 错误
+                  checkTokenError(socksError)
+                  logger.warn('⚠️ socks-proxy-agent 也失败:', socksError.message)
+                  throw socksError
+                }
+              }
+            } else if (scheme === 'http') {
+              // HTTP 代理：CONNECT 隧道（仅 http://；https:// 代理由方法3 HttpsProxyAgent 处理）
+              try {
+                logger.info('🔄 使用HTTP代理（CONNECT隧道）...')
+                return await this.requestViaHttpProxy(url, params, `http://${info.host}:${info.port}`, method, body)
+              } catch (proxyError) {
+                logger.warn('⚠️ HTTP代理隧道失败:', proxyError.message)
               }
             }
-          } catch (socks5Error) {
-            logger.warn('⚠️ 原生SOCKS实现失败:', socks5Error.message)
-            // 只有在明确是 socks URL 时才允许 socks-proxy-agent 兜底，避免对 HTTP 端口造成 protocol mismatch
-            try {
-              logger.info(`🔄 尝试使用socks-proxy-agent: ${socksUrl}`)
-              const agent = new SocksProxyAgent(socksUrl, { timeout: timeout })
-              const config = { params, httpsAgent: agent, httpAgent: agent, timeout: timeout }
-              
-              const requestPromise = method === 'POST' 
-                ? axios.post(url, body, config) 
-                : axios.get(url, config)
-              
-              const resp = await fetchWithTimeout(requestPromise, timeout)
-              
-              // 检查 Token 错误
-              if (resp.data?.error) {
-                checkTokenError(resp.data)
-              } else {
-                recordSuccess()
-              }
-              
-              // 解析响应头并动态休眠（如果返回响应头）
-              if (returnHeaders && resp.headers) {
-                const usageHeader = resp.headers['x-business-use-case-usage'] || resp.headers['x-business-use-case-usage'.toLowerCase()]
-                if (usageHeader) {
-                  const usageInfo = parseUsageHeader(usageHeader)
-                  await sleepBasedOnUsage(usageInfo)
-                }
-              }
-              
-              logger.info('✅ socks-proxy-agent 请求成功')
-              return returnHeaders ? { data: resp.data, headers: resp.headers } : resp.data
-            } catch (socksError) {
-              // 检查是否是 Token 错误
-              checkTokenError(socksError)
-              logger.warn('⚠️ socks-proxy-agent 也失败:', socksError.message)
-              throw socksError
-            }
+            // scheme === 'https' 或 其它：跳过 CONNECT，由方法3 HttpsProxyAgent 处理（支持 https:// 代理）
           }
-        } else if (scheme === 'http') {
-          // HTTP 代理：CONNECT 隧道（仅 http://；https:// 代理由方法3 HttpsProxyAgent 处理）
+        }
+        
+        // 方法3: 尝试使用axios with HTTP代理agent（排除 socks5h/socks5/socks4）
+        if (proxyUrl && !isSocksProxy(proxyUrl)) {
           try {
-            logger.info('🔄 使用HTTP代理（CONNECT隧道）...')
-            return await this.requestViaHttpProxy(url, params, `http://${info.host}:${info.port}`, method, body)
-          } catch (proxyError) {
-            logger.warn('⚠️ HTTP代理隧道失败:', proxyError.message)
+            let httpProxyUrl = proxyUrl
+            if (!httpProxyUrl.startsWith('http://') && !httpProxyUrl.startsWith('https://')) {
+              httpProxyUrl = `http://${httpProxyUrl}`
+            }
+            const agent = new HttpsProxyAgent(httpProxyUrl)
+            const config = {
+              params,
+              httpsAgent: agent,
+              httpAgent: agent,
+              timeout: timeout
+            }
+            
+            const requestPromise = method === 'POST' 
+              ? axios.post(url, body, config) 
+              : axios.get(url, config)
+            
+            const response = await fetchWithTimeout(requestPromise, timeout)
+            
+            // 检查 Token 错误
+            if (response.data?.error) {
+              checkTokenError(response.data)
+            } else {
+              recordSuccess()
+            }
+            
+            // 解析响应头并动态休眠（如果返回响应头）
+            if (returnHeaders && response.headers) {
+              const usageHeader = response.headers['x-business-use-case-usage'] || response.headers['x-business-use-case-usage'.toLowerCase()]
+              if (usageHeader) {
+                const usageInfo = parseUsageHeader(usageHeader)
+                await sleepBasedOnUsage(usageInfo)
+              }
+            }
+            
+            return returnHeaders ? { data: response.data, headers: response.headers } : response.data
+          } catch (httpError) {
+            logger.warn('⚠️ HTTP代理agent失败:', httpError.message)
           }
         }
-        // scheme === 'https' 或 其它：跳过 CONNECT，由方法3 HttpsProxyAgent 处理（支持 https:// 代理）
-      }
-    }
-    
-    // 方法3: 尝试使用axios with HTTP代理agent（排除 socks5h/socks5/socks4）
-    if (proxyUrl && !isSocksProxy(proxyUrl)) {
-      try {
-        let httpProxyUrl = proxyUrl
-        if (!httpProxyUrl.startsWith('http://') && !httpProxyUrl.startsWith('https://')) {
-          httpProxyUrl = `http://${httpProxyUrl}`
+        
+        // 方法4: 尝试使用原生fetch（Node.js 18+，会自动使用系统代理）
+        if (typeof fetch !== 'undefined') {
+          try {
+            const queryString = new URLSearchParams(params).toString()
+            const fullUrl = `${url}?${queryString}`
+            logger.info('🔄 尝试使用原生fetch（自动使用系统代理）...')
+            
+            const fetchOptions = {
+              method: method,
+              headers: { 'Accept': 'application/json' },
+              signal: AbortSignal.timeout(timeout)
+            }
+            if (method === 'POST' && body) {
+              fetchOptions.headers['Content-Type'] = 'application/json'
+              fetchOptions.body = JSON.stringify(body)
+            }
+            
+            const fetchPromise = fetch(fullUrl, fetchOptions)
+            const response = await fetchWithTimeout(fetchPromise, timeout)
+            
+            if (!response.ok) {
+              const errorData = await response.json().catch(() => ({}))
+              checkTokenError(errorData)
+              throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+            }
+            
+            const data = await response.json()
+            
+            // 检查 Token 错误
+            if (data?.error) {
+              checkTokenError(data)
+            } else {
+              recordSuccess()
+            }
+            
+            // 解析响应头并动态休眠（如果返回响应头）
+            if (returnHeaders && response.headers) {
+              const usageHeader = response.headers.get('x-business-use-case-usage')
+              if (usageHeader) {
+                const usageInfo = parseUsageHeader(usageHeader)
+                await sleepBasedOnUsage(usageInfo)
+              }
+            }
+            
+            return returnHeaders ? { data, headers: Object.fromEntries(response.headers.entries()) } : data
+          } catch (fetchError) {
+            logger.warn('⚠️ 原生fetch失败:', fetchError.message)
+          }
         }
-        const agent = new HttpsProxyAgent(httpProxyUrl)
+        
+        // 方法5: 最后尝试直接使用axios（不配置agent，依赖系统代理）
+        logger.info('🔄 尝试使用axios（依赖系统代理）...')
         const config = {
           params,
-          httpsAgent: agent,
-          httpAgent: agent,
           timeout: timeout
         }
         
@@ -496,91 +860,8 @@ class FacebookMarketingAPI {
         }
         
         return returnHeaders ? { data: response.data, headers: response.headers } : response.data
-      } catch (httpError) {
-        logger.warn('⚠️ HTTP代理agent失败:', httpError.message)
       }
-    }
-    
-    // 方法4: 尝试使用原生fetch（Node.js 18+，会自动使用系统代理）
-    if (typeof fetch !== 'undefined') {
-      try {
-        const queryString = new URLSearchParams(params).toString()
-        const fullUrl = `${url}?${queryString}`
-        logger.info('🔄 尝试使用原生fetch（自动使用系统代理）...')
-        
-        const fetchOptions = {
-          method: method,
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(timeout)
-        }
-        if (method === 'POST' && body) {
-          fetchOptions.headers['Content-Type'] = 'application/json'
-          fetchOptions.body = JSON.stringify(body)
-        }
-        
-        const fetchPromise = fetch(fullUrl, fetchOptions)
-        const response = await fetchWithTimeout(fetchPromise, timeout)
-        
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          checkTokenError(errorData)
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-        }
-        
-        const data = await response.json()
-        
-        // 检查 Token 错误
-        if (data?.error) {
-          checkTokenError(data)
-        } else {
-          recordSuccess()
-        }
-        
-        // 解析响应头并动态休眠（如果返回响应头）
-        if (returnHeaders && response.headers) {
-          const usageHeader = response.headers.get('x-business-use-case-usage')
-          if (usageHeader) {
-            const usageInfo = parseUsageHeader(usageHeader)
-            await sleepBasedOnUsage(usageInfo)
-          }
-        }
-        
-        return returnHeaders ? { data, headers: Object.fromEntries(response.headers.entries()) } : data
-      } catch (fetchError) {
-        logger.warn('⚠️ 原生fetch失败:', fetchError.message)
-      }
-    }
-    
-    // 方法5: 最后尝试直接使用axios（不配置agent，依赖系统代理）
-    logger.info('🔄 尝试使用axios（依赖系统代理）...')
-    const config = {
-      params,
-      timeout: timeout
-    }
-    
-    const requestPromise = method === 'POST' 
-      ? axios.post(url, body, config) 
-      : axios.get(url, config)
-    
-    const response = await fetchWithTimeout(requestPromise, timeout)
-    
-    // 检查 Token 错误
-    if (response.data?.error) {
-      checkTokenError(response.data)
-    } else {
-      recordSuccess()
-    }
-    
-    // 解析响应头并动态休眠（如果返回响应头）
-    if (returnHeaders && response.headers) {
-      const usageHeader = response.headers['x-business-use-case-usage'] || response.headers['x-business-use-case-usage'.toLowerCase()]
-      if (usageHeader) {
-        const usageInfo = parseUsageHeader(usageHeader)
-        await sleepBasedOnUsage(usageInfo)
-      }
-    }
-    
-    return returnHeaders ? { data: response.data, headers: response.headers } : response.data
+    )
   }
 
   // 使用原生HTTP模块通过代理发送请求（最可靠的方法）
@@ -860,7 +1141,10 @@ class FacebookMarketingAPI {
       let currentUrl = url
       let currentParams = params
       while (currentUrl) {
-        const data = await this.makeRequest(currentUrl, currentParams, 'GET')
+        const data = await this.makeRequest(currentUrl, currentParams, 'GET', null, {
+          requestPriority: 'today',
+          requestLabel: 'get_ads'
+        })
         if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
         all.push(...(data.data || []))
         currentUrl = data?.paging?.next || null
@@ -937,7 +1221,10 @@ class FacebookMarketingAPI {
       while (currentUrl) {
         let data
         try {
-          data = await this.makeRequest(currentUrl, currentParams, 'GET')
+          data = await this.makeRequest(currentUrl, currentParams, 'GET', null, {
+            requestPriority: 'today',
+            requestLabel: 'get_ad_insights'
+          })
         } catch (e) {
           if (this.isInvalidFieldError(e) && currentParams.fields === fullFields) {
             currentParams = buildParams(fallbackFields)
@@ -1190,13 +1477,19 @@ class FacebookMarketingAPI {
 
     let data
     try {
-      data = await this.makeRequest(url, params, 'GET')
+      data = await this.makeRequest(url, params, 'GET', null, {
+        requestPriority: 'cold',
+        requestLabel: 'get_ad_insights_roi'
+      })
       if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
     } catch (e) {
       // 有些账号/版本对部分字段不支持：降级为“最稳字段集”，保证接口可用
       if (this.isInvalidFieldError(e)) {
         const fallbackParams = { ...params, fields: baseFields }
-        data = await this.makeRequest(url, fallbackParams, 'GET')
+        data = await this.makeRequest(url, fallbackParams, 'GET', null, {
+          requestPriority: 'cold',
+          requestLabel: 'get_ad_insights_roi_fallback'
+        })
         if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
       } else {
         throw e
@@ -1267,13 +1560,19 @@ class FacebookMarketingAPI {
     }
 
     try {
-      const data = await this.makeRequest(url, params, 'POST', null)
+      const data = await this.makeRequest(url, params, 'POST', null, {
+        requestPriority: 'cold',
+        requestLabel: 'start_roi_async_job'
+      })
       if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
       return data.report_run_id || data.id
     } catch (e) {
       if (this.isInvalidFieldError(e)) {
         const fallbackParams = { ...params, fields: baseFields }
-        const data = await this.makeRequest(url, fallbackParams, 'POST', null)
+        const data = await this.makeRequest(url, fallbackParams, 'POST', null, {
+          requestPriority: 'cold',
+          requestLabel: 'start_roi_async_job_fallback'
+        })
         if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
         return data.report_run_id || data.id
       }
@@ -1284,7 +1583,10 @@ class FacebookMarketingAPI {
   async getReportRunStatus(reportRunId) {
     const url = `${FACEBOOK_API_BASE}/${reportRunId}`
     const params = { fields: 'async_status,async_percent_completion', access_token: this.accessToken }
-    const data = await this.makeRequest(url, params, 'GET')
+    const data = await this.makeRequest(url, params, 'GET', null, {
+      requestPriority: 'cold',
+      requestLabel: 'report_run_status'
+    })
     if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
     const percent = parseInt(data.async_percent_completion || '0')
     return { status: data.async_status, percent: Number.isNaN(percent) ? 0 : percent }
@@ -1300,13 +1602,19 @@ class FacebookMarketingAPI {
     while (url) {
       let data
       try {
-        data = await this.makeRequest(url, params, 'GET')
+        data = await this.makeRequest(url, params, 'GET', null, {
+          requestPriority: 'cold',
+          requestLabel: 'report_run_insights'
+        })
         if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
       } catch (e) {
         // 若 report-run 不支持 extraFields，则降级回 baseFields，至少拿到购买/漏斗/官方 CPA
         if (this.isInvalidFieldError(e)) {
           const fallbackParams = { ...params, fields: baseFields }
-          data = await this.makeRequest(url, fallbackParams, 'GET')
+          data = await this.makeRequest(url, fallbackParams, 'GET', null, {
+            requestPriority: 'cold',
+            requestLabel: 'report_run_insights_fallback'
+          })
           if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
         } else {
           throw e
@@ -1363,7 +1671,10 @@ class FacebookMarketingAPI {
         status: 'PAUSED',
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'POST', null)
+      const data = await this.makeRequest(url, params, 'POST', null, {
+        requestPriority: 'action',
+        requestLabel: 'pause_ad'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1383,7 +1694,10 @@ class FacebookMarketingAPI {
         status: 'ACTIVE',
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'POST', null)
+      const data = await this.makeRequest(url, params, 'POST', null, {
+        requestPriority: 'action',
+        requestLabel: 'activate_ad'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1418,7 +1732,10 @@ class FacebookMarketingAPI {
         fields: 'daily_budget,lifetime_budget,budget_remaining',
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'GET')
+      const data = await this.makeRequest(url, params, 'GET', null, {
+        requestPriority: 'action',
+        requestLabel: 'get_adset_budget_detail'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1448,7 +1765,10 @@ class FacebookMarketingAPI {
         [field]: Math.round(newBudgetCents),
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, {}, 'POST', body)
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'update_adset_budget'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1483,7 +1803,10 @@ class FacebookMarketingAPI {
         fields: 'daily_budget,lifetime_budget,budget_remaining',
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, params, 'GET')
+      const data = await this.makeRequest(url, params, 'GET', null, {
+        requestPriority: 'action',
+        requestLabel: 'get_campaign_budget_detail'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1511,7 +1834,10 @@ class FacebookMarketingAPI {
         [field]: Math.round(newBudgetCents),
         access_token: this.accessToken
       }
-      const data = await this.makeRequest(url, {}, 'POST', body)
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'update_campaign_budget'
+      })
       if (data.error) {
         throw new Error(`Facebook API Error: ${data.error.message}`)
       }
@@ -1698,7 +2024,10 @@ class RuleEngine {
           // 原始计数（用于高级分析）
           link_clicks: adData.link_clicks,
           unique_link_clicks: adData.unique_link_clicks,
-          purchase_value: adData.purchase_value
+          purchase_value: adData.purchase_value,
+          add_to_cart_count: adData.add_to_cart_count,
+          initiate_checkout_count: adData.initiate_checkout_count,
+          add_payment_info_count: adData.add_payment_info_count
         })
       }
     }
@@ -1741,7 +2070,10 @@ class RuleEngine {
           payment_cost: adData.payment_cost,
           link_clicks: adData.link_clicks,
           unique_link_clicks: adData.unique_link_clicks,
-          purchase_value: adData.purchase_value
+          purchase_value: adData.purchase_value,
+          add_to_cart_count: adData.add_to_cart_count,
+          initiate_checkout_count: adData.initiate_checkout_count,
+          add_payment_info_count: adData.add_payment_info_count
         })
       }
     }
@@ -1925,6 +2257,12 @@ class RuleEngine {
         return parseInt(adData.link_clicks || 0)
       case 'unique_link_clicks':
         return parseInt(adData.unique_link_clicks || 0)
+      case 'add_to_cart_count':
+        return parseInt(adData.add_to_cart_count || 0)
+      case 'initiate_checkout_count':
+        return parseInt(adData.initiate_checkout_count || 0)
+      case 'add_payment_info_count':
+        return parseInt(adData.add_payment_info_count || 0)
       
       // 单价/比率类指标
       case 'cpc':
@@ -2208,12 +2546,18 @@ app.get('/api/structure/objects', requireAuth, requireActive, async (req, res) =
     const rawLimit = Number(req.query.limit || 50)
     const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
     const include_paused = req.query.include_paused
+    const scope_status = req.query.scope_status != null ? String(req.query.scope_status) : undefined
+    const scope_status_exclude = req.query.scope_status_exclude != null ? String(req.query.scope_status_exclude) : undefined
+    const name_exclude = req.query.name_exclude != null ? String(req.query.name_exclude) : undefined
+    const scopeCreatedWithinHoursRaw = req.query.scope_created_within_hours
+    const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
+    const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
 
     if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数' })
     if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
     if (!(await assertAccountAccess(req, res, account_id))) return
 
-    const result = await listStructureObjectsFromDb(account_id, { type, q, limit, after, include_paused })
+    const result = await listStructureObjectsFromDb(account_id, { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours })
     const sourceTable = result._source || (type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads')
     logger.info('[2.2] GET /api/structure/objects', { account_id, type, count: result.items.length, has_next: !!result.paging?.after })
     return res.json({
@@ -2229,6 +2573,7 @@ app.get('/api/structure/objects', requireAuth, requireActive, async (req, res) =
 
 // 多账户结构列表（规则页多选账户用）— 须在 :level 之前注册
 // GET /api/structure/objects/multi?account_ids=act_1,act_2&type=ad|adset|campaign&q=&limit=50&after=&include_paused=
+// after 为 base64(JSON.stringify({ i, a, pas }))：i=当前账户下标，a=该账户游标，pas=首轮每账户 after 列表
 app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, res) => {
   try {
     const accountIdsRaw = (req.query.account_ids || '').trim()
@@ -2237,9 +2582,23 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
     const rawLimit = Number(req.query.limit || 50)
     const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 500)) : 50
     const include_paused = req.query.include_paused
+    // 兼容各客户端：Query 里可能是 "1" | 1 | "true" | true，未传时为 undefined
+    const includePausedEffective = include_paused === '1' || include_paused === 1 || include_paused === 'true' || include_paused === true
+    if (req.query.include_paused != null && !includePausedEffective && String(include_paused).trim() !== '') {
+      logger.warn('[multi] include_paused 收到非常规值，将按「不含已暂停」处理', { received: req.query.include_paused })
+    }
+    const afterRaw = req.query.after != null && req.query.after !== '' ? String(req.query.after).trim() : null
+    const scope_status = req.query.scope_status != null ? String(req.query.scope_status) : undefined
+    const scope_status_exclude = req.query.scope_status_exclude != null ? String(req.query.scope_status_exclude) : undefined
+    const name_exclude = req.query.name_exclude != null ? String(req.query.name_exclude) : undefined
+    const scopeCreatedWithinHoursRaw = req.query.scope_created_within_hours
+    const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
+    const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
 
     if (!accountIdsRaw) return res.status(400).json({ error: '缺少 account_ids 参数' })
     if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
+
+    logger.info('[multi] 请求参数', { include_paused: req.query.include_paused, includePausedEffective, type, limit })
 
     const requestedIds = [...new Set(accountIdsRaw.split(',').map(s => s.trim()).filter(Boolean))]
     if (requestedIds.length === 0) return res.status(400).json({ error: 'account_ids 至少包含一个有效账户 ID' })
@@ -2252,33 +2611,133 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
       return res.status(403).json({ error: '无权访问所请求的任一广告账户', code: 'ACCOUNT_FORBIDDEN' })
     }
 
-    // 简化分页：每账户各取一页，合并后截断；after 暂不实现
+    const MULTI_ACCOUNT_IDS_MAX = 20
+    const MULTI_ACCOUNT_IDS_MAX_ADMIN = 50
+    const isAdmin = req.user && req.user.role === 'admin'
+    const maxAccounts = isAdmin ? MULTI_ACCOUNT_IDS_MAX_ADMIN : MULTI_ACCOUNT_IDS_MAX
+    if (allowedIds.length > maxAccounts) {
+      return res.status(400).json({
+        error: `单次请求最多选择 ${maxAccounts} 个广告账户`,
+        code: 'TOO_MANY_ACCOUNTS'
+      })
+    }
+
+    const sourceTable = type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads'
+
+    if (afterRaw) {
+      let cursor
+      try {
+        cursor = JSON.parse(Buffer.from(afterRaw, 'base64').toString('utf8'))
+        if (cursor == null || typeof cursor.i !== 'number' || !Array.isArray(cursor.pas)) {
+          return res.status(400).json({ error: 'after 游标无效' })
+        }
+      } catch {
+        return res.status(400).json({ error: 'after 游标无效' })
+      }
+      const { i, a, pas } = cursor
+      if (i < 0 || i >= allowedIds.length) {
+        return res.status(400).json({ error: 'after 游标无效' })
+      }
+      const accountId = allowedIds[i]
+      const result = await listStructureObjectsFromDb(accountId, { type, q, limit, after: a || null, include_paused: includePausedEffective, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours })
+      const items = result.items.map((item) => ({ ...item, account_id: item.account_id || accountId }))
+      const hasNext = result.paging && result.paging.after != null
+      const nextPas = [...(pas || [])]
+      if (i < nextPas.length) nextPas[i] = result.paging?.after ?? null
+      let nextAfter
+      if (hasNext) {
+        nextAfter = Buffer.from(JSON.stringify({ i, a: result.paging.after, pas: nextPas })).toString('base64')
+      } else if (i + 1 < allowedIds.length) {
+        // 只对「还有下一页」的账户返回游标，跳过 pas[j]==null 的账户，避免用 after=null 再拉第一页导致重复
+        let nextI = -1
+        for (let j = i + 1; j < nextPas.length; j++) {
+          if (nextPas[j] != null) {
+            nextI = j
+            break
+          }
+        }
+        if (nextI >= 0) {
+          nextAfter = Buffer.from(JSON.stringify({ i: nextI, a: nextPas[nextI], pas: nextPas })).toString('base64')
+        } else {
+          nextAfter = undefined
+        }
+      } else {
+        nextAfter = undefined
+      }
+      const hasMore = nextAfter != null
+      logger.info('[2.2] GET /api/structure/objects/multi (after)', { allowed: allowedIds.length, type, accountIndex: i, count: items.length, has_more: hasMore })
+      const perAccountAfterMeta = {}
+      allowedIds.forEach((aid, idx) => { perAccountAfterMeta[aid] = nextPas[idx] ?? null })
+      return res.json({
+        items,
+        paging: { after: nextAfter, has_more: hasMore },
+        meta: {
+          type,
+          source: sourceTable,
+          accounts: allowedIds.length,
+          requested_accounts: requestedIds.length,
+          allowed_accounts: allowedIds.length,
+          denied_accounts: Math.max(0, requestedIds.length - allowedIds.length),
+          per_account_after: perAccountAfterMeta,
+          has_more: hasMore
+        }
+      })
+    }
+
     const perAccountLimit = Math.max(1, Math.ceil(limit / allowedIds.length))
     const allItems = []
     const seen = new Set()
-    for (const accountId of allowedIds) {
-      const result = await listStructureObjectsFromDb(accountId, { type, q, limit: perAccountLimit, after: null, include_paused })
+    const perAccountAfter = []
+    const pl = pLimit(4)
+    const results = await Promise.all(allowedIds.map((accountId, idx) =>
+      pl(() =>
+        listStructureObjectsFromDb(accountId, {
+          type,
+          q,
+          limit: perAccountLimit,
+          after: null,
+          include_paused: includePausedEffective,
+          scope_status,
+          scope_status_exclude,
+          name_exclude,
+          scope_created_within_hours
+        }).then(result => ({ idx, accountId, result }))
+      )
+    ))
+    for (const { accountId, result } of results) {
+      perAccountAfter.push(result.paging?.after ?? null)
       for (const item of result.items) {
-        const key = `${item.account_id}:${item.id}`
+        const key = `${item.account_id || accountId}:${item.id}`
         if (seen.has(key)) continue
         seen.add(key)
-        allItems.push(item)
+        allItems.push({ ...item, account_id: item.account_id || accountId })
       }
     }
     const items = allItems.slice(0, limit)
-    const hasMore = allItems.length > limit
-    const sourceTable = type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads'
-    logger.info('[2.2] GET /api/structure/objects/multi', { requested: requestedIds.length, allowed: allowedIds.length, type, count: items.length })
+    const hasAnyMore = perAccountAfter.some((a) => a != null)
+    const hasMore = hasAnyMore
+    let nextAfter
+    if (hasMore) {
+      const firstI = perAccountAfter.findIndex((a) => a != null)
+      if (firstI >= 0) {
+        nextAfter = Buffer.from(JSON.stringify({ i: firstI, a: perAccountAfter[firstI], pas: perAccountAfter })).toString('base64')
+      }
+    }
+    const perAccountAfterMeta = {}
+    allowedIds.forEach((aid, idx) => { perAccountAfterMeta[aid] = perAccountAfter[idx] ?? null })
+    logger.info('[2.2] GET /api/structure/objects/multi', { requested: requestedIds.length, allowed: allowedIds.length, type, count: items.length, has_more: hasMore })
     return res.json({
       items,
-      paging: { after: undefined, has_more: hasMore },
+      paging: { after: nextAfter, has_more: hasMore },
       meta: {
         type,
         source: sourceTable,
         accounts: allowedIds.length,
         requested_accounts: requestedIds.length,
         allowed_accounts: allowedIds.length,
+        denied_accounts: Math.max(0, requestedIds.length - allowedIds.length),
         per_account_limit: perAccountLimit,
+        per_account_after: perAccountAfterMeta,
         has_more: hasMore
       }
     })
@@ -2303,12 +2762,18 @@ app.get('/api/structure/:level', requireAuth, requireActive, async (req, res) =>
     if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数' })
     if (!(await assertAccountAccess(req, res, account_id))) return
 
+    const include_paused = req.query.include_paused
+    const scope_status = req.query.scope_status != null ? String(req.query.scope_status) : undefined
+    const scope_status_exclude = req.query.scope_status_exclude != null ? String(req.query.scope_status_exclude) : undefined
+    const name_exclude = req.query.name_exclude != null ? String(req.query.name_exclude) : undefined
+    const scopeCreatedWithinHoursRaw = req.query.scope_created_within_hours
+    const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
+    const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
+    const opts = { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
+
     const edgeMap = { campaigns: 'campaigns', adsets: 'adsets', ads: 'ads' }
     const edge = edgeMap[String(level || '').toLowerCase()]
     if (!edge) return res.status(400).json({ error: 'level 参数无效（campaigns/adsets/ads）' })
-
-    const include_paused = req.query.include_paused
-    const opts = { q, limit, after, include_paused }
 
     if (edge === 'ads') {
       const result = await listStructureAdsFromDb(account_id, opts)
@@ -2848,26 +3313,14 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
 })
 
 // 执行自动规则 - 【已废弃】
-// 原因：这个接口直接调用 Facebook API 获取数据，会触发限流
-// 替代方案：使用 /api/rules/execute-all（从数据库读取数据，不消耗 API 额度）
-// 保留此接口仅为兼容性，返回错误提示使用新接口
+// 「立即运行所有规则」已移除，规则由每分钟 Cron 自动执行（文档：执行频率与执行时间 — 适配方案 §7）
+// 单条规则请使用 POST /api/rules/:id/execute
 app.post('/api/execute-rules', async (req, res) => {
   logger.warn('⚠️ 废弃接口被调用: POST /api/execute-rules')
-  logger.warn('   请使用新接口: POST /api/rules/execute-all')
-  
-  return res.status(410).json({ 
-    error: '此接口已废弃，请使用 POST /api/rules/execute-all',
+  return res.status(410).json({
+    error: '此接口已废弃；规则由每分钟 Cron 自动执行，单条规则请使用 POST /api/rules/:id/execute',
     code: 'DEPRECATED_ENDPOINT',
-    migration: {
-      old_endpoint: 'POST /api/execute-rules',
-      new_endpoint: 'POST /api/rules/execute-all',
-      reason: '旧接口直接调用 Facebook API，会触发限流；新接口从数据库读取数据，不消耗 API 额度',
-      benefits: [
-        '毫秒级响应（原来需要 2-5 秒）',
-        '不消耗 Facebook API 额度',
-        '支持多人同时使用'
-      ]
-    }
+    new_endpoint: 'POST /api/rules/:id/execute'
   })
 })
 

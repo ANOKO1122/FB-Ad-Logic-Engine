@@ -4,6 +4,7 @@ import { db } from '../db/drizzle.js'
 import { rules } from '../db/schema.js'
 import { eq, and, desc } from 'drizzle-orm'
 import { getAccountTimezone } from './ruleDataService.js'
+import pool from '../db/connection.js'
 
 /**
  * 创建规则
@@ -33,7 +34,13 @@ export async function createRule(userId, ruleData) {
     timezoneName,
     isSimulation: ruleData.isSimulation ?? false,
     actions: ruleData.actions,
-    enabled: ruleData.enabled ?? true
+    enabled: ruleData.enabled ?? true,
+    executionIntervalMinutes: ruleData.executionIntervalMinutes ?? ruleData.execution_interval_minutes ?? 15,
+    executionTimeWindows: ruleData.executionTimeWindows ?? ruleData.execution_time_windows ?? null,
+    useDynamicScope: ruleData.useDynamicScope ?? true,
+    scopeFilters: ruleData.scopeFilters ?? null,
+    excludeIds: ruleData.excludeIds ?? null,
+    maxDynamicMatches: ruleData.maxDynamicMatches ?? 1000
   })
   
   // 获取新插入的规则 ID
@@ -162,24 +169,37 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false) {
  * @returns {Promise<boolean>} 是否删除成功
  */
 export async function deleteRule(ruleId, userId, isAdmin = false) {
-  // 构建查询条件
-  let whereCondition = eq(rules.id, ruleId)
-  
-  // 非管理员用户：只能删除自己的规则
-  if (!isAdmin) {
-    whereCondition = and(whereCondition, eq(rules.userId, userId))
+  const connection = await pool.getConnection()
+  try {
+    await connection.beginTransaction()
+
+    const deleteRuleSql = isAdmin
+      ? 'DELETE FROM rules WHERE id = ? LIMIT 1'
+      : 'DELETE FROM rules WHERE id = ? AND user_id = ? LIMIT 1'
+    const deleteRuleParams = isAdmin ? [ruleId] : [ruleId, userId]
+    const [ruleResult] = await connection.execute(deleteRuleSql, deleteRuleParams)
+
+    if (!ruleResult || ruleResult.affectedRows === 0) {
+      await connection.rollback()
+      throw new Error('规则不存在或无权访问')
+    }
+
+    // 联动清理动态快照，避免留下 rule_matched_objects 孤儿数据
+    await connection.execute(
+      'DELETE FROM rule_matched_objects WHERE rule_id = ?',
+      [ruleId]
+    )
+
+    await connection.commit()
+    return true
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback() } catch {}
+    }
+    throw error
+  } finally {
+    connection.release()
   }
-  
-  // 对应 SQL: DELETE FROM rules WHERE id = ? [AND user_id = ?]
-  const result = await db
-    .delete(rules)
-    .where(whereCondition)
-  
-  if (result[0].affectedRows === 0) {
-    throw new Error('规则不存在或无权访问')
-  }
-  
-  return true
 }
 
 /**

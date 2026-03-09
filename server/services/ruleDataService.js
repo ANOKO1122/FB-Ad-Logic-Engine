@@ -25,7 +25,7 @@ function selectDataSource(timeWindow, timezoneName = 'UTC') {
     case 'today':
       // 第1-4行：Today → ad_snapshots（热数据，毫秒级响应）
       // needAggregation: false 表示单天数据，不需要聚合
-      // 注意：读侧统一由 calculateSingleDayMetrics 计算口径；API ROAS 仅作为兜底值（DB 字段 roas）
+      // 注意：读侧统一由 calculateSingleDayMetrics 计算口径；ROAS 一律用本地 purchase_value/spend 计算
       return { 
         source: 'ad_snapshots', 
         needAggregation: false,  // 单天不需要聚合
@@ -973,11 +973,10 @@ function calculateSingleDayMetrics(dailyStats) {
   const initiateCheckoutCount = parseInt(dailyStats.initiate_checkout_count || 0)
   const addPaymentInfoCount = parseInt(dailyStats.add_payment_info_count || 0)
   
-  // 单天指标统一口径：计算优先 -> API 兜底 -> 零兜底（仅 ROAS）
-  const dbRoas = dailyStats.roas != null ? parseFloat(dailyStats.roas) : null
+  // 单天指标统一口径：一律用本地 purchase_value/spend 计算 ROAS（不再使用 Facebook 提供的 roas 字段兜底）
   const roas = spend === 0
     ? null
-    : (purchaseValue > 0 ? purchaseValue / spend : (dbRoas != null && dbRoas > 0 ? dbRoas : 0))
+    : (purchaseValue > 0 ? purchaseValue / spend : 0)
 
   return {
     // 基本信息（直接传递）

@@ -2,7 +2,7 @@ import { Router } from 'express'
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { requireAuth, requireActive, requireAdmin } from '../middleware/authJwt.js'
-import { manualExecute, getCronStatus } from '../services/cronService.js'
+import { getCronStatus } from '../services/cronService.js'
 import { validateTemplateBody } from '../utils/templateValidator.js'
 
 const router = Router()
@@ -23,16 +23,12 @@ router.get('/cron/status', async (req, res) => {
   }
 })
 
-// POST /api/admin/cron/execute
-// 手动触发一次规则执行（用于测试/演练）
+// POST /api/admin/cron/execute — 已移除「立即运行所有规则」，规则由每分钟 Cron 驱动
 router.post('/cron/execute', async (req, res) => {
-  try {
-    // 手动触发：会走同一套并发保护 + 分布式锁逻辑
-    await manualExecute()
-    res.json({ success: true, message: '已触发规则执行，请查看后端日志' })
-  } catch (err) {
-    res.status(500).json({ error: '触发失败', code: 'ERROR', details: err?.message })
-  }
+  res.status(410).json({
+    error: '「立即运行所有规则」已移除，规则由每分钟 Cron 自动执行',
+    code: 'GONE'
+  })
 })
 
 router.get('/pending-count', async (req, res) => {

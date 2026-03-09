@@ -126,7 +126,7 @@ async function verifyRuleCreated() {
     console.log(`   - 关联账户: ${accountRows.length > 0 ? `✅ ${accountRows.length} 个` : '❌'}`)
     console.log('')
     console.log('💡 下一步：')
-    console.log('   1. 在前端点击"立即运行所有规则"')
+    console.log('   1. 在前端对某条规则点击「运行此规则」或等待每分钟 Cron 自动执行')
     console.log('   2. 运行验证脚本: node test-e2e-verify-offline-query.js')
     console.log('')
     

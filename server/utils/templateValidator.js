@@ -132,11 +132,16 @@ function _validateActions(actions) {
   const budgetTypes = ['increase_budget', 'decrease_budget', 'set_budget']
   for (let i = 0; i < actions.length; i++) {
     const a = actions[i]
+    const hasMaxDailyBudget = a?.max_daily_budget != null
+    const hasMinDailyBudget = a?.min_daily_budget != null
     if (!a || typeof a !== 'object') {
       return { valid: false, error: `actions[${i}] 须为对象`, field: 'actions' }
     }
     if (!VALID_ACTION_TYPES.includes(a.type)) {
       return { valid: false, error: `actions[${i}] type 不支持: ${a.type}`, field: 'actions' }
+    }
+    if (hasMaxDailyBudget && hasMinDailyBudget) {
+      return { valid: false, error: `actions[${i}] 不允许同时配置 max_daily_budget 与 min_daily_budget`, field: 'actions' }
     }
     if (a.type === 'set_budget') {
       // set_budget 仅允许 value_unit='usd' 或不传（undefined/null），其它一律报错
@@ -154,16 +159,16 @@ function _validateActions(actions) {
       if (/\.\d{3,}$/.test(strVal)) {
         return { valid: false, error: `actions[${i}] set_budget value 最多两位小数`, field: 'actions' }
       }
-      if (a.max_daily_budget != null) {
-        const mdb = Number(a.max_daily_budget)
-        if (!Number.isInteger(mdb) || mdb < 0) {
-          return { valid: false, error: `actions[${i}] max_daily_budget 须为非负整数（分）`, field: 'actions' }
-        }
-        if (mdb < 100) {
-          return { valid: false, error: `actions[${i}] max_daily_budget 须 >= 100 分（1 美元）或留空不设上限`, field: 'actions' }
-        }
+      if (hasMaxDailyBudget || hasMinDailyBudget) {
+        return { valid: false, error: `actions[${i}] set_budget 不允许配置 max_daily_budget 或 min_daily_budget`, field: 'actions' }
       }
     } else if (budgetTypes.includes(a.type)) {
+      if (a.type === 'increase_budget' && hasMinDailyBudget) {
+        return { valid: false, error: `actions[${i}] increase_budget 不允许配置 min_daily_budget`, field: 'actions' }
+      }
+      if (a.type === 'decrease_budget' && hasMaxDailyBudget) {
+        return { valid: false, error: `actions[${i}] decrease_budget 不允许配置 max_daily_budget`, field: 'actions' }
+      }
       const unit = VALID_VALUE_UNITS.includes(a.value_unit) ? a.value_unit : 'percent'
       if (unit === 'usd') {
         // usd 模式：value 必填，0.01–9999，最多两位小数
@@ -185,13 +190,22 @@ function _validateActions(actions) {
           return { valid: false, error: `actions[${i}] 百分比模式下 value 须为 1–100 整数`, field: 'actions' }
         }
       }
-      if (a.max_daily_budget != null) {
+      if (a.type === 'increase_budget' && hasMaxDailyBudget) {
         const mdb = Number(a.max_daily_budget)
         if (!Number.isInteger(mdb) || mdb < 0) {
           return { valid: false, error: `actions[${i}] max_daily_budget 须为非负整数（分）`, field: 'actions' }
         }
         if (mdb < 100) {
           return { valid: false, error: `actions[${i}] max_daily_budget 须 >= 100 分（1 美元）或留空不设上限`, field: 'actions' }
+        }
+      }
+      if (a.type === 'decrease_budget' && hasMinDailyBudget) {
+        const mdb = Number(a.min_daily_budget)
+        if (!Number.isInteger(mdb) || mdb < 0) {
+          return { valid: false, error: `actions[${i}] min_daily_budget 须为非负整数（分）`, field: 'actions' }
+        }
+        if (mdb < 100) {
+          return { valid: false, error: `actions[${i}] min_daily_budget 须 >= 100 分（1 美元）或留空不设下限`, field: 'actions' }
         }
       }
     } else {
@@ -206,6 +220,15 @@ function _validateActions(actions) {
         }
         if (mdb < 100) {
           return { valid: false, error: `actions[${i}] max_daily_budget 须 >= 100 分（1 美元）或留空不设上限`, field: 'actions' }
+        }
+      }
+      if (a.min_daily_budget != null) {
+        const mdb = Number(a.min_daily_budget)
+        if (!Number.isInteger(mdb) || mdb < 0) {
+          return { valid: false, error: `actions[${i}] min_daily_budget 须为非负整数（分）`, field: 'actions' }
+        }
+        if (mdb < 100) {
+          return { valid: false, error: `actions[${i}] min_daily_budget 须 >= 100 分（1 美元）或留空不设下限`, field: 'actions' }
         }
       }
     }

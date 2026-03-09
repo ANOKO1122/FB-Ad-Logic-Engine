@@ -391,7 +391,7 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
       logger.info(`✅ 从 API 查询到 ${insights.length} 条 spend>0 的广告数据，${activeAdIds.length} 个唯一广告ID`)
 
       // 第2步：元数据补全（同一轮只调用一次 resolveObjectsByIds，供 status 落盘 + Piggyback 写 structure_ads 复用）
-      const STRUCTURE_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time'
+      const STRUCTURE_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time,created_time'
       const statusMap = new Map()
 
       if (activeAdIds.length > 0) {
@@ -408,7 +408,8 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
             configured_status: ad.configured_status ?? null,
             adset_id: ad.adset_id ?? null,
             campaign_id: ad.campaign_id ?? null,
-            updated_time: ad.updated_time ?? null
+            updated_time: ad.updated_time ?? null,
+            created_time: ad.created_time ?? null
           }
         })
       }
@@ -688,8 +689,8 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
       add_to_cart_count = VALUES(add_to_cart_count),
       initiate_checkout_count = VALUES(initiate_checkout_count),
       add_payment_info_count = VALUES(add_payment_info_count),
-      ad_set_id = VALUES(ad_set_id),
-      campaign_id = VALUES(campaign_id),
+      ad_set_id = COALESCE(VALUES(ad_set_id), ad_set_id),
+      campaign_id = COALESCE(VALUES(campaign_id), campaign_id),
       updated_at = NOW()
   `
   
@@ -1829,8 +1830,8 @@ async function saveSnapshotsToDbInternal(insights, metadata) {
           add_to_cart_count = VALUES(add_to_cart_count),
           initiate_checkout_count = VALUES(initiate_checkout_count),
           add_payment_info_count = VALUES(add_payment_info_count),
-          ad_set_id = VALUES(ad_set_id),
-          campaign_id = VALUES(campaign_id),
+          ad_set_id = COALESCE(VALUES(ad_set_id), ad_set_id),
+          campaign_id = COALESCE(VALUES(campaign_id), campaign_id),
           synced_at = VALUES(synced_at),
           timezone_name = VALUES(timezone_name),
           data_date = VALUES(data_date)
@@ -2951,25 +2952,8 @@ export async function unifiedHeartbeatSync() {
           // 2.3 执行双窗口归档检查
           const archiveResult = await checkAndExecuteArchive(accountId, ownerId, timezoneName, localTime)
           
-          // 2.4 AdsPolar 事件驱动优化：数据同步完成后立即触发规则执行
-          // 这是"顺手触发"模式：数据刚落库，立即评估规则，避免批量执行导致的资源浪费
-          // 注意：使用异步执行，不阻塞数据同步流程
-          if (synced && dataUpdated) {
-            // 异步触发规则执行（不等待完成，避免阻塞数据同步）
-            setImmediate(async () => {
-              try {
-                // 动态导入规则执行服务（避免循环依赖）
-                const { executeRulesForAccount } = await import('./cronService.js')
-                const { generateRunId } = await import('./ruleExecutionSummaryService.js')
-                const runId = generateRunId()
-                logger.info(`   🔄 [${accountId}] 数据同步完成，立即触发规则执行（AdsPolar 事件驱动，run_id: ${runId}）`)
-                await executeRulesForAccount(accountId, { force: false, runId })
-              } catch (ruleError) {
-                // 规则执行失败不影响数据同步结果
-                logger.error(`   ⚠️  [${accountId}] 规则执行失败:`, ruleError.message)
-              }
-            })
-          }
+          // 规则执行不再由心跳顺带触发，改由「每分钟 Cron」统一驱动（见 cronService 调度）
+          // 依据：docs/执行频率与执行时间 — 适配方案（执行频率语义 + 移除 Smart Mute）.md §4.1
           
           return {
             synced,

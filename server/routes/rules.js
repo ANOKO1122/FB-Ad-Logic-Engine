@@ -4,14 +4,86 @@ import { Router } from 'express'
 import logger from '../utils/logger.js'
 import { requireAuth, requireActive } from '../middleware/authJwt.js'
 import * as rulesService from '../services/rulesService.js'
-import { manualExecute, getCronStatus, executeSingleRule } from '../services/cronService.js'
+import { getCronStatus, executeSingleRule } from '../services/cronService.js'
 import { assertAccountAccess } from '../utils/accountAccess.js'
 import { generateRunId } from '../services/ruleExecutionSummaryService.js'
 import pool from '../db/connection.js'
 import { validateConditionsStructure, validateTimeWindowConsistency, normalizeConditionsToV2 } from '../utils/conditionsValidator.js'
 import { validateActions } from '../utils/templateValidator.js'
+import { refreshDynamicTargetsForAccount, refreshDynamicTargetsForRule, scheduleDynamicScopeRefreshForRule, isDynamicScopeFeatureEnabled } from '../services/dynamicScopeService.js'
 
 const router = Router()
+
+function parseDynamicScopePayload(body = {}) {
+  const hasUse = Object.prototype.hasOwnProperty.call(body, 'useDynamicScope')
+  const hasFilters = Object.prototype.hasOwnProperty.call(body, 'scopeFilters')
+  const hasExclude = Object.prototype.hasOwnProperty.call(body, 'excludeIds')
+  const hasMax = Object.prototype.hasOwnProperty.call(body, 'maxDynamicMatches')
+  return {
+    hasAny: hasUse || hasFilters || hasExclude || hasMax,
+    useDynamicScope: hasUse ? !!body.useDynamicScope : undefined,
+    scopeFilters: hasFilters ? body.scopeFilters : undefined,
+    excludeIds: hasExclude ? body.excludeIds : undefined,
+    maxDynamicMatches: hasMax ? body.maxDynamicMatches : undefined
+  }
+}
+
+function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
+  const errors = []
+  const updates = {}
+  if (!dynamicPayload?.hasAny) return { valid: true, updates }
+
+  if (dynamicPayload.useDynamicScope !== undefined) {
+    updates.useDynamicScope = !!dynamicPayload.useDynamicScope
+  }
+  if (dynamicPayload.excludeIds !== undefined) {
+    if (Array.isArray(dynamicPayload.excludeIds)) {
+      const ad_ids = []
+      const adset_ids = []
+      const campaign_ids = []
+      for (const item of dynamicPayload.excludeIds) {
+        if (!item || typeof item !== 'object') continue
+        const level = String(item.level || '').trim().toLowerCase()
+        const id = String(item.id || '').trim()
+        if (!id) continue
+        if (level === 'ad') ad_ids.push(id)
+        else if (level === 'adset') adset_ids.push(id)
+        else if (level === 'campaign') campaign_ids.push(id)
+      }
+      updates.excludeIds = { ad_ids, adset_ids, campaign_ids }
+    } else if (dynamicPayload.excludeIds && typeof dynamicPayload.excludeIds === 'object') {
+      updates.excludeIds = {
+        ad_ids: Array.isArray(dynamicPayload.excludeIds.ad_ids) ? dynamicPayload.excludeIds.ad_ids.map(v => String(v)).filter(Boolean) : [],
+        adset_ids: Array.isArray(dynamicPayload.excludeIds.adset_ids) ? dynamicPayload.excludeIds.adset_ids.map(v => String(v)).filter(Boolean) : [],
+        campaign_ids: Array.isArray(dynamicPayload.excludeIds.campaign_ids) ? dynamicPayload.excludeIds.campaign_ids.map(v => String(v)).filter(Boolean) : []
+      }
+    } else {
+      errors.push('excludeIds 必须是数组或对象')
+    }
+  }
+  if (dynamicPayload.maxDynamicMatches !== undefined) {
+    const n = Number(dynamicPayload.maxDynamicMatches)
+    if (!Number.isFinite(n) || n < 1 || n > 5000) {
+      errors.push('maxDynamicMatches 必须在 1~5000 之间')
+    } else {
+      updates.maxDynamicMatches = Math.floor(n)
+    }
+  }
+  if (dynamicPayload.scopeFilters !== undefined) {
+    const sf = dynamicPayload.scopeFilters
+    if (!sf || typeof sf !== 'object') {
+      errors.push('scopeFilters 必须是对象')
+    } else {
+      const level = String(sf.level || fallbackTargetLevel || 'ad').trim().toLowerCase()
+      if (!['ad', 'adset', 'campaign'].includes(level)) {
+        errors.push(`scopeFilters.level 仅支持 ad/adset/campaign，当前: ${level}`)
+      }
+      const conditions = Array.isArray(sf.conditions) ? sf.conditions : []
+      updates.scopeFilters = { level, conditions }
+    }
+  }
+  return { valid: errors.length === 0, error: errors[0], updates }
+}
 
 /**
  * GET /api/templates
@@ -138,7 +210,13 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
       target_by_account,   // 方案B：{ "act_1": ["id1","id2"], "act_2": ["id3"] }
       logicOperator,
       timezoneName,
-      isSimulation
+      isSimulation,
+      executionIntervalMinutes,
+      executionTimeWindows,
+      useDynamicScope,
+      scopeFilters,
+      excludeIds,
+      maxDynamicMatches
     } = req.body
     
     // ✅ 方案三：accountId 必填校验（防止反向索引退化）
@@ -252,6 +330,17 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
       }
     }
 
+    const dynamicPayload = parseDynamicScopePayload({
+      useDynamicScope,
+      scopeFilters,
+      excludeIds,
+      maxDynamicMatches
+    })
+    const dynamicCheck = validateDynamicScopePayload(dynamicPayload, targetLevel)
+    if (!dynamicCheck.valid) {
+      return res.status(400).json({ error: dynamicCheck.error, code: 'INVALID_DYNAMIC_SCOPE' })
+    }
+
     const newRule = await rulesService.createRule(userId, {
       ruleName,
       accountId: accountIdStr,
@@ -264,8 +353,16 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
       targetByAccount: targetByAccount ?? null,
       logicOperator,
       timezoneName,
-      isSimulation
+      isSimulation,
+      executionIntervalMinutes: executionIntervalMinutes ?? 15,
+      executionTimeWindows: executionTimeWindows ?? null,
+      ...dynamicCheck.updates
     })
+
+    // TriggerB：规则保存后异步刷新动态快照（多账户规则按目标账户逐个防抖）
+    if (isDynamicScopeFeatureEnabled()) {
+      await scheduleDynamicScopeRefreshForRule(newRule.id, { trigger: 'rule_saved' })
+    }
     
     res.status(201).json({
       message: '规则创建成功',
@@ -316,7 +413,13 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
       'targetByAccount',
       'logicOperator',
       'timezoneName',
-      'isSimulation'
+      'isSimulation',
+      'executionIntervalMinutes',
+      'executionTimeWindows',
+      'useDynamicScope',
+      'scopeFilters',
+      'excludeIds',
+      'maxDynamicMatches'
     ]
     
     const updates = {}
@@ -327,6 +430,14 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     }
     if (body.targetAccounts != null) updates.targetAccountIds = Array.isArray(body.targetAccounts) ? body.targetAccounts : null
     if (body.target_by_account != null && typeof body.target_by_account === 'object') updates.targetByAccount = body.target_by_account
+    if (body.execution_interval_minutes != null) updates.executionIntervalMinutes = body.execution_interval_minutes
+    if (body.execution_time_windows != null) updates.executionTimeWindows = body.execution_time_windows
+    const dynamicPayload = parseDynamicScopePayload(body)
+    const dynamicCheck = validateDynamicScopePayload(dynamicPayload, updates.targetLevel || body.targetLevel || 'ad')
+    if (!dynamicCheck.valid) {
+      return res.status(400).json({ error: dynamicCheck.error, code: 'INVALID_DYNAMIC_SCOPE' })
+    }
+    Object.assign(updates, dynamicCheck.updates)
 
     if (updates.targetAccountIds && updates.targetAccountIds.length > 0 && !isAdmin) {
       for (const aid of updates.targetAccountIds) {
@@ -444,6 +555,11 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     
     // 更新规则（管理员可以更新所有规则）
     const updatedRule = await rulesService.updateRule(ruleId, userId, updates, isAdmin)
+
+    // TriggerB：规则保存后异步刷新动态快照（多账户规则按目标账户逐个防抖）
+    if (isDynamicScopeFeatureEnabled()) {
+      await scheduleDynamicScopeRefreshForRule(updatedRule.id, { trigger: 'rule_saved' })
+    }
     
     res.json({
       message: '规则更新成功',
@@ -455,6 +571,57 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     }
     logger.error('更新规则失败:', error)
     res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /api/rules/dynamic-scope/refresh-account
+ * TriggerC：手动重算指定账户的动态筛选快照（立即执行，非防抖）
+ * 请求体：
+ *   - accountId: string（可选）
+ *   - ruleId: number（可选，提供时将自动推导 accountId）
+ */
+router.post('/rules/dynamic-scope/refresh-account', requireAuth, requireActive, async (req, res) => {
+  try {
+    if (!isDynamicScopeFeatureEnabled()) {
+      return res.status(400).json({ error: '动态筛选功能未开启(ENABLE_DYNAMIC_SCOPE=false)', code: 'FEATURE_DISABLED' })
+    }
+
+    const userId = req.user.id
+    const isAdmin = req.user.role === 'admin'
+    const accountIdFromBody = req.body?.accountId != null ? String(req.body.accountId).trim() : ''
+    const ruleIdFromBody = req.body?.ruleId != null ? parseInt(req.body.ruleId, 10) : null
+
+    let accountId = accountIdFromBody
+    let refreshByRule = false
+    if (!accountId && ruleIdFromBody && !Number.isNaN(ruleIdFromBody)) {
+      const rule = await rulesService.getRuleById(ruleIdFromBody, userId, isAdmin)
+      if (!rule) {
+        return res.status(404).json({ error: '规则不存在或无权访问', code: 'RULE_NOT_FOUND' })
+      }
+      refreshByRule = true
+      accountId = String(rule.accountId || '').trim()
+    }
+
+    if (!accountId) {
+      return res.status(400).json({ error: '请提供 accountId 或 ruleId', code: 'MISSING_ACCOUNT' })
+    }
+
+    if (!isAdmin && accountId) {
+      const ok = await assertAccountAccess(req, res, accountId)
+      if (!ok) return
+    }
+
+    if (refreshByRule && ruleIdFromBody) {
+      const result = await refreshDynamicTargetsForRule(ruleIdFromBody, { trigger: 'manual' })
+      return res.json({ success: true, ruleId: ruleIdFromBody, trigger: 'manual', result })
+    }
+
+    const result = await refreshDynamicTargetsForAccount(accountId, { trigger: 'manual' })
+    return res.json({ success: true, accountId, trigger: 'manual', result })
+  } catch (error) {
+    logger.error('手动刷新动态筛选失败:', error)
+    return res.status(500).json({ error: error.message || '刷新失败', code: 'ERROR' })
   }
 })
 
@@ -520,42 +687,6 @@ router.patch('/rules/:id/toggle', requireAuth, requireActive, async (req, res) =
       return res.status(404).json({ error: error.message })
     }
     logger.error('启用/禁用规则失败:', error)
-    res.status(500).json({ error: error.message })
-  }
-})
-
-/**
- * POST /api/rules/execute-all
- * 手动触发规则执行（离线查询模式）
- * 
- * 说明：
- * - 这个接口触发的是离线查询模式（从数据库 daily_stats/ad_snapshots 查询）
- * - 不会直接调用 Facebook API，避免触发频率限制
- * - 执行结果会写入 automation_logs 审计日志
- */
-router.post('/rules/execute-all', requireAuth, requireActive, async (req, res) => {
-  try {
-    // 检查是否已经在运行
-    const status = getCronStatus()
-    if (status.isRunning) {
-      return res.status(409).json({ 
-        error: '规则正在执行中，请稍后再试',
-        code: 'ALREADY_RUNNING'
-      })
-    }
-    
-    // 方案B：非 admin 只跑自己负责人下的账户；admin 跑全部
-    const ownerId = req.user.role === 'admin' ? undefined : req.user.owner_id
-    manualExecute(true, { ownerId }).catch(err => {
-      logger.error('规则执行后台任务失败:', err)
-    })
-    
-    res.json({ 
-      success: true, 
-      message: ownerId != null ? '已触发您负责账户的规则执行，请查看执行日志' : '已触发规则执行，请查看执行日志页面查看结果'
-    })
-  } catch (error) {
-    logger.error('触发规则执行失败:', error)
     res.status(500).json({ error: error.message })
   }
 })

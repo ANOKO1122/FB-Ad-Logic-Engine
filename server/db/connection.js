@@ -17,7 +17,10 @@ const rawPool = mysql.createPool({
   connectionLimit: 25,  // 从 10 增加到 25，支持多人并发
   queueLimit: 0,
   enableKeepAlive: true,
-  keepAliveInitialDelay: 0
+  keepAliveInitialDelay: 0,
+  // 关键：告诉 mysql2 在 JS Date <-> 字符串 编解码时使用 UTC，
+  // 与我们在会话里 SET time_zone = '+00:00' 的策略保持一致
+  timezone: '+00:00'
 })
 
 /**

@@ -10,7 +10,8 @@ import {
   mysqlEnum,
   decimal,
   date,
-  text
+  text,
+  primaryKey
 } from 'drizzle-orm/mysql-core'
 // 规则表（rules）
 // 这是新功能使用的表，使用 Drizzle ORM 操作
@@ -47,6 +48,22 @@ export const rules = mysqlTable('rules', {
   timezoneName: varchar('timezone_name', { length: 50 }).default('UTC'),      // 账户时区
   isSimulation: boolean('is_simulation').default(false),                      // 是否 Dry Run 模式
   
+  // 动态筛选（Dynamic Scope）相关字段（M3 扩展，参见「动态筛选执行方案 V3」）
+  // use_dynamic_scope=1 时，规则目标对象从 rule_matched_objects 读取；0 时走旧的 targetLevel/targetIds 逻辑
+  useDynamicScope: boolean('use_dynamic_scope').notNull().default(false),
+  // 监控范围条件：由前端三个监控范围控件序列化而来，示例：
+  // { level: 'adset', conditions: [{ field:'effective_status', op:'in', value:['ACTIVE'] }, { field:'created_time', op:'within_hours', value:72 }] }
+  scopeFilters: json('scope_filters'),
+  // 排除名单：支持混合 campaign/adset/ad，示例：
+  // { campaign_ids:['C1'], adset_ids:['AS1'], ad_ids:['A1','A2'] }
+  excludeIds: json('exclude_ids'),
+  // 动态匹配上限：finalAdIds 超过该值时视为 ERROR_OVERSIZE，本轮不写新快照（保留上一版）
+  maxDynamicMatches: int('max_dynamic_matches').notNull().default(1000),
+  // 动态筛选刷新状态机：NORMAL / ERROR_OVERSIZE / ERROR_FILTER_INVALID / ERROR_REFRESH_FAILED
+  dynamicScopeStatus: varchar('dynamic_scope_status', { length: 32 }).notNull().default('NORMAL'),
+  dynamicScopeErrorMsg: varchar('dynamic_scope_error_msg', { length: 255 }),
+  dynamicScopeUpdatedAt: timestamp('dynamic_scope_updated_at'),
+
   // 执行操作：JSON 格式存储
   // 示例：[{ type: 'pause_ad' }] 或 [{ type: 'increase_budget', value: 20 }]
   // M4 3.5：max_daily_budget 单位为「分」(int)，前端展示时除以 100
@@ -62,7 +79,11 @@ export const rules = mysqlTable('rules', {
   updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
   
   // 上次执行时间（用于冷却期机制）
-  lastExecutedAt: timestamp('last_executed_at')
+  lastExecutedAt: timestamp('last_executed_at'),
+  
+  // 执行频率与时间段（文档：执行频率与执行时间 — 适配方案）
+  executionIntervalMinutes: int('execution_interval_minutes'),   // 规则×广告执行间隔(分钟)，NULL 按 15
+  executionTimeWindows: json('execution_time_windows')           // 允许执行时间段(北京时间)，空/NULL=全天
 })
 
 // ============================================
@@ -201,3 +222,26 @@ export const automationLogs = mysqlTable('automation_logs', {
 // export type Rule = typeof rules.$inferSelect  // 查询时的类型
 // export type NewRule = typeof rules.$inferInsert  // 插入时的类型
 
+// rule_ad_execution_state：规则×冷却键执行状态（仅调度路径读写，单条执行不参与）
+// 迁移 031：主键改为 (rule_id, scope_key)；scope_key 可为 ad:xxx | budget_adset:xxx | budget_campaign:xxx
+export const ruleAdExecutionState = mysqlTable('rule_ad_execution_state', {
+  ruleId: int('rule_id').notNull(),
+  scopeKey: varchar('scope_key', { length: 100 }).notNull(),
+  lastExecutedAt: timestamp('last_executed_at').notNull(),
+  lastStatus: mysqlEnum('last_status', ['success', 'fail', 'suppressed', 'outside_window']),
+  // 保留 ad_id 仅作诊断/兼容，主键与业务逻辑均以 scope_key 为准
+  adId: varchar('ad_id', { length: 50 })
+}, (t) => ({
+  pk: primaryKey({ columns: [t.ruleId, t.scopeKey] })
+}))
+
+// rule_matched_objects：动态筛选预计算快照表
+// 存储「规则 × 账户」在 ad 级别的目标快照，执行层按 rule_id+account_id 直接读 object_id 列得到 ad_id
+export const ruleMatchedObjects = mysqlTable('rule_matched_objects', {
+  id: int('id').primaryKey().autoincrement(),
+  ruleId: int('rule_id').notNull(),
+  accountId: varchar('account_id', { length: 50 }).notNull(),
+  objectId: varchar('object_id', { length: 50 }).notNull(),       // V1：ad_id
+  objectType: varchar('object_type', { length: 16 }).notNull(),   // V1 固定 'ad'，为后续扩展预留
+  createdAt: timestamp('created_at').notNull().defaultNow()
+})

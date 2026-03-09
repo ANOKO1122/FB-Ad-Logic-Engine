@@ -106,7 +106,7 @@ async function verifyOfflineQuery() {
     console.log(`   - 匹配广告: ${matchedAds.length > 0 ? `✅ ${matchedAds.length} 个` : '⚠️  0 个（条件未满足）'}`)
     console.log('')
     console.log('💡 下一步：')
-    console.log('   1. 在前端点击"立即运行所有规则"，观察执行结果')
+    console.log('   1. 在前端对某条规则点击「运行此规则」，或等待每分钟 Cron 自动执行，观察执行结果')
     console.log('   2. 等待 15 分钟，观察定时任务日志')
     console.log('   3. 确认日志显示"离线查询模式"')
     console.log('')

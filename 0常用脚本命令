@@ -1,0 +1,11 @@
+# 1）先看会删多少日志
+node server/scripts/cleanup-automation-logs.js --dry-run
+
+# 2）确认无误后，真正清理
+node server/scripts/cleanup-automation-logs.js --confirm
+
+# 1）先看会删多少
+node server/scripts/cleanup-rules-and-snapshots.js --dry-run
+
+# 2）确认无误后，真正清理
+node server/scripts/cleanup-rules-and-snapshots.js --confirm

@@ -34,4 +34,47 @@ describe('validateActions', () => {
   it('increase_budget percent value=10 应通过', () => {
     expect(validateActions([{ type: 'increase_budget', value: 10 }]).valid).toBe(true)
   })
+
+  it('increase_budget 允许 max_daily_budget，不允许 min_daily_budget', () => {
+    expect(validateActions([{ type: 'increase_budget', value: 10, max_daily_budget: 7000 }]).valid).toBe(true)
+    const bad = validateActions([{ type: 'increase_budget', value: 10, min_daily_budget: 3000 }])
+    expect(bad.valid).toBe(false)
+    expect(bad.error).toMatch(/increase_budget.*min_daily_budget/)
+  })
+
+  it('decrease_budget 允许 min_daily_budget，不允许 max_daily_budget', () => {
+    expect(validateActions([{ type: 'decrease_budget', value: 10, min_daily_budget: 3000 }]).valid).toBe(true)
+    const bad = validateActions([{ type: 'decrease_budget', value: 10, max_daily_budget: 7000 }])
+    expect(bad.valid).toBe(false)
+    expect(bad.error).toMatch(/decrease_budget.*max_daily_budget/)
+  })
+
+  it('set_budget 传上下限字段应失败', () => {
+    const r1 = validateActions([{ type: 'set_budget', value: 30, value_unit: 'usd', max_daily_budget: 7000 }])
+    const r2 = validateActions([{ type: 'set_budget', value: 30, value_unit: 'usd', min_daily_budget: 3000 }])
+    expect(r1.valid).toBe(false)
+    expect(r2.valid).toBe(false)
+    expect(r1.error).toMatch(/set_budget.*不允许配置/)
+    expect(r2.error).toMatch(/set_budget.*不允许配置/)
+  })
+
+  it('同一动作同时传 max_daily_budget 和 min_daily_budget 应失败', () => {
+    const result = validateActions([{
+      type: 'increase_budget',
+      value: 10,
+      max_daily_budget: 7000,
+      min_daily_budget: 3000
+    }])
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/不允许同时配置/)
+  })
+
+  it('min_daily_budget 非整数或小于 100 应失败', () => {
+    const r1 = validateActions([{ type: 'decrease_budget', value: 10, min_daily_budget: 99 }])
+    const r2 = validateActions([{ type: 'decrease_budget', value: 10, min_daily_budget: 100.5 }])
+    expect(r1.valid).toBe(false)
+    expect(r2.valid).toBe(false)
+    expect(r1.error).toMatch(/min_daily_budget.*>= 100/)
+    expect(r2.error).toMatch(/min_daily_budget.*整数/)
+  })
 })

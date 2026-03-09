@@ -26,15 +26,47 @@
 
 - Phase 1：稳定性与透明化 —— ✅ 已完成，用于支撑后续迭代。
 - Phase 2：多用户隔离架构 —— ✅ 已完成，规则应继续遵守 owner 维度隔离。
-- Phase 3：规则重心下沉与 7x24h 自动化 —— 🔄 进行中（约 75%），是本计划的主要施工范围。
+- Phase 3：规则重心下沉与 7x24h 自动化 —— 🔄 进行中（约 88%），是本计划的主要施工范围。
   - ✅ 数据架构层（M2）：已完成（约 98%）
-  - ✅ 规则配置层（M3）：基础功能已完成（约 80%）
-  - 🔄 动作执行层（M4）：部分完成（约 40%）
-  - ⏳ 反馈与监控层（M5）：规划中（约 10%）
+  - ✅ 规则配置层（M3）：已完成并进入多账户闭环阶段（约 95%）
+  - 🔄 动作执行层（M4）：核心链路已通并完成动态筛选执行一致性（约 70%）
+  - 🔄 反馈与监控层（M5）：基础审计与动态刷新观测已具备（约 20%）
 - Phase 4：前端布局优化 —— ✅ 已完成，可在后续做小幅改进。
 - Phase 5：审计、模拟与安全实战 —— ⏳ 规划中，对应《自动化优化方案》的第 4 部分。
 
-**最新进度（2026-02-14）**：
+**最新进度（2026-03-07）**：
+- ✅ **动态筛选多账户闭环（M3.5 + M4.x）**：依据 `.cursor/plans/多账户动态筛选闭环_51336d09.plan.md`。① DynamicScope 策略 B 修复：`ERROR_OVERSIZE` 不清空旧快照，仅 `NORMAL` 规则按 `rule_id + account_id` 原子替换；② 单条执行路径与调度路径统一到 Dispatcher，`executeSingleRule` 改走 `loadDataForAccount + evaluateRuleWithCache`，确保 `use_dynamic_scope=1` 时严格按 `rule_matched_objects(rule_id, account_id)` 取目标；③ 前端 RuleManager 打通动态开关（默认开）、上限、状态、手动重算、排除名单配置/回显/摘要；④ TriggerB/TriggerC 升级为多账户语义：保存规则后按规则涉及账户逐个防抖刷新，TriggerC 传 `ruleId` 自动刷新全部目标账户并返回 `accountResults`；⑤ 修复 `targetIds=act_xxx:id` 在动态计算中的账户隔离解析，避免跨账户串值；⑥ 删除规则事务内联动清理 `rule_matched_objects`，避免孤儿快照；⑦ 补齐自动化测试（Dispatcher act:id 隔离、DynamicScope 多账户 helper、rules 删除联动清快照）并通过。手工验收覆盖 TriggerB/TriggerC 多账户、A 超限 B 正常、执行与快照一致，全部通过。
+- ✅ **Track2 极速结构同步 + 全局 FB 限流 + 脏结构刷新**：依据 `.cursor/plans/fast-track-batch-sync-final_2a7a3666.plan.md`。① 在 `server/index.js` 中实现统一三边 Batch 内核 `unifiedStructureBatch(accountId, { sinceSec, limit })`，一次 Batch 请求同时拉取 `campaigns/adsets/ads` 三个 edge，正确解析双重转义 JSON body，并在子响应 code≠200 或 body.error 存在时记录含 message/code/subcode 的 warn 日志，对失败 edge 触发 Unix 秒 / ISO8601 回退重拉第一页，单 edge 修复不影响其它 edge 结果。② 在 `structureSyncService.js` 中新增 Track2 快速结构同步链路：`fastSyncStructureForAccount` 与 `collectFastSyncDataForAccount` 在账户级 MySQL 锁下调用 unified batch + 软分页补页（仅对返回 after 的 edge 调用 `getStructurePage` 继续拉，页数上限由 `maxSoftPagesPerEdge` 控制，默认 20，可通过 `TRACK2_FAST_SYNC_MAX_SOFT_PAGES` 调整），并将 `adsets/ads` 视为关键 edge，任一 edge 持续报错（含 FB 限流 `User request limit reached`）即整账户返回 `ok=false, reason='edge_failed'`，避免假成功。③ Track2 Cron 使用 `collectFastSyncDataForAccount` 收集白名单账户结果后，在 `applyMergedFastSyncPayload` 中按 `(account_id, object_id)` 去重合并，并对 `structure_campaigns/structure_adsets/structure_ads` 分别执行 chunked bulk upsert（默认块大小 300，可在 opts 中调节），返回本轮写入三表行数与被标记 dirty 的账户数；写库只对有变更的账户在 `structure_sync_status.fast_dirty` 上打标。④ 通过迁移 032/033 为 `structure_sync_status` 新增 `last_fast_sync_ts`、`last_fast_filter_since_sec` 与 `fast_dirty/fast_dirty_marked_at/fast_dirty_cleared_at` 列，Track2 每轮成功后无论是否有数据命中，都会用本轮使用的 `sinceSec` 推进专用水位，并仅对有变更的账户将 `fast_dirty` 置 1；规则调度入口 `executeRulesForAccount(fromScheduler=true)` 在账户锁内调用 `refreshStructureIfDirtyBeforeRules`，若 dirty 为 1 则先按最近 Fast Sync 水位刷新一次结构，成功后清空标记，失败则保留标记并打告警日志，从而实现「规则尽量使用最新结构，但失败不会阻塞执行」。⑤ `cronService.js` 新增 Track2 Fast Sync 定时任务，Cron 为 `7,27,52 * * * *`（每小时 3 次，避开 :45 热数据 Today 同步），账户列表来源为 account_mappings + 环境变量 `TRACK2_FAST_SYNC_ACCOUNT_IDS` 白名单，账户并发由 `TRACK2_FAST_SYNC_CONCURRENCY` 控制，窗口计算为 `sinceSec = max(last_fast_sync_sec - TRACK2_FAST_SYNC_BUFFER_SEC, now - 3d)`，当前 buffer=14400 秒（4 小时，已通过日志差值验证）；当 Token 熔断器 `getCircuitBreakerStatus().isLocked` 为 true 或最近 `getLastUsageRate() >= TRACK2_FAST_SYNC_USAGE_SKIP_THRESHOLD` 时，本轮 Track2 直接跳过。Track1 「结构轮转（近3天）」保持每小时 :12 跑最多 6 账户（账户并发 5），但可通过 `ENABLE_UNIFIED_STRUCTURE_BATCH/unifiedLimit/unifiedMaxSoftPages` 选择复用 unified batch 内核，形成「Track2 极速铺表 + Track1 每小时兜底轮转」双轨结构。⑥ 在 `FacebookMarketingAPI.makeRequest` 外围引入全局请求队列 `enqueueFacebookRequest({ priority, label, queueTimeoutMs }, taskFn)`，通过环境变量 `FB_GLOBAL_REQUEST_CONCURRENCY` 与 `FB_GLOBAL_QUEUE_TIMEOUT_MS` 统一限制发往 Facebook 的并发数和排队超时时间；所有 Today/Track1/Track2/规则动作请求都会按优先级 `action > today > track2 > cold` 入队，队列内部按优先级 + FIFO 调度任务到固定并发槽位，并在排队超时后返回明确错误避免客户端自身 timeout；对于 action 优先级请求，在实际执行前必打印 `[FBQueue] 开始执行` 日志，便于确认止损类请求不会在结构同步/冷任务压力下被饿死。
+
+**最新进度（2026-03-04）**：
+- ✅ **时区统一与执行日志显示**：① **连接池统一**：`server/db/drizzle.js` 改为复用 `server/db/connection.js` 的 pool（Single Source of Truth），不再自建 pool，确保 Drizzle 写入 `automation_logs.triggered_at` 与列表接口读取使用同一套「SET time_zone = UTC」连接。② **mysql2 时区选项**：`connection.js` 的 createPool 增加 `timezone: '+00:00'`，与已有会话 `SET time_zone = '+00:00'` 配合，避免驱动在 Date ↔ 字符串转换时按本地时区导致 8 小时偏差。③ **API 与前端**：执行日志列表/详情用 `toUTCISO()` 统一返回 `triggered_at`/`created_at` 为带 Z 的 UTC ISO；前端 `parseUTC` 对无 Z 字符串补 Z 后按 UTC 转北京展示。④ **冷却日志**：`ruleExecutionStateService.isCooldownDue` 的 debug 日志同时输出 `lastAtUtc` 与 `lastAtBj`（北京时间）。⑤ **文档**：`docs/0时区转换解决方案.md` 补充已落地规范与 SQL 说明（北京会话下勿对 `triggered_at` 再做 CONVERT_TZ）。验收：执行日志前端时间与本地北京时间一致；SQL 与前端一致。历史数据未迁移。本窗口总结见 `项目开发过程/项目总结-2026-03-04-时区统一与执行日志及连接池.md`。
+- ✅ **预算动作护栏与前端精简**：依据 `.cursor/plans/budget-guardrail-ui-and-cooldown_c1b0010a.plan.md`。① **预算上下限校验**：`server/utils/templateValidator.js` 为预算动作新增 `min_daily_budget` 字段支持，并限定 increase 仅允许 `max_daily_budget`、decrease 仅允许 `min_daily_budget`、set_budget 禁止上下限，且上下限须为整数分且 `>=100`。② **预算语义收紧**：`computeNewBudgetCentsOnce` 将 increase/decrease/set_budget 语义固化为「超上限/在下限不动、执行后封顶/托底、set_budget 仅上调不下调」，与 MIN_BUDGET_CENTS 统一。③ **Pre-Flight 跳过原因细分**：执行层在 `currentCents === newBudgetCents` 时，根据当前与护栏位置输出 `above_max_cap` / `below_min_floor` / `budget_already_at_target` 三类 skip_reason，审计日志与 API 响应均带 reason，便于排查。④ **前端 RuleManager/AdminTemplates 精简**：规则页与管理员模板页的动作编辑 UI 仅在 increase 时显示「预算上限」、在 decrease 时显示「预算下限」、在 set_budget 时隐藏上下限输入；动作切换时自动清理无关字段，保存时仅对 increase 透传 max_daily_budget，对 decrease 透传 min_daily_budget，set_budget 不再透传上下限字段。⑤ **测试补齐**：`budgetUnitCents.test.js` 与 `templateValidator.test.js` 补齐预算护栏用例，新增 `budgetPreFlightReason.test.js` 验证三类预算 Pre-Flight 跳过原因。
+- ⏳ **下一窗口建议**：Step 4 体验与完整性、4.2 IM 机器人；可选：历史执行日志/冷却表时区迁移（老数据减 8 小时转 UTC 语义）。
+
+**此前进度（2026-03-02）**：
+- ✅ **ROAS 一律用本地计算**：`server/services/ruleDataService.js` 的 `calculateSingleDayMetrics` 中单日 ROAS 改为仅用 `purchase_value/spend` 计算（spend=0→null；有花费无转化→0），**不再使用** DB/Facebook 的 roas 字段兜底，与多日 `aggregateMultiDayMetrics` 口径一致。规则条件判断完全依据自有数据，避免 FB roas 为空或口径差异导致误判。
+- ✅ **验证**：提供并修正验证 SQL（单日/多日 ROAS、时区、automation_logs；MySQL 子查询去掉 LIMIT）；用户执行后确认单日/多日 our_roas 正确、规则 461 Pre-Flight skipped 行为符合预期。
+- ✅ **预算冷却与 Pre-Flight 重构（budget-cooldown-and-prefight）**：依据 `.cursor/plans/budget-cooldown-and-prefight-refactor_e251157f.plan.md`。① **数据层**：迁移 031 为 `rule_ad_execution_state` 增加 `scope_key`，主键改为 (rule_id, scope_key)，ad_id 保留诊断；② **ruleExecutionStateService**：抽离 loadRuleAdExecutionState、isCooldownDue、upsertRuleAdExecutionStateBatch；③ **actionExecutorService**：pause/activate 用 cooldownKey=ad:，预算 ABO/CBO 用 budget_adset:/budget_campaign:，当前预算=目标预算时 Pre-Flight 记为 skipped 不调 FB，results 中返回 cooldownKey；④ **cronService 双写**：写冷却表时除按 cooldownKey 写入外，若 cooldownKey≠ad: 则再写入一条 ad:${adId}，使调度层「广告级冷却」过滤对预算动作生效（修改前只写 budget_*，Cron 按 ad: 过滤查不到，导致冷却期内每分钟仍执行）。验收：冷却表可见同一 rule_id 下 budget_* 与 ad: 两条；15 分钟内 Cron 不再重复执行。可选待办：单元/集成测试；执行层 isCooldownDue 对手动执行是否遵守冷却。
+- ⏳ **下一窗口建议**：Step 4 体验与完整性、4.2 IM 机器人；可选：将 ROAS 统一口径写入文档或 RuleManager 提示。
+
+**说明**：开发过程中若出现 `echo noop` 等 Shell 输出，为工具误调用产生的空操作，未连 MySQL、未改任何代码或文件；SQL 与执行命令由用户自行运行，代码修改仅通过文件读写工具完成。
+
+**此前进度（2026-02-28）**：
+- ✅ **执行频率与执行时间 适配方案七阶段全部完成**：依据 `docs/执行频率与执行时间 — 适配方案（执行频率语义 + 移除 Smart Mute）.md`。① 迁移与 Schema（rules 新字段 + rule_ad_execution_state 表，迁移 027/028）；② 心跳中移除规则触发（unifiedHeartbeatSync 不再调 executeRulesForAccount）；③ Cron 每分钟调度 + executeRulesForAccount 改造（fromScheduler 时读写冷却表、广告级间隔与执行时间段）；④ 执行时间段 isInExecutionWindow + 摘要 outside_execution_window；⑤ 移除 Smart Mute 执行路径（保留 mute_until/mute_reason 与 clear-ad-mute.js）；⑥ 移除 execute-all 与「立即运行所有规则」（保留单条 POST /api/rules/:id/execute）；⑦ API 与前端（执行频率/时间段配置、列表展示「执行频率」「执行时间」、单条执行保留）。前端修复：RuleManager normalizeRule 补全 executionIntervalMinutes/executionTimeWindows，解决保存后再编辑回显默认值问题。规则更新使用 **PUT /api/rules/:id**（不支持 PATCH 更新规则体）。教学文档：`docs/阶段五与阶段六_知识点与教学说明.md`。开发过程总结见 `项目开发过程/项目总结-2026-02-28-执行频率与执行时间方案完成与窗口总结.md`。
+- ✅ **结构同步近 3 天改造与定时/前端（同日本窗口）**：依据 `docs/0结构同步任务改造—执行方案.md`。① getStructurePage 映射 created_time；② syncAccountStructureAds 改为只拉 updated_time >= 3 天前（Unix 秒 + 单 edge 报错回退 ISO）；③ structure_sync_status 增加 last_filter_since_sec（迁移 030）；④ 轮转命名/日志统一「近3天」；⑤ Cron 改为 5,35,55 * * * *、每次 5 账户；⑥ 前端「刷新列表」仅单选一个广告账户时可点击。验收见 `docs/结构同步近3天_测试与验证指南.md`。开发过程总结见 `项目开发过程/项目总结-2026-02-28-结构同步近3天与定时前端.md`。
+- ✅ **监控范围条件「创建时间段」已落地并验证（本对话窗口）**：依据 `docs/0监控范围条件[创建时间段]—执行方案.md`。后端 structureSyncService 三 list + listStructureObjectsFromDb 支持 scope_created_within_hours；index.js 结构列表路由透传；前端 facebookApi 与 RuleManager 字段/值/校验/列表带参、多行取 min 小时；`docs/监控范围条件_后端SQL过滤与优先展示方案.md` 已更新。用户验证（名称包含 0227 + 近 24 小时内）与 SQL 核对通过。开发过程总结见 `项目开发过程/项目总结-2026-02-28-监控范围条件创建时间段完成.md`。
+- ⏳ **下一窗口建议（按优先级）**：
+  1. **Step 4 体验与完整性**：结构增量/定时同步、选择器优化；多账户「应用监控范围」拉全量时的加载提示或分页策略（可选）。
+  2. **4.2 IM 机器人**：钉钉/飞书通知、60 秒聚合、Token 熔断/同步异常等告警接入。
+  3. 可选：测试覆盖率 60%→80%；TLS/代理日志噪音优化（200 OK 后仍打 TLS 错误的可观测性优化）；按 `docs/采纳项验证与测试指南.md` 做回归。
+
+**此前进度（2026-02-27）**：
+- ✅ 采纳项 §2.5.3 已全部落地并验收通过；结构镜像三张表新增 created_time（迁移 029）；本窗口新增文档见 `docs/采纳项落地_知识点与教学说明.md`、`docs/采纳项验证与测试指南.md`、`docs/下一步与可选完善.md`。开发过程总结见 `项目开发过程/项目总结-2026-02-27-采纳项落地验收与教学及下一步.md`。
+
+**此前进度（2026-02-24）**：
+- ✅ **采纳清单与监控范围完善（文档定稿）**：多账户 multi、状态不等于、名称类大表等具体改法见 `docs/采纳清单与具体修改说明.md`；实现与验收在本窗口（2026-02-26/27）完成。
+
+**此前进度（2026-02-14）**：
 - ✅ **多账户规则 target_by_account 优化**：evaluateRule 当当前 accountId 不在 target_by_account 时设 targetAdIds=[] 不查全量；getRuleAccountIds/ruleAppliesToAccount 仅对「value 为非空数组」的账户执行；GET /api/structure/objects/multi 响应 meta 增加 per_account_limit、has_more；前端 refreshScopeItems 移除不在 scope 的 targetIds。详见 `项目开发过程/项目总结-2026-02-14-多账户target_by_account优化与ThunderClient验证.md`。
 - ✅ **Thunder Client 小白验证步骤**：`docs/Thunder_Client_小白验证步骤.md`（登录→objects/multi 带 token 与 Query→检查 meta）；验证通过。
 - ⏳ **下一窗口建议（按优先级）**：
@@ -98,6 +130,7 @@
 落地「二、规则配置层」：
 
 - 规则模型包含：目标对象、条件数组（AND/OR）、时间窗口、账户时区。
+- 新增动态筛选模型：`use_dynamic_scope`、`scope_filters`、`exclude_ids`、`max_dynamic_matches`、`dynamic_scope_status`，并通过 `rule_matched_objects(rule_id, account_id)` 承载预计算快照。
 - 支持 Today / Yesterday / Last 3 Days / 累计至今。
 - **对象与状态口径**：前端选择器默认按 ACTIVE/PAUSED（基于 effective_status）过滤；规则执行前用本地 `ad_snapshots.status` 做 Pre-Flight（目标已达成则 skipped），不新增 per-ad GET；FB 返回「already in that state」类错误容错为 skipped/success。
 - **比值类指标与规则比较语义**：cpc/ucpc/cpa/roas 在分母为 0 时为 null（不可比较）；规则比较时 null 与数值比较结果为 false；「坏 vs 空」口径见 **5.2.1 指标口径与规则引擎比较语义**。
@@ -109,6 +142,7 @@
 
 - 实现动作优先级体系（暂停 > 降预算 > 加预算等）。
 - 同一广告同一轮扫描只执行优先级最高的动作。
+- 单条执行与调度执行统一 Dispatcher 口径；当 `use_dynamic_scope=1` 时均按每账户快照读取目标，保证执行与动态筛选快照一致。
 - 支持 Smart Mute（手动/自动挂起），预算上限护栏。
 - 引入 Pre-Flight Check 和重试策略。
 - **动作下发与审计硬口径**：pause_ad 在非 Dry Run 下必须真实调用 FB API（POST），并在 automation_logs 记录 status=success/fail/skipped、skip_reason、is_simulation 等可复盘字段；验收以 FB 后台广告状态变为 PAUSED 为准。Pre-Flight 仅用本地 status + FB 返回 already-state 容错，不新增 per-ad GET。
@@ -184,9 +218,9 @@
     - 状态：`status`(success/fail/skipped)、`error_message`
     - 时间：`triggered_at`(DATETIME)、`created_at`(DATETIME)
 - `structure_ads`（结构镜像：广告清单/选择器数据源，0 次 FB 调用）
-  - 存：ad_id、name、effective_status、层级 id、updated_time、last_synced_at
+  - 存：ad_id、name、effective_status、层级 id、updated_time、**created_time**、last_synced_at
   - 不存：spend/roas 等指标
-  - 用途：规则创建/编辑的指定对象选择器、名称搜索、分页、默认 ACTIVE/PAUSED 展示口径
+  - 用途：规则创建/编辑的指定对象选择器、名称搜索、分页、默认 ACTIVE/PAUSED 展示口径；created_time 供监控范围条件「创建时间段」后续扩展。
 - 口径对齐：**ad_snapshots** = 热指标快照（且 Today 口径可只收 spend>0）；**structure_ads** = 结构与状态镜像（覆盖 0 花费广告，供选择器与状态展示）。结构镜像是「广告清单/选择器读库」用，与「热数据与广告的匹配」无关——热数据与广告的对应由 Insights 返回的 ad_id/ad_name 在写入 ad_snapshots 时已完成。
 
 ### 4.2 Data Ingestor 批量同步流程
@@ -281,7 +315,7 @@
 - **结构同步**：
   1. **首次全量（Bootstrap）必须**：每个账户第一次跑一次真全量分页同步 `/act_xxx/ads`（6 类状态）→ upsert structure_ads；写入 structure_sync_status：has_full_synced=1、last_full_count=COUNT(*)、last_full_success_at、last_success_at。
   2. **Bootstrap 与轮转优先级（写死）**：① 任何账户 **has_full_synced=0** 或 has_full_synced=1 且 last_full_count=0（未铺表）时，轮转任务**必须优先处理该账户**（先铺表再谈伪增量）。② 若结构表本地 COUNT(*)=0 且 **has_full_synced=1**（异常态），本次**直接全量修复**并重置 last_full_count。③ **判定已铺表的最低标准**：**has_full_synced=1 且 last_full_count>0** 才算真正完成过一次可用的全量铺表。
-  3. **后续增量主策略 = 伪增量**：不依赖 FB updated_time filtering（现网不可靠）。**Piggyback 与伪增量关系（写死，防重复调用）**：**结构写库用的 resolveObjectsByIds 同一轮心跳内只执行一次**；Piggyback 承担 activeAdIds 补齐，**尽量复用 Today 同步里已拿到的 ad name/status**（能复用就复用，只对「缺口」补查）；伪增量**只对 diffIds** 调用 resolveObjectsByIds。**diffIds** = recentActiveIds − activeAdIds。**recentActiveIds 取数口径（写死）**：`effective_status='ACTIVE' AND last_synced_at >= UTC_TIMESTAMP() - INTERVAL 24 HOUR`（6h/12h/24h 项目选一写死；用 UTC_TIMESTAMP 避免 session time_zone 歧义）。**每账户每轮差异上限 maxDiffIds=200**，超过按 **last_synced_at 最新优先**。仅对 diffIds 拉 id, name, effective_status, status, configured_status, updated_time → upsert 到 structure_ads；diffIds 为空则不调 FB。
+  3. **后续增量主策略 = 伪增量**：不依赖 FB updated_time filtering（现网不可靠）。**Piggyback 与伪增量关系（写死，防重复调用）**：**结构写库用的 resolveObjectsByIds 同一轮心跳内只执行一次**；Piggyback 承担 activeAdIds 补齐，**尽量复用 Today 同步里已拿到的 ad name/status**（能复用就复用，只对「缺口」补查）；伪增量**只对 diffIds** 调用 resolveObjectsByIds。**diffIds** = recentActiveIds − activeAdIds。**recentActiveIds 取数口径（写死）**：`effective_status='ACTIVE' AND last_synced_at >= UTC_TIMESTAMP() - INTERVAL 24 HOUR`（6h/12h/24h 项目选一写死；用 UTC_TIMESTAMP 避免 session time_zone 歧义）。**每账户每轮差异上限 maxDiffIds=200**，超过按 **last_synced_at 最新优先**。仅对 diffIds 拉 id, name, effective_status, status, configured_status, updated_time, **created_time** → upsert 到 structure_ads；diffIds 为空则不调 FB。
   4. **全量保底**：每小时结构全量轮转，**默认 6 个账户**，**允许动态上调到 12**（条件：API 使用率低 + P0 不繁忙；降级：usage 高/退避/429 → 本小时少跑或不跑）。**结构全量并发固定 1**。结构全量必须为 P1 后台任务：**永远让路 P0**（主心跳/归档/回补），撞上就跳过或延后。
   5. **退避策略**：基于 **x-business-use-case-usage** 的强制降级；水池紧张时优先保主心跳，结构全量立即降级/停跑。
   - **历史方案/可选优化**：原「对外 ISO Z/对内 Unix 秒、5 分钟回看窗口、updated_time > sinceISO 拉增量」仅当**确认 FB 支持 updated_time filtering** 时再启用；**当前版本不依赖该能力**。structure_sync_status 的 last_sync_updated_ts 可仍记录本轮 max(updated_time)（可选），但不作为 FB filtering 的依赖。
