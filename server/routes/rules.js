@@ -8,9 +8,10 @@ import { getCronStatus, executeSingleRule } from '../services/cronService.js'
 import { assertAccountAccess } from '../utils/accountAccess.js'
 import { generateRunId } from '../services/ruleExecutionSummaryService.js'
 import pool from '../db/connection.js'
+import { parseCompositeId, normalizeAccountId } from '../utils/targetIdUtils.js'
 import { validateConditionsStructure, validateTimeWindowConsistency, normalizeConditionsToV2 } from '../utils/conditionsValidator.js'
 import { validateActions } from '../utils/templateValidator.js'
-import { refreshDynamicTargetsForAccount, refreshDynamicTargetsForRule, scheduleDynamicScopeRefreshForRule, isDynamicScopeFeatureEnabled } from '../services/dynamicScopeService.js'
+import { refreshDynamicTargetsForAccount, refreshDynamicTargetsForRule, scheduleDynamicScopeRefreshForRule, isDynamicScopeFeatureEnabled, previewDynamicScope } from '../services/dynamicScopeService.js'
 
 const router = Router()
 
@@ -123,22 +124,52 @@ router.get('/templates', requireAuth, requireActive, async (req, res) => {
  *   - orderBy: createdAt（排序字段）
  *   - limit: 数量限制
  *   - offset: 偏移量
+ *   - ownerIds: 逗号分隔的负责人 ID（仅管理员有效，如 "1,2,3"；不传或空表示全部负责人）
  */
 router.get('/rules', requireAuth, requireActive, async (req, res) => {
   try {
     const userId = req.user.id
     const isAdmin = req.user.role === 'admin'
-    
+
+    // 解析 ownerIds：仅管理员使用；空数组/未传表示不按负责人过滤
+    let ownerIds = undefined
+    if (isAdmin && req.query.ownerIds != null && String(req.query.ownerIds).trim() !== '') {
+      const raw = String(req.query.ownerIds).split(',').map(s => parseInt(s.trim(), 10))
+      ownerIds = [...new Set(raw)].filter(n => Number.isFinite(n) && n > 0)
+      if (ownerIds.length === 0) ownerIds = undefined
+    }
+
     const options = {
       onlyEnabled: req.query.onlyEnabled === 'true',
       orderBy: req.query.orderBy || 'createdAt',
       limit: req.query.limit ? parseInt(req.query.limit) : undefined,
       offset: req.query.offset ? parseInt(req.query.offset) : undefined,
-      isAdmin: isAdmin  // 传递管理员标识
+      isAdmin,
+      ownerIds
     }
-    
+
     const userRules = await rulesService.getUserRules(userId, options)
-    
+
+    const dynamicRuleIds = (userRules || [])
+      .filter((r) => Number(r.useDynamicScope ?? r.use_dynamic_scope) === 1 && r.id != null)
+      .map((r) => r.id)
+    if (dynamicRuleIds.length > 0) {
+      const placeholders = dynamicRuleIds.map(() => '?').join(',')
+      const [rows] = await pool.execute(
+        `SELECT rule_id, COUNT(*) AS cnt FROM rule_matched_objects WHERE rule_id IN (${placeholders}) GROUP BY rule_id`,
+        dynamicRuleIds
+      )
+      const countByRuleId = new Map()
+      for (const row of rows || []) {
+        countByRuleId.set(row.rule_id, row.cnt == null ? 0 : Number(row.cnt))
+      }
+      for (const rule of userRules) {
+        if (countByRuleId.has(rule.id)) {
+          rule.matched_count = countByRuleId.get(rule.id)
+        }
+      }
+    }
+
     res.json({
       rules: userRules,
       count: userRules.length,
@@ -147,6 +178,69 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
   } catch (error) {
     logger.error('获取规则列表失败:', error)
     res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /api/rules/preview-dynamic-scope
+ * 预览动态范围全量 ID（与规则执行共用 calculateMatchedAdIdsForRule，消除 91 vs 101 盲区）
+ * 须注册在 /rules/:id 之前，避免 preview-dynamic-scope 被当作 id。
+ * 请求体：account_ids（必）, scope_filters（必）, target_level（可选默认 ad）, exclude_ids（可选）, max_dynamic_matches（可选）
+ */
+router.post('/rules/preview-dynamic-scope', requireAuth, requireActive, async (req, res, next) => {
+  try {
+    const body = req.body || {}
+    let accountIds = []
+    const rawAccounts = body.account_ids
+    if (Array.isArray(rawAccounts)) {
+      accountIds = rawAccounts.map((id) => String(id || '').trim()).filter(Boolean)
+    } else if (typeof rawAccounts === 'string') {
+      accountIds = rawAccounts.split(',').map((s) => s.trim()).filter(Boolean)
+    }
+    accountIds = [...new Set(accountIds)]
+    if (accountIds.length === 0) {
+      return res.status(400).json({ error: 'account_ids 必填且至少一个有效账户', code: 'ACCOUNT_IDS_REQUIRED' })
+    }
+
+    let scopeFilters = body.scope_filters
+    if (!scopeFilters || typeof scopeFilters !== 'object') {
+      return res.status(400).json({ error: 'scope_filters 必填且为对象', code: 'SCOPE_FILTERS_REQUIRED' })
+    }
+    const targetLevel = (body.target_level || 'ad').trim().toLowerCase()
+    if (!['ad', 'adset', 'campaign'].includes(targetLevel)) {
+      return res.status(400).json({ error: 'target_level 仅支持 ad/adset/campaign', code: 'INVALID_TARGET_LEVEL' })
+    }
+    scopeFilters = { ...scopeFilters }
+    if (!scopeFilters.level) {
+      scopeFilters.level = targetLevel
+    }
+
+    const rawExclude = body.exclude_ids
+    const excludeIds = !rawExclude || typeof rawExclude !== 'object'
+      ? null
+      : {
+          ad_ids: Array.isArray(rawExclude.ad_ids) ? rawExclude.ad_ids.map((id) => String(id)).filter(Boolean) : [],
+          adset_ids: Array.isArray(rawExclude.adset_ids) ? rawExclude.adset_ids.map((id) => String(id)).filter(Boolean) : [],
+          campaign_ids: Array.isArray(rawExclude.campaign_ids) ? rawExclude.campaign_ids.map((id) => String(id)).filter(Boolean) : []
+        }
+
+    for (const accountId of accountIds) {
+      if (!(await assertAccountAccess(req, res, accountId))) return
+    }
+
+    const maxDynamicMatches = body.max_dynamic_matches != null && Number.isFinite(Number(body.max_dynamic_matches))
+      ? Math.max(1, Math.min(Number(body.max_dynamic_matches), 5000))
+      : undefined
+
+    const result = await previewDynamicScope(accountIds, {
+      scopeFilters,
+      excludeIds,
+      targetLevel,
+      maxDynamicMatches
+    })
+    return res.json(result)
+  } catch (err) {
+    next(err)
   }
 })
 
@@ -169,7 +263,28 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
     if (!rule) {
       return res.status(404).json({ error: '规则不存在或无权访问' })
     }
-    
+
+    if (Number(rule.useDynamicScope ?? rule.use_dynamic_scope) === 1) {
+      const [rows] = await pool.execute(
+        'SELECT COUNT(*) AS cnt FROM rule_matched_objects WHERE rule_id = ?',
+        [ruleId]
+      )
+      rule.matched_count = rows?.[0]?.cnt ?? 0
+      const [matchedRows] = await pool.execute(
+        'SELECT account_id, object_id FROM rule_matched_objects WHERE rule_id = ?',
+        [ruleId]
+      )
+      const rawTargetIds = rule.targetIds ?? rule.target_ids ?? []
+      const targetIds = Array.isArray(rawTargetIds) ? rawTargetIds : (typeof rawTargetIds === 'string' ? (() => { try { return JSON.parse(rawTargetIds) } catch { return [] } })() : [])
+      const matchedSet = new Set((matchedRows || []).map((r) => `${normalizeAccountId(r.account_id)}:${String(r.object_id || '').trim()}`))
+      const configuredSet = new Set()
+      for (const compositeId of targetIds) {
+        const p = parseCompositeId(compositeId)
+        if (p) configuredSet.add(`${p.accountId}:${p.objId}`)
+      }
+      rule.invalid_ids = [...configuredSet].filter((c) => !matchedSet.has(c))
+    }
+
     res.json({ rule })
   } catch (error) {
     logger.error('获取规则详情失败:', error)

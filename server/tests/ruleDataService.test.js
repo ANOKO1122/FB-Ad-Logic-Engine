@@ -84,7 +84,7 @@ describe('ruleDataService', () => {
       expect(result.roas).toBe(0.6)
     })
 
-    it('spend=50, purchase_value=0, day.roas=1.2 时应走 API 兜底', () => {
+    it('spend=50, purchase_value=0 时 roas 应为 0（有花费无转化）', () => {
       const row = {
         account_id: 'act_test',
         ad_id: '120xxx',
@@ -97,13 +97,13 @@ describe('ruleDataService', () => {
         unique_link_clicks: 8,
         purchases: 0,
         purchase_value: 0,
-        roas: 1.2,
+        roas: null,
         add_to_cart_count: 0,
         initiate_checkout_count: 0,
         add_payment_info_count: 0
       }
       const result = calculateSingleDayMetrics(row)
-      expect(result.roas).toBe(1.2)
+      expect(result.roas).toBe(0)
     })
 
     it('link_clicks=0 / unique_link_clicks=0 时 cpc/ucpc 应为 null', () => {

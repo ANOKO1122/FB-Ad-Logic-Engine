@@ -106,6 +106,16 @@ const FB_GLOBAL_QUEUE_TIMEOUT_MS = Number.isFinite(FB_GLOBAL_QUEUE_TIMEOUT_MS_RA
   ? Math.max(1000, Math.min(Math.floor(FB_GLOBAL_QUEUE_TIMEOUT_MS_RAW), 120000))
   : 30000
 
+// Insights 源头过滤：默认只取 spend>0 的记录
+const DEFAULT_SPEND_FILTERING = Object.freeze([
+  { field: 'spend', operator: 'GREATER_THAN', value: '0' }
+])
+
+function buildSpendFiltering () {
+  // 预留扩展点：未来可根据配置调整过滤条件（如按多指标过滤）
+  return DEFAULT_SPEND_FILTERING
+}
+
 let fbQueueSeq = 0
 let fbRunningCount = 0
 const fbPendingQueue = []
@@ -177,6 +187,13 @@ function enqueueFacebookRequest({ priority, label, queueTimeoutMs }, run) {
 class FacebookMarketingAPI {
   constructor(accessToken) {
     this.accessToken = accessToken
+  }
+
+  /**
+   * 返回默认的 spend>0 filtering 配置，用于 Insights 源头过滤与 Batch 构造
+   */
+  getDefaultSpendFiltering () {
+    return buildSpendFiltering()
   }
 
   /**
@@ -291,6 +308,70 @@ class FacebookMarketingAPI {
       await sleepBasedOnUsage(usageInfo)
     }
     return results
+  }
+
+  /**
+   * 通用 Batch API：按顺序发送任意子请求集合，并保持结果顺序与请求顺序一致
+   * - 自动按 50 条一批分片（Graph Batch 上限）
+   * - 对每个子响应做双重 JSON 解析（外层数组元素 + body 字符串）
+   * - 返回结构：[{ code, body, raw }, ...]，其中 raw 为原始子响应对象
+   *
+   * @param {Array<{ method: string, relative_url: string, body?: string }>} requests
+   * @param {{ priority?: string|number, label?: string }} [opts]
+   * @returns {Promise<Array<{ code: number, body: any, raw: any }>>}
+   */
+  async batchRequests(requests, { priority = 'action', label = 'actions_batch' } = {}) {
+    if (!Array.isArray(requests) || requests.length === 0) return []
+
+    const BATCH_LIMIT = 50
+    const batchUrl = `${FACEBOOK_API_BASE}/`
+    const allResults = []
+
+    for (let i = 0; i < requests.length; i += BATCH_LIMIT) {
+      const chunk = requests.slice(i, i + BATCH_LIMIT)
+      const batchParams = {
+        batch: JSON.stringify(chunk),
+        access_token: this.accessToken
+      }
+
+      const response = await this.makeRequest(batchUrl, batchParams, 'POST', null, {
+        returnHeaders: true,
+        timeout: 60000,
+        requestPriority: priority,
+        requestLabel: label
+      })
+
+      const responseData = (response && typeof response === 'object' && 'data' in response)
+        ? response.data
+        : response
+      if (responseData?.error) {
+        throw new Error(`Batch API Error: ${responseData.error?.message || 'unknown'}`)
+      }
+
+      const batchResponses = Array.isArray(responseData) ? responseData : []
+      const chunkResults = batchResponses.map((subRes) => {
+        let parsedBody = null
+        if (subRes && subRes.body) {
+          try {
+            parsedBody = JSON.parse(subRes.body)
+          } catch (e) {
+            logger.warn('[Batch] 子响应 body 解析失败，将 raw body 作为字符串保留', {
+              error: e.message
+            })
+          }
+        }
+        return {
+          code: subRes?.code ?? 0,
+          body: parsedBody,
+          raw: subRes
+        }
+      })
+
+      // 按分片顺序直接拼接，确保全局索引顺序与原始 requests 一致
+      allResults.push(...chunkResults)
+    }
+
+    return allResults
   }
 
   /**
@@ -1185,6 +1266,11 @@ class FacebookMarketingAPI {
       if (Array.isArray(options?.actionAttributionWindows) && options.actionAttributionWindows.length > 0) {
         params.action_attribution_windows = options.actionAttributionWindows
       }
+      // 可选：在 FB 端就做 spend>0 过滤，减少包体与 CPU；可通过 DISABLE_SPEND_FILTERING 关闭
+      if (options?.spendGreaterThanZero === true && process.env.DISABLE_SPEND_FILTERING !== '1') {
+        const filtering = buildSpendFiltering()
+        params.filtering = JSON.stringify(filtering)
+      }
       return params
     }
 
@@ -1235,7 +1321,8 @@ class FacebookMarketingAPI {
         }
         if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
 
-        const pageInsights = (data.data || []).map(mapItem)
+        const dataList = Array.isArray(data?.data) ? data.data : []
+        const pageInsights = dataList.map(mapItem)
         allInsights.push(...pageInsights)
 
         currentUrl = data.paging?.next || null

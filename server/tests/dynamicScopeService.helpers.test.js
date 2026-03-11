@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { _internals } from '../services/dynamicScopeService.js'
+import { _internals, previewDynamicScope } from '../services/dynamicScopeService.js'
 
 describe('DynamicScopeService helpers', () => {
   it('getRuleTargetAccountIds 优先使用 target_by_account 的非空账户', () => {
@@ -39,3 +39,34 @@ describe('DynamicScopeService helpers', () => {
   })
 })
 
+describe('previewDynamicScope', () => {
+  it('returns object_ids, count and optional per_account; invalid scopeFilters yield per_account error', async () => {
+    const result = await previewDynamicScope(['act_123'], {
+      scopeFilters: {},
+      excludeIds: null,
+      targetLevel: 'ad'
+    })
+    expect(result).toHaveProperty('object_ids')
+    expect(result).toHaveProperty('count')
+    expect(Array.isArray(result.object_ids)).toBe(true)
+    expect(result.count).toBe(result.object_ids.length)
+    expect(result.object_ids).toHaveLength(0)
+    expect(result.per_account).toBeDefined()
+    expect(result.per_account.act_123).toBeDefined()
+    expect(result.per_account.act_123.status).toBe('ERROR_FILTER_INVALID')
+    expect(result.per_account.act_123.errorMsg).toBeDefined()
+  })
+
+  it('normalizes accountIds and excludeIds; object_ids items are act_xxx:id when present', async () => {
+    const result = await previewDynamicScope('act_a, act_b', {
+      scopeFilters: {},
+      excludeIds: { ad_ids: [], adset_ids: [], campaign_ids: [] }
+    })
+    expect(result.object_ids).toHaveLength(0)
+    expect(result.count).toBe(0)
+    expect(result.per_account).toBeDefined()
+    expect(Object.keys(result.per_account)).toContain('act_a')
+    expect(Object.keys(result.per_account)).toContain('act_b')
+    result.object_ids.forEach((id) => expect(id).toMatch(/^act_\d+:\d+$/))
+  })
+})

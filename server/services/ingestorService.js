@@ -361,15 +361,16 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
     let structurePayload = {}
     try {
       // 直接从 API 查询 insights（不指定 ad_id），Facebook 会返回账户下所有广告的 insights
+      // 优先在 FB 端通过 filtering 做 spend>0 源头过滤（可通过 DISABLE_SPEND_FILTERING 回退到纯本地过滤）
       insights = await facebookApi.getAdInsights(accountId, {
         preset: 'today'
       }, {
         level: 'ad',
-        useAccountAttributionSetting: true
+        useAccountAttributionSetting: true,
+        spendGreaterThanZero: true
       })
       
-      // 在客户端过滤：只保留 spend > 0 的广告
-      // 注意：Facebook API 可能不支持 filtering 参数，所以我们在客户端过滤
+      // 本地仍保留 spend>0 过滤作为兜底，防止 filtering 失效或被关闭时写入 0 花费快照
       insights = insights.filter(insight => {
         const spend = parseFloat(insight.spend || 0)
         return spend > 0
@@ -1476,6 +1477,9 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
   const fields = 'ad_id,ad_name,adset_id,spend,actions,action_values,unique_actions,cost_per_action_type,cost_per_unique_link_click,cost_per_unique_inline_link_click,inline_link_clicks,unique_inline_link_clicks,purchase_roas,website_purchase_roas'
   const useAccountAttributionSetting = 'true'
   
+  // 为 Batch Insights 构造 spend>0 源头过滤（与 FacebookMarketingAPI.DEFAULT_SPEND_FILTERING 保持一致）
+  const batchFilteringStr = encodeURIComponent(JSON.stringify(facebookApi.getDefaultSpendFiltering()))
+
   // 遍历每一组，发送 Batch API 请求
   for (let i = 0; i < adIdChunks.length; i++) {
     const chunk = adIdChunks[i]
@@ -1483,10 +1487,10 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
     
     try {
       // 构造 Batch API 请求体
-      // 每个子请求的 relative_url 格式：{ad_id}/insights?fields=...&date_preset=today&use_account_attribution_setting=true
+      // 每个子请求的 relative_url 格式：{ad_id}/insights?fields=...&date_preset=today&use_account_attribution_setting=true&filtering=...
       const batchRequests = chunk.map(adId => ({
         method: 'GET',
-        relative_url: `${adId}/insights?fields=${fields}&date_preset=${datePreset}&use_account_attribution_setting=${useAccountAttributionSetting}`
+        relative_url: `${adId}/insights?fields=${fields}&date_preset=${datePreset}&use_account_attribution_setting=${useAccountAttributionSetting}&filtering=${batchFilteringStr}`
       }))
       
       // Facebook Batch API 端点
@@ -2849,6 +2853,22 @@ export async function unifiedHeartbeatSync() {
     logger.info(`📋 找到 ${accounts.length} 个活跃账户`)
     logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
+    // Track2 Fast Sync 开关与白名单（用于决定哪些账户可依赖 Track2，不再跑伪增量）
+    const enableTrack2FastSync = process.env.ENABLE_TRACK2_FAST_SYNC === '1' || process.env.ENABLE_TRACK2_FAST_SYNC === 'true'
+    const track2AccountWhitelist = new Set(
+      String(process.env.TRACK2_FAST_SYNC_ACCOUNT_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
+    const isTrack2EnabledForAccount = (accountId) => {
+      if (!enableTrack2FastSync) return false
+      const id = String(accountId || '').trim()
+      if (!id) return false
+      if (track2AccountWhitelist.size === 0) return true
+      return track2AccountWhitelist.has(id)
+    }
+
     // 2. 为每个账户执行同步和归档（受控并发）
     let syncedAccounts = 0
     let archivedAccounts = 0
@@ -2986,8 +3006,15 @@ export async function unifiedHeartbeatSync() {
     // 等待所有账户任务完成
     const results = await Promise.all(accountTasks)
 
-    // 心跳后置阶段：伪增量（对所有账户跑，传空 activeAdIds 也可——由 recentActiveIds 决定是否调 FB，满足「没花钱也要管状态」）
-    const accountsForPseudo = results.filter(r => r?.accountId)
+    // 心跳后置阶段：伪增量（仅对非 Track2 账户跑；Track2 账户由 Track1+Track2+Piggyback 承担结构职责）
+    const allValidAccounts = results.filter((r) => r?.accountId)
+    const track2Accounts = allValidAccounts.filter((r) => isTrack2EnabledForAccount(r.accountId))
+    const accountsForPseudo = allValidAccounts.filter((r) => !isTrack2EnabledForAccount(r.accountId))
+
+    logger.info(
+      `[伪增量] 本轮账户统计: total=${allValidAccounts.length}, track2=${track2Accounts.length}, pseudo=${accountsForPseudo.length}`
+    )
+
     if (accountsForPseudo.length > 0 && process.env.FACEBOOK_ACCESS_TOKEN) {
       const facebookApi = new FacebookMarketingAPI(process.env.FACEBOOK_ACCESS_TOKEN)
       for (const r of accountsForPseudo) {

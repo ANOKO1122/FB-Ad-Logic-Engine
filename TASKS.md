@@ -2,6 +2,8 @@
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
 > 
+> **最新更新（2026-03-11）**：**动态规则 UX 与快照一致性修复**：① **方案「动态规则_ux_与列表性能优化」已闭环**：优化 A（[同步] 按钮、syncJustDoneMessage、syncConfigFromMatch）与优化 B（GET /api/rules 附带 matched_count、规则卡片「当前生效 N 个对象」、rule_matched_objects.rule_id 索引）此前已落地，本窗口确认验收要点满足。② **编辑弹窗「规则配置」与「当前匹配」一致**：打开编辑时对动态规则拉取 GET /api/rules/:id 后，除 matchedCount/invalidIds 外，用接口返回的 target_ids 覆盖 ruleForm.targetIds，并调用 resolveSelectedTargetIds 刷新标签，避免列表陈旧导致「规则配置共 M 个」滞后于「当前匹配 N 个」。③ **重算时清理多余账户快照**：`refreshDynamicTargetsForRule` 在按当前 target_account_ids 刷新各账户快照后，执行 `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (当前账户列表)`，避免目标账户缩小后残留旧账户行导致 matched_count 虚高（如规则 603 仅 3 账户却显示 113 对象）。④ 抽取 `resolveSelectedTargetIds(rawIds)` 复用；临时数据修正 SQL 已提供。窗口总结见 `项目开发过程/项目总结-2026-03-11-动态规则UX与快照一致性修复.md`。
+>
 > **最新更新（2026-03-07）**：**动态筛选多账户闭环（M3.5 + M4.x）完成并验收通过**：① 修复策略 B（`ERROR_OVERSIZE` 保留旧快照）：动态刷新改为 `NORMAL` 规则按 `rule_id + account_id` 原子替换，`ERROR_*` 仅更新状态不清空快照；② 单条执行路径统一到 Dispatcher（`executeSingleRule` 改走 `loadDataForAccount + evaluateRuleWithCache`），确保 `use_dynamic_scope=1` 时严格按 `rule_matched_objects(rule_id, account_id)` 取目标；③ 前后端打通动态筛选配置：规则页新增动态开关（默认开）、上限、状态展示、手动重算 TriggerC、排除名单 UI 与回显，执行语义对齐 `final = (动态 ∪ 手动) - 排除`；④ 多账户动态刷新闭环：TriggerB 保存后按规则涉及账户逐个防抖刷新，TriggerC 传 `ruleId` 自动刷新该规则全部目标账户并返回 `accountResults` 汇总；⑤ `op/operator` 双字段兼容、`act_xxx:id` 目标按账户隔离解析；⑥ 删除规则联动清理 `rule_matched_objects`，避免孤儿快照；⑦ 新增/扩展自动化测试：`ruleEngineDispatcher.test.js`（快照优先 + act:id 隔离）、`dynamicScopeService.helpers.test.js`（多账户账户解析与目标隔离）、`rules.test.js`（删规则联动清快照）。本窗口验证覆盖 TriggerB/TriggerC 多账户、A 超限 B 正常、执行与快照一致，全部通过。窗口总结见 `项目开发过程/项目总结-2026-03-07-动态筛选多账户闭环与项目收尾.md`。
 >
 > **此前进度（2026-03-07）**：**Track2 极速结构同步 + 全局 FB 限流 + 脏结构刷新**：① 在 `server/index.js` 实现统一三边 Batch 内核 `unifiedStructureBatch(accountId, { sinceSec, limit })`，一次请求拉取 `campaigns/adsets/ads`，支持 Unix 秒 / ISO8601 双过滤、边级别错误解析与「单 edge 回补 + ISO 回退」；② 在 `structureSyncService.js` 新增 Track2 快速同步链路：`fastSyncStructureForAccount` 与 `collectFastSyncDataForAccount` 负责单账户 Batch + 软分页补页（仅对返回 `after` 的 edge 用 `getStructurePage` 继续拉，页数上限可配置），`applyMergedFastSyncPayload` 将多账户结果合并去重并对 `structure_campaigns/structure_adsets/structure_ads` 做分块批量 upsert（默认 chunk≈300 行），同时按账户标记 `fast_dirty`；③ `structure_sync_status` 通过迁移 032/033 新增 `last_fast_sync_ts`、`last_fast_filter_since_sec`、`fast_dirty/fast_dirty_marked_at/fast_dirty_cleared_at` 列，Track2 成功后推进专用水位并在规则执行前由 `refreshStructureIfDirtyBeforeRules` 做一次「脏结构刷新」；④ `cronService.js` 增加 Track2 Fast Sync 定时任务（默认 `7,27,52 * * * *`，accounts 由白名单控制、并发 `TRACK2_FAST_SYNC_CONCURRENCY`、窗口 `sinceSec = max(last_fast_sync_sec - bufferSec, now - 3d)`，buffer 默认 4 小时，可配；Token 熔断或 `x-business-use-case-usage` 过高时本轮跳过），Track1 结构轮转改为可选复用 unified batch 内核；⑤ 在 FB 客户端 `FacebookMarketingAPI.makeRequest` 上方引入全局请求队列与优先级闸门：并发上限 `FB_GLOBAL_REQUEST_CONCURRENCY`（默认 10）、优先级顺序 `action > today > track2 > cold`、排队超时 `FB_GLOBAL_QUEUE_TIMEOUT_MS`，所有对 Facebook 的请求（包含 Today 同步、Track1/Track2 结构同步、规则动作）统一经过该队列，解决多任务叠加时的配额抢占与「止损规则被饿死」风险。详细过程与日志示例见 `项目开发过程/项目总结-2026-03-07-Track2极速结构同步与全局限流.md`。
@@ -15,6 +17,36 @@
 > **此前进度（2026-02-27）**：§2.5.3 采纳项已落地并验收通过；结构镜像三张表新增 created_time（迁移 029）；本窗口总结见 `项目开发过程/项目总结-2026-02-27-采纳项落地验收与教学及下一步.md`。
 
 **推荐开发顺序（按依赖与验收最短路径）**：Step 0 数据口径（today spend>0 + status=effective_status）→ Step 1 pause_ad 真闭环（3.3+3.7，Pre-Flight 本地 status、非 Dry Run 真实 POST、already-state 容错）→ Step 2 审计可复盘（4.1 最小字段）→ Step 3 Piggyback 补齐 structure_ads（1.2，失败不影响主链路）→ Step 4 体验与完整性（结构增量/定时同步、选择器优化等）。先保证数据可信，再保证能真关广告，再保证日志可解释，最后优化选择与同步体验。
+>
+> **本窗口执行方案（2026-03-09）**：依据 `.cursor/plans/fb-api-optimizations-v3_8fa0e467.plan.md`（FB API 三项关键优化落地方案 v3）。三项优化及实施顺序：① **优化二** Insights 热数据源头过滤（FB 端 spend>0 过滤、空结果健壮处理、本地兜底、`DISABLE_SPEND_FILTERING` 开关）；② **优化一** 规则执行 Batch POST（按账户收集动作、分片≤50、预算去重合并与覆盖日志、`batchRequests` 顺序拼接、`ENABLE_ACTION_BATCH` 开关）；③ **优化三** Track2 弱化伪增量（Track2 账户不跑伪增量，非 Track2 保留伪增量）。**实施顺序**：先优化二 → 再优化一（分阶段）→ 最后优化三。每完成一项需验收后再进入下一项。
+
+---
+
+## 本窗口执行方案：FB API 三项关键优化（fb-api-optimizations-v3，2026-03-09）
+
+> 方案全文：`.cursor/plans/fb-api-optimizations-v3_8fa0e467.plan.md`。本窗口按以下顺序落地并验收。
+
+- [x] **优化二：Insights 热数据源头过滤（spend>0）**  
+  `FacebookMarketingAPI` 统一过滤配置；`getAdInsights` / `syncAccountTodayStats` 启用 FB 端 filtering；滑动窗口 `fetchInsightsInBatches` 追加 filtering；空结果 `data: []` 健壮处理；本地过滤兜底 + `DISABLE_SPEND_FILTERING` 开关。
+- [x] **优化一：规则执行 Batch POST**  
+  `batchRequests`（分片≤50、顺序拼接）；动作收集与预算去重合并（`PendingAction`、覆盖日志）；`ENABLE_ACTION_BATCH` 开关；先暂停/启用再预算分阶段上线。
+- [x] **优化三：Track2 弱化伪增量**  
+  `isTrack2EnabledForAccount`；`unifiedHeartbeatSync` 仅对非 Track2 账户执行 `runPseudoIncrementForAccount`；概要日志（Track2 覆盖数、伪增量账户数）；Piggyback 不改动。
+
+---
+
+## 动态规则 UX 与快照一致性（2026-03-11，方案 `.cursor/plans/动态规则_ux_与列表性能优化_c2f7ceda.plan.md`）
+
+> 方案目标：编辑弹窗「规则配置/当前匹配」不一致时提供 [同步] 与引导；列表接口为动态规则附带 matched_count 并在卡片展示「当前生效 N 个对象」。以下为方案验收与本窗口补充修复。
+
+- [x] **优化 A（同步按钮与引导）**  
+  当 `ruleForm.useDynamicScope && ruleForm.matchedCount != null && ruleForm.matchedCount !== ruleForm.targetIds.length` 时显示高亮 [同步] 按钮；`syncConfigFromMatch()` 调用 `previewDynamicScope` 更新 `ruleForm.targetIds` 并设置 `syncJustDoneMessage`「配置已更新，请点击【保存规则】以使更改永久生效」；关闭弹窗或保存后清空提示。（RuleManager.vue：showSyncButton、btn-sync-highlight、syncJustDoneMessage）
+- [x] **优化 B（列表 matched_count 与「当前生效 N 个对象」）**  
+  GET /api/rules 对 `use_dynamic_scope=1` 的规则执行 `SELECT rule_id, COUNT(*) FROM rule_matched_objects WHERE rule_id IN (...) GROUP BY rule_id` 并写回 `matched_count`；规则卡片在 `r.useDynamicScope && r.matchedCount != null` 时展示「当前生效 {{ r.matchedCount }} 个对象」；依赖迁移 035 的 `idx_rule(rule_id)` 索引。（server/routes/rules.js；RuleManager.vue 卡片区）
+- [x] **编辑弹窗用详情同步 targetIds（本窗口）**  
+  打开编辑时若为动态规则，拉取 GET /api/rules/:id 后除 `matchedCount`、`invalidIds` 外，用 `data.rule.target_ids`/`targetIds` 覆盖 `ruleForm.targetIds`，并调用 `resolveSelectedTargetIds(nextTargetIds)` 刷新已选对象标签，使「规则配置共 N 个」与「当前匹配 N 个」一致。（RuleManager.vue：openEditRule 内详情 then、resolveSelectedTargetIds）
+- [x] **重算时删除已不在目标账户的快照行（本窗口）**  
+  `refreshDynamicTargetsForRule` 在按 `accountIds` 循环刷新各账户快照之后，执行 `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (当前 accountIds)`，避免目标账户从多改少后 matched_count 仍包含历史账户对象。（server/services/dynamicScopeService.js）
 
 ---
 

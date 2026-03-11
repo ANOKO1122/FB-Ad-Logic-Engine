@@ -106,7 +106,7 @@ describe('规则 API 测试', () => {
         ruleName: '测试规则（新字段）',
         accountId: TEST_ACCOUNT_ID,
         targetLevel: 'adset',
-        targetIds: ['adset_123', 'adset_456'],
+        targetIds: [`${TEST_ACCOUNT_ID}:adset_123`, `${TEST_ACCOUNT_ID}:adset_456`],
         conditions: [
           { metric: 'spend', operator: 'gt', value: 20, time_window: 'today' }
         ],
@@ -126,9 +126,10 @@ describe('规则 API 测试', () => {
       expect(res.status).toBe(201)
       expect(res.body).toHaveProperty('rule')
       
-      // 验证新字段
+      // 验证新字段（targetIds 为复合 ID 格式 accountId:objId）
+      const expectedTargetIds = [`${TEST_ACCOUNT_ID}:adset_123`, `${TEST_ACCOUNT_ID}:adset_456`]
       expect(res.body.rule.targetLevel).toBe('adset')
-      expect(res.body.rule.targetIds).toEqual(['adset_123', 'adset_456'])
+      expect(res.body.rule.targetIds).toEqual(expectedTargetIds)
       expect(res.body.rule.logicOperator).toBe('OR')
       expect(res.body.rule.timezoneName).toBe('Asia/Shanghai')
       expect(res.body.rule.isSimulation).toBe(true)
@@ -145,7 +146,7 @@ describe('规则 API 测试', () => {
       const targetIds = typeof rows[0].target_ids === 'string' 
         ? JSON.parse(rows[0].target_ids) 
         : rows[0].target_ids
-      expect(targetIds).toEqual(['adset_123', 'adset_456'])
+      expect(targetIds).toEqual(expectedTargetIds)
       
       expect(rows[0].logic_operator).toBe('OR')
       expect(rows[0].timezone_name).toBe('Asia/Shanghai')
@@ -274,7 +275,7 @@ describe('规则 API 测试', () => {
           ruleName: '测试规则列表（新字段）',
           accountId: TEST_ACCOUNT_ID,
           targetLevel: 'campaign',
-          targetIds: ['campaign_999'],
+          targetIds: [`${TEST_ACCOUNT_ID}:campaign_999`],
           logicOperator: 'OR',
           timezoneName: 'Europe/London',
           isSimulation: false,
@@ -330,7 +331,8 @@ describe('规则 API 测试', () => {
     })
 
     it('应该返回规则的新字段（M3 扩展）', async () => {
-      // 先创建一个规则（包含新字段）
+      const expectedTargetIds = [`${TEST_ACCOUNT_ID}:adset_111`, `${TEST_ACCOUNT_ID}:adset_222`]
+      // 先创建一个规则（包含新字段，targetIds 使用复合 ID）
       const createRes = await request(app)
         .post('/api/rules')
         .set('Cookie', `token=${authToken}`)
@@ -338,7 +340,7 @@ describe('规则 API 测试', () => {
           ruleName: '测试规则详情（新字段）',
           accountId: TEST_ACCOUNT_ID,
           targetLevel: 'adset',
-          targetIds: ['adset_111', 'adset_222'],
+          targetIds: expectedTargetIds,
           conditions: [
             { metric: 'spend', operator: 'gt', value: 30, time_window: 'yesterday' }
           ],
@@ -358,9 +360,9 @@ describe('规则 API 测试', () => {
       expect(res.status).toBe(200)
       expect(res.body).toHaveProperty('rule')
       
-      // 验证新字段
+      // 验证新字段（targetIds 为复合 ID 格式）
       expect(res.body.rule.targetLevel).toBe('adset')
-      expect(res.body.rule.targetIds).toEqual(['adset_111', 'adset_222'])
+      expect(res.body.rule.targetIds).toEqual(expectedTargetIds)
       expect(res.body.rule.logicOperator).toBe('OR')
       expect(res.body.rule.timezoneName).toBe('Asia/Tokyo')
       expect(res.body.rule.isSimulation).toBe(true)
@@ -415,13 +417,14 @@ describe('规则 API 测试', () => {
       expect(createRes.body.rule.timezoneName).toBe('UTC')
       expect(createRes.body.rule.isSimulation).toBe(false)
 
-      // 更新新字段
+      const expectedTargetIds = [`${TEST_ACCOUNT_ID}:campaign_789`]
+      // 更新新字段（targetIds 使用复合 ID）
       const res = await request(app)
         .put(`/api/rules/${ruleId}`)
         .set('Cookie', `token=${authToken}`)
         .send({
           targetLevel: 'campaign',
-          targetIds: ['campaign_789'],
+          targetIds: expectedTargetIds,
           logicOperator: 'OR',
           timezoneName: 'America/New_York',
           isSimulation: true
@@ -430,9 +433,9 @@ describe('规则 API 测试', () => {
       expect(res.status).toBe(200)
       expect(res.body).toHaveProperty('rule')
       
-      // 验证新字段已更新
+      // 验证新字段已更新（targetIds 为复合 ID 格式）
       expect(res.body.rule.targetLevel).toBe('campaign')
-      expect(res.body.rule.targetIds).toEqual(['campaign_789'])
+      expect(res.body.rule.targetIds).toEqual(expectedTargetIds)
       expect(res.body.rule.logicOperator).toBe('OR')
       expect(res.body.rule.timezoneName).toBe('America/New_York')
       expect(res.body.rule.isSimulation).toBe(true)
@@ -480,6 +483,46 @@ describe('规则 API 测试', () => {
         [ruleId]
       )
       expect(snapshotRows.length).toBe(0)
+    })
+  })
+
+  describe('POST /api/rules/preview-dynamic-scope - 预览动态范围全量 ID', () => {
+    it('缺 scope_filters 应返回 400', async () => {
+      const res = await request(app)
+        .post('/api/rules/preview-dynamic-scope')
+        .set('Cookie', `token=${authToken}`)
+        .send({ account_ids: [TEST_ACCOUNT_ID] })
+      expect(res.status).toBe(400)
+      expect(res.body.code).toBe('SCOPE_FILTERS_REQUIRED')
+    })
+
+    it('缺 account_ids 或空应返回 400', async () => {
+      const res = await request(app)
+        .post('/api/rules/preview-dynamic-scope')
+        .set('Cookie', `token=${authToken}`)
+        .send({ scope_filters: { level: 'ad', conditions: [] } })
+      expect(res.status).toBe(400)
+      expect(res.body.code).toBe('ACCOUNT_IDS_REQUIRED')
+    })
+
+    it('合法 body 且 scope_filters 无效时返回 200，含 object_ids/count 及 per_account 错误', async () => {
+      const res = await request(app)
+        .post('/api/rules/preview-dynamic-scope')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          account_ids: [TEST_ACCOUNT_ID],
+          scope_filters: { level: 'invalid' },
+          target_level: 'ad'
+        })
+      expect(res.status).toBe(200)
+      expect(res.body).toHaveProperty('object_ids')
+      expect(res.body).toHaveProperty('count')
+      expect(Array.isArray(res.body.object_ids)).toBe(true)
+      expect(res.body.count).toBe(res.body.object_ids.length)
+      expect(res.body.object_ids).toHaveLength(0)
+      expect(res.body.per_account).toBeDefined()
+      expect(res.body.per_account[TEST_ACCOUNT_ID]).toBeDefined()
+      expect(res.body.per_account[TEST_ACCOUNT_ID].status).toBe('ERROR_FILTER_INVALID')
     })
   })
 })

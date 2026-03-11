@@ -1,5 +1,6 @@
 // Drizzle ORM Schema 定义
 // 注意：只定义新表（rules），旧表（users, account_mappings）继续使用原生 SQL
+// 规则管理「负责人筛选」方案 B：为联表查询在 Schema 中增加 users、owners 最小只读定义（不迁移表结构）
 import { 
   mysqlTable, 
   int, 
@@ -13,6 +14,22 @@ import {
   text,
   primaryKey
 } from 'drizzle-orm/mysql-core'
+
+// ============================================
+// 旧表只读定义（仅联表用，列名与 MySQL 真实表一致）
+// ============================================
+/** users 表（旧表）：仅 id、owner_id，供 rules → users → owners 联表。owner_id 映射到 Drizzle 的 ownerId */
+export const users = mysqlTable('users', {
+  id: int('id').primaryKey(),
+  ownerId: int('owner_id')  // 映射到 MySQL 列 owner_id，联表时用 users.ownerId
+})
+
+/** owners 表（旧表）：仅 id、owner_name，供联表带出负责人名称。owner_name 映射到 ownerName */
+export const owners = mysqlTable('owners', {
+  id: int('id').primaryKey(),
+  ownerName: varchar('owner_name', { length: 255 })
+})
+
 // 规则表（rules）
 // 这是新功能使用的表，使用 Drizzle ORM 操作
 // 按照 DEV_PLAN.md M3 的要求，扩展了规则配置层所需的新字段

@@ -1,10 +1,37 @@
 // 规则服务层 - 使用 Drizzle ORM 操作 rules 表
 // 注意：这是新功能，使用 Drizzle；旧功能（用户管理）继续使用原生 SQL
 import { db } from '../db/drizzle.js'
-import { rules } from '../db/schema.js'
-import { eq, and, desc } from 'drizzle-orm'
+import { rules, users, owners } from '../db/schema.js'
+import { eq, and, desc, inArray } from 'drizzle-orm'
+import { getTableColumns } from 'drizzle-orm'
 import { getAccountTimezone } from './ruleDataService.js'
 import pool from '../db/connection.js'
+import { parseCompositeId } from '../utils/targetIdUtils.js'
+
+/**
+ * 以 target_ids 为唯一真理，强制生成并覆盖 target_by_account，并归一化 target_ids（去 act_act_ 等脏数据）
+ * @param {object} rule - 含 target_ids / targetIds 的对象，会被原地修改
+ */
+function syncTargetByAccount(rule) {
+  const raw = rule.target_ids ?? rule.targetIds
+  const targetIds = Array.isArray(raw) ? raw : (typeof raw === 'string' ? (() => { try { return JSON.parse(raw) } catch { return [] } })() : [])
+  const newMap = {}
+  const normalizedTargetIds = []
+  for (const compositeId of targetIds) {
+    const parsed = parseCompositeId(compositeId)
+    if (!parsed) continue
+    const { accountId, objId } = parsed
+    if (!newMap[accountId]) newMap[accountId] = []
+    if (!newMap[accountId].includes(objId)) {
+      newMap[accountId].push(objId)
+      normalizedTargetIds.push(`${accountId}:${objId}`)
+    }
+  }
+  rule.targetByAccount = newMap
+  rule.target_by_account = newMap
+  rule.targetIds = normalizedTargetIds
+  rule.target_ids = normalizedTargetIds
+}
 
 /**
  * 创建规则
@@ -19,8 +46,7 @@ export async function createRule(userId, ruleData) {
   const timezoneName = (!tzNorm || tzNorm === 'UTC')
     ? await getAccountTimezone(ruleData.accountId)
     : tzNorm
-  // 使用 Drizzle 插入数据
-  // 对应 SQL: INSERT INTO rules (user_id, account_id, rule_name, target_level, target_ids, conditions, logic_operator, timezone_name, is_simulation, actions, enabled) VALUES (...)
+  syncTargetByAccount(ruleData)
   const result = await db.insert(rules).values({
     userId: userId,
     accountId: ruleData.accountId,
@@ -57,45 +83,53 @@ export async function createRule(userId, ruleData) {
 }
 
 /**
- * 获取用户的所有规则
+ * 获取用户的所有规则（方案 B：联表一次查询，带出负责人信息并按 ownerIds 过滤）
  * @param {number} userId - 用户 ID
  * @param {object} options - 查询选项
  * @param {boolean} options.isAdmin - 是否为管理员（管理员可查看所有规则）
- * @returns {Promise<Array>} 规则列表
+ * @param {number[]} [options.ownerIds] - 仅当 isAdmin 时有效；有值时只查这些负责人下的规则，空/未传表示不按负责人过滤
+ * @returns {Promise<Array>} 规则列表（每项为扁平对象，含 ownerId、ownerName，与旧结构兼容）
  */
 export async function getUserRules(userId, options = {}) {
-  // 构建查询
-  // admin 用户可以查看所有规则，普通用户只能查看自己的规则
-  let query = db.select().from(rules)
-  
-  // 非 admin 用户：只查询自己的规则
-  if (!options.isAdmin) {
-    query = query.where(eq(rules.userId, userId))
-    
-    // 如果只查询启用的规则
-    if (options.onlyEnabled) {
-      query = db.select().from(rules).where(and(eq(rules.userId, userId), eq(rules.enabled, true)))
-    }
-  } else {
-    // admin 用户：查看所有规则（可选只查启用的）
-    if (options.onlyEnabled) {
-      query = query.where(eq(rules.enabled, true))
-    }
+  const { isAdmin, ownerIds, onlyEnabled, orderBy, limit, offset } = options
+
+  // 显式扁平化 select：规则表全部列 + 负责人 id/name，避免 Drizzle 默认返回嵌套 { rules, users, owners }
+  const selectColumns = {
+    ...getTableColumns(rules),
+    ownerId: owners.id,
+    ownerName: owners.ownerName
   }
-  
-  // 排序（默认按创建时间倒序）
-  if (options.orderBy === 'createdAt' || !options.orderBy) {
+
+  let query = db
+    .select(selectColumns)
+    .from(rules)
+    .leftJoin(users, eq(rules.userId, users.id))
+    .leftJoin(owners, eq(users.ownerId, owners.id))
+
+  const filters = []
+  if (!isAdmin) {
+    filters.push(eq(rules.userId, userId))
+  } else if (ownerIds && ownerIds.length > 0) {
+    // 管理员且传了负责人 ID：只查这些负责人下的规则
+    filters.push(inArray(users.ownerId, ownerIds))
+  }
+  if (onlyEnabled) {
+    filters.push(eq(rules.enabled, true))
+  }
+  if (filters.length > 0) {
+    query = query.where(and(...filters))
+  }
+
+  if (orderBy === 'createdAt' || !orderBy) {
     query = query.orderBy(desc(rules.createdAt))
   }
-  
-  // 分页
-  if (options.limit) {
-    query = query.limit(options.limit)
-    if (options.offset) {
-      query = query.offset(options.offset)
+  if (limit) {
+    query = query.limit(limit)
+    if (offset) {
+      query = query.offset(offset)
     }
   }
-  
+
   const userRules = await query
   return userRules
 }
@@ -142,8 +176,9 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false) {
   if (!isAdmin) {
     whereCondition = and(whereCondition, eq(rules.userId, userId))
   }
-  
-  // 对应 SQL: UPDATE rules SET ... WHERE id = ? [AND user_id = ?]
+  if (Object.prototype.hasOwnProperty.call(updates, 'targetIds') && updates.targetIds !== undefined) {
+    syncTargetByAccount(updates)
+  }
   const result = await db
     .update(rules)
     .set({

@@ -4,7 +4,7 @@
 import cron from 'node-cron'
 import logger from '../utils/logger.js'
 import { db } from '../db/drizzle.js'
-import { rules } from '../db/schema.js'
+import { rules, automationLogs } from '../db/schema.js'
 import { eq } from 'drizzle-orm'
 import pool from '../db/connection.js'
 import { RuleEngine, FacebookMarketingAPI } from '../index.js'
@@ -16,7 +16,7 @@ import {
   cleanupAdSnapshots
 } from './ingestorService.js'
 import { getCircuitBreakerStatus, getLastUsageRate } from './rateLimitService.js'
-import { executeActionsForRule, executeActionsForAd, resolveNewBudgetCentsForAction } from './actionExecutorService.js'
+import { executeActionsForRule, executeActionsForAd, resolveNewBudgetCentsForAction, mergeBudgetPendingActions, computeNewBudgetCentsOnce } from './actionExecutorService.js'
 import { pickSingleCandidateAction, getActionPriority } from '../utils/actionPriority.js'
 import { loadDataForAccount, evaluateRuleWithCache } from './ruleEngineDispatcher.js'
 import {
@@ -48,6 +48,60 @@ async function refreshEffectiveStatusForAds(adIds) {
     logger.warn(`   ⚠️  Pre-Flight 刷新 status 失败，使用本地快照:`, err.message)
   }
   return result
+}
+
+async function writeBatchStatusAuditLog({
+  runId,
+  accountId,
+  ownerId,
+  rule,
+  matchedAd,
+  actionType,
+  actionPayload = null,
+  status,
+  errorMessage = null,
+  apiRequest = null,
+  apiResponse = null
+}) {
+  const isSimulation = rule?.isSimulation || rule?.is_simulation || false
+  const metricsSnapshot = {
+    spend: matchedAd?.spend || 0,
+    cpc: matchedAd?.cpc ?? null,
+    ucpc: matchedAd?.ucpc ?? null,
+    roas: matchedAd?.roas ?? null,
+    cpa: matchedAd?.cpa ?? null,
+    purchases: matchedAd?.purchases || 0,
+    link_clicks: matchedAd?.link_clicks ?? 0,
+    unique_link_clicks: matchedAd?.unique_link_clicks ?? 0,
+    add_to_cart_count: matchedAd?.add_to_cart_count ?? 0,
+    initiate_checkout_count: matchedAd?.initiate_checkout_count ?? 0,
+    add_payment_info_count: matchedAd?.add_payment_info_count ?? 0,
+    ad_id: matchedAd?.ad_id,
+    ad_name: matchedAd?.ad_name,
+    status: matchedAd?.status ?? null
+  }
+  try {
+    await db.insert(automationLogs).values({
+      runId: runId || null,
+      accountId: String(accountId),
+      adId: String(matchedAd?.ad_id || ''),
+      adName: matchedAd?.ad_name || null,
+      ruleId: rule?.id || null,
+      ruleName: rule?.ruleName || rule?.rule_name || null,
+      ownerId: ownerId ?? 0,
+      metricsSnapshot,
+      actionType: String(actionType || '').toUpperCase(),
+      actionPayload: actionPayload || { type: actionType },
+      isSimulation,
+      apiRequest,
+      apiResponse,
+      status,
+      errorMessage,
+      triggeredAt: new Date()
+    })
+  } catch (e) {
+    logger.warn(`   ⚠️  写入 Batch 审计日志失败 ad=${matchedAd?.ad_id || 'unknown'}: ${e.message}`)
+  }
 }
 import { syncAccountsFromFacebook } from './accountSyncService.js'
 import { runHourlyStructureFullRotation, fastSyncStructureForAccount, collectFastSyncDataForAccount, applyMergedFastSyncPayload } from './structureSyncService.js'
@@ -472,6 +526,7 @@ function getRuleAccountIds(rule) {
  */
 export async function executeRulesForAccount(accountId, options = {}) {
   const { force = false, runId = null, fromScheduler = false } = options
+  const enableActionBatch = process.env.ENABLE_ACTION_BATCH === '1' || process.env.ENABLE_ACTION_BATCH === 'true'
   
   // ✅ 如果没有传入 runId，生成新的
   const currentRunId = runId || generateRunId()
@@ -676,7 +731,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
     const ruleToMuted = new Map()  // 保留结构，Smart Mute 已移除，不再写入
     const ruleToOutsideWindow = new Map()  // ruleId -> [{ ad_id, windows }]
     const stateUpdates = []  // 调度路径：{ ruleId, scopeKey, lastStatus }[]
+    const allPendingActions = [] // 收集本账户下所有 PendingAction，供预算合并与后续 Batch 使用
     let budgetApi = null
+    const batchStatusPlans = []
+    const batchBudgetPlans = [] // 保留声明供 canUseBatchForBudget 块内使用（当前 canUseBatchForBudget=false 不进入）
     for (const [adId, meta] of arbitrated) {
       // 调度路径：执行时间段检查（文档 §4.2）
       if (fromScheduler) {
@@ -719,6 +777,223 @@ export async function executeRulesForAccount(accountId, options = {}) {
       let success = 0
       let fail = 0
       let results = []
+      const isStatusAction = actionToPass && ['pause_ad', 'activate_ad'].includes(actionToPass.type)
+      const canUseBatchForStatus = enableActionBatch && fromScheduler && isStatusAction && !isSim
+      if (canUseBatchForStatus) {
+        const adStatus = String(meta.matchedAd?.status || '').toUpperCase()
+        const skipPause = actionToPass.type === 'pause_ad' && ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)
+        const skipActivateDone = actionToPass.type === 'activate_ad' && adStatus === 'ACTIVE'
+        const skipActivateForbidden = actionToPass.type === 'activate_ad' && ['ARCHIVED', 'DELETED'].includes(adStatus)
+        const preflightSkipped = skipPause || skipActivateDone || skipActivateForbidden
+        if (preflightSkipped) {
+          const reason = skipPause
+            ? 'already_paused'
+            : (skipActivateDone ? 'already_active' : 'cannot_activate')
+          executionResultsByAd[adId] = { success: 0, fail: 0 }
+          accountMatched++
+          accountExecuted++
+          const cooldownKey = `ad:${adId}`
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
+          await writeBatchStatusAuditLog({
+            runId: currentRunId,
+            accountId: lockedAccountId,
+            ownerId: meta.winnerRule._ownerId ?? 0,
+            rule: meta.winnerRule,
+            matchedAd: meta.matchedAd,
+            actionType: actionToPass.type,
+            status: 'skipped',
+            errorMessage: `目标已达成（status=${adStatus}）`,
+            apiRequest: JSON.stringify({ preFlight: true, status: adStatus }),
+            apiResponse: JSON.stringify({ skipped: true, reason })
+          })
+          continue
+        }
+        batchStatusPlans.push({
+          adId,
+          rule: meta.winnerRule,
+          matchedAd: meta.matchedAd,
+          ownerId: meta.winnerRule._ownerId ?? 0,
+          actionType: actionToPass.type
+        })
+        allPendingActions.push({
+          kind: 'status',
+          op: actionToPass.type === 'pause_ad' ? 'pause' : 'activate',
+          accountId: lockedAccountId,
+          adId,
+          ruleId: meta.winnerRule.id,
+          runId: currentRunId
+        })
+        continue
+      }
+      const canUseBatchForBudget = false // 预算改为逐条 GET→预计算→POST，不再 Batch；状态类仍用 Batch
+      if (canUseBatchForBudget) {
+        try {
+          if (!budgetApi) budgetApi = new FacebookMarketingAPI(FACEBOOK_ACCESS_TOKEN)
+          const intervalMin = meta.winnerRule.executionIntervalMinutes ?? meta.winnerRule.execution_interval_minutes ?? 15
+          const adsetId = meta.matchedAd?.ad_set_id || meta.matchedAd?.adset_id
+          if (!adsetId) {
+            executionResultsByAd[adId] = { success: 0, fail: 1 }
+            accountMatched++
+            accountExecuted++
+            accountErrors++
+            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+            await writeBatchStatusAuditLog({
+              runId: currentRunId,
+              accountId: lockedAccountId,
+              ownerId: meta.winnerRule._ownerId ?? 0,
+              rule: meta.winnerRule,
+              matchedAd: meta.matchedAd,
+              actionType: actionToPass.type,
+              actionPayload: actionToPass,
+              status: 'fail',
+              errorMessage: 'adset_id 不存在，无法调整预算',
+              apiRequest: null,
+              apiResponse: JSON.stringify({ error: 'missing_adset_id' })
+            })
+            continue
+          }
+
+          const adsetDetail = await budgetApi.getAdsetBudgetDetail(adsetId)
+          const isABO = adsetDetail && ((adsetDetail.daily_budget || 0) > 0 || (adsetDetail.lifetime_budget || 0) > 0)
+          let scope = 'adset'
+          let nodeId = adsetId
+          let isDaily = true
+          let currentCents = 0
+          if (isABO) {
+            currentCents = (adsetDetail.daily_budget || 0) > 0 ? adsetDetail.daily_budget : adsetDetail.lifetime_budget
+            isDaily = (adsetDetail.daily_budget || 0) > 0
+          } else {
+            const campaignId = meta.matchedAd?.campaign_id || null
+            if (!campaignId) {
+              executionResultsByAd[adId] = { success: 0, fail: 1 }
+              accountMatched++
+              accountExecuted++
+              accountErrors++
+              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+              await writeBatchStatusAuditLog({
+                runId: currentRunId,
+                accountId: lockedAccountId,
+                ownerId: meta.winnerRule._ownerId ?? 0,
+                rule: meta.winnerRule,
+                matchedAd: meta.matchedAd,
+                actionType: actionToPass.type,
+                actionPayload: actionToPass,
+                status: 'fail',
+                errorMessage: 'CBO 广告系列缺少 campaign_id，无法调整系列预算',
+                apiRequest: null,
+                apiResponse: JSON.stringify({ error: 'missing_campaign_id' })
+              })
+              continue
+            }
+            const campaignDetail = await budgetApi.getCampaignBudgetDetail(campaignId)
+            scope = 'campaign'
+            nodeId = campaignId
+            currentCents = (campaignDetail.daily_budget || 0) > 0 ? campaignDetail.daily_budget : campaignDetail.lifetime_budget
+            isDaily = (campaignDetail.daily_budget || 0) > 0
+          }
+
+          const cooldownKey = scope === 'adset' ? `budget_adset:${nodeId}` : `budget_campaign:${nodeId}`
+          if (intervalMin > 0) {
+            const due = await isCooldownDue(meta.winnerRule.id, cooldownKey, intervalMin)
+            if (!due) {
+              executionResultsByAd[adId] = { success: 0, fail: 0 }
+              accountMatched++
+              accountExecuted++
+              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
+              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'success' })
+              await writeBatchStatusAuditLog({
+                runId: currentRunId,
+                accountId: lockedAccountId,
+                ownerId: meta.winnerRule._ownerId ?? 0,
+                rule: meta.winnerRule,
+                matchedAd: meta.matchedAd,
+                actionType: actionToPass.type,
+                actionPayload: actionToPass,
+                status: 'skipped',
+                errorMessage: '预算冷却未到期',
+                apiRequest: JSON.stringify({ preFlight: true, cooldownKey, reason: 'cooldown_not_reached' }),
+                apiResponse: JSON.stringify({ skipped: true, reason: 'cooldown_not_reached' })
+              })
+              continue
+            }
+          }
+
+          const newBudgetCents = actionToPass.type === 'set_budget'
+            ? computeNewBudgetCentsOnce(currentCents, actionToPass)
+            : ((actionToPass._resolvedBudgetCents != null && Number.isInteger(actionToPass._resolvedBudgetCents))
+                ? actionToPass._resolvedBudgetCents
+                : computeNewBudgetCentsOnce(currentCents, actionToPass))
+          if (currentCents === newBudgetCents) {
+            executionResultsByAd[adId] = { success: 0, fail: 0 }
+            accountMatched++
+            accountExecuted++
+            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
+            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'success' })
+            await writeBatchStatusAuditLog({
+              runId: currentRunId,
+              accountId: lockedAccountId,
+              ownerId: meta.winnerRule._ownerId ?? 0,
+              rule: meta.winnerRule,
+              matchedAd: meta.matchedAd,
+              actionType: actionToPass.type,
+              actionPayload: { ...actionToPass, _resolvedBudgetCents: newBudgetCents },
+              status: 'skipped',
+              errorMessage: '目标已达成（budget_already_at_target）',
+              apiRequest: JSON.stringify({ preFlight: true, currentCents, newBudgetCents, reason: 'budget_already_at_target' }),
+              apiResponse: JSON.stringify({ skipped: true, reason: 'budget_already_at_target' })
+            })
+            continue
+          }
+
+          const budgetField = isDaily ? 'daily_budget' : 'lifetime_budget'
+          batchBudgetPlans.push({
+            adId,
+            rule: meta.winnerRule,
+            matchedAd: meta.matchedAd,
+            ownerId: meta.winnerRule._ownerId ?? 0,
+            actionType: actionToPass.type,
+            actionPayload: { ...actionToPass, _resolvedBudgetCents: newBudgetCents },
+            cooldownKey,
+            request: {
+              method: 'POST',
+              relative_url: `${nodeId}`,
+              body: `${budgetField}=${Math.round(newBudgetCents)}`
+            }
+          })
+          allPendingActions.push({
+            kind: 'budget',
+            scope,
+            accountId: lockedAccountId,
+            nodeId: String(nodeId),
+            isDaily,
+            newBudgetCents: Math.round(newBudgetCents),
+            sourceRuleId: meta.winnerRule.id,
+            runId: currentRunId,
+            rawAction: actionToPass
+          })
+          continue
+        } catch (err) {
+          executionResultsByAd[adId] = { success: 0, fail: 1 }
+          accountMatched++
+          accountExecuted++
+          accountErrors++
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+          await writeBatchStatusAuditLog({
+            runId: currentRunId,
+            accountId: lockedAccountId,
+            ownerId: meta.winnerRule._ownerId ?? 0,
+            rule: meta.winnerRule,
+            matchedAd: meta.matchedAd,
+            actionType: actionToPass.type,
+            actionPayload: actionToPass,
+            status: 'fail',
+            errorMessage: err.message,
+            apiRequest: null,
+            apiResponse: JSON.stringify({ error: err.message })
+          })
+          continue
+        }
+      }
       try {
         results = await executeActionsForAd({
           rule: meta.winnerRule,
@@ -731,6 +1006,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
         for (const r of results) {
           if (r.status === 'success') success++
           else if (r.status === 'fail') fail++
+        }
+        // 收集 PendingAction（仅 data，用于预算合并与 Batch 规划，当前不改变执行路径）
+        if (Array.isArray(results.pendingActions) && results.pendingActions.length > 0) {
+          allPendingActions.push(...results.pendingActions)
         }
         accountMatched++
         accountExecuted++
@@ -752,6 +1031,77 @@ export async function executeRulesForAccount(accountId, options = {}) {
         if (adScopeKey !== cooldownKey) {
           stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: adScopeKey, lastStatus: statusForCooldown })
         }
+      }
+    }
+
+    if (batchStatusPlans.length > 0) {
+      try {
+        const batchApi = new FacebookMarketingAPI(FACEBOOK_ACCESS_TOKEN)
+        const requests = batchStatusPlans.map((plan) => ({
+          method: 'POST',
+          relative_url: `${plan.adId}`,
+          body: plan.actionType === 'pause_ad' ? 'status=PAUSED' : 'status=ACTIVE'
+        }))
+        const batchResults = await batchApi.batchRequests(requests, { priority: 'action', label: 'actions_batch' })
+        for (let i = 0; i < batchStatusPlans.length; i++) {
+          const plan = batchStatusPlans[i]
+          const res = batchResults[i]
+          const ok = Number(res?.code || 0) >= 200 && Number(res?.code || 0) < 300 && !res?.body?.error
+          executionResultsByAd[plan.adId] = { success: ok ? 1 : 0, fail: ok ? 0 : 1 }
+          accountMatched++
+          accountExecuted++
+          if (!ok) accountErrors++
+          const cooldownKey = `ad:${plan.adId}`
+          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: cooldownKey, lastStatus: ok ? 'success' : 'fail' })
+          await writeBatchStatusAuditLog({
+            runId: currentRunId,
+            accountId: lockedAccountId,
+            ownerId: plan.ownerId,
+            rule: plan.rule,
+            matchedAd: plan.matchedAd,
+            actionType: plan.actionType,
+            status: ok ? 'success' : 'fail',
+            errorMessage: ok ? null : (res?.body?.error?.message || `Batch code=${res?.code || 0}`),
+            apiRequest: JSON.stringify(requests[i]),
+            apiResponse: JSON.stringify(res?.body || res?.raw || null)
+          })
+        }
+      } catch (err) {
+        logger.error(`   ❌ [${lockedAccountId}] Batch 状态动作执行失败:`, err.message)
+        for (const plan of batchStatusPlans) {
+          executionResultsByAd[plan.adId] = { success: 0, fail: 1 }
+          accountMatched++
+          accountExecuted++
+          accountErrors++
+          const cooldownKey = `ad:${plan.adId}`
+          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: cooldownKey, lastStatus: 'fail' })
+          await writeBatchStatusAuditLog({
+            runId: currentRunId,
+            accountId: lockedAccountId,
+            ownerId: plan.ownerId,
+            rule: plan.rule,
+            matchedAd: plan.matchedAd,
+            actionType: plan.actionType,
+            status: 'fail',
+            errorMessage: err.message,
+            apiRequest: null,
+            apiResponse: JSON.stringify({ error: err.message })
+          })
+        }
+      }
+    }
+
+    // 预算 PendingAction 去重合并与覆盖日志（不改变执行路径，仅增强可观测性）
+    const { merged: mergedPendingActions, budgetMergeLogs } = mergeBudgetPendingActions(allPendingActions)
+    if (budgetMergeLogs.length > 0) {
+      for (const logMeta of budgetMergeLogs) {
+        logger.info('budget_merge', {
+          accountId: logMeta.accountId,
+          scope: logMeta.scope,
+          nodeId: logMeta.nodeId,
+          keptRuleId: logMeta.keptRuleId,
+          overwrittenRuleIds: logMeta.overwrittenRuleIds
+        })
       }
     }
 

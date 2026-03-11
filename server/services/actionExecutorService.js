@@ -150,6 +150,83 @@ export async function resolveNewBudgetCentsForAction(api, adsetId, action) {
 }
 
 /**
+ * 优化一 Phase3：预算 PendingAction 去重合并（按 scope+nodeId 维度聚合，同一节点单轮只保留最后一条）
+ * - 目前为纯函数，不改执行路径；后续由调度层按账户调用并写 budget_merge 日志。
+ *
+ * @param {Array} pendingActions - executeActionsForAd 收集的 pendingActions（可能包含 status 和 budget）
+ * @returns {{ merged: Array, budgetMergeLogs: Array }}
+ */
+export function mergeBudgetPendingActions(pendingActions) {
+  if (!Array.isArray(pendingActions) || pendingActions.length === 0) {
+    return { merged: [], budgetMergeLogs: [] }
+  }
+
+  const merged = []
+  const budgetByKey = new Map()
+  const budgetOrder = []
+
+  // 1. 先保留所有 status 类 PendingAction，预算类进入 Map 聚合
+  for (const pa of pendingActions) {
+    if (!pa || !pa.kind) continue
+    if (pa.kind === 'budget') {
+      const scope = pa.scope || 'adset'
+      const nodeId = String(pa.nodeId || '')
+      const accountId = String(pa.accountId || '')
+      if (!nodeId || !accountId) continue
+      const key = `${accountId}:${scope}:${nodeId}`
+      budgetByKey.set(key, pa)
+      if (!budgetOrder.includes(key)) {
+        budgetOrder.push(key)
+      }
+    } else {
+      merged.push(pa)
+    }
+  }
+
+  // 2. 生成预算合并日志（同 key 多条时记录 kept/overwritten）
+  const budgetMergeLogs = []
+  const seenKeys = new Map()
+  for (const pa of pendingActions) {
+    if (!pa || pa.kind !== 'budget') continue
+    const scope = pa.scope || 'adset'
+    const nodeId = String(pa.nodeId || '')
+    const accountId = String(pa.accountId || '')
+    if (!nodeId || !accountId) continue
+    const key = `${accountId}:${scope}:${nodeId}`
+    const kept = budgetByKey.get(key)
+    if (!kept) continue
+    let acc = seenKeys.get(key)
+    if (!acc) {
+      acc = { keptRuleId: kept.sourceRuleId ?? null, overwrittenRuleIds: [] }
+      seenKeys.set(key, acc)
+    }
+    if (pa !== kept && pa.sourceRuleId != null) {
+      acc.overwrittenRuleIds.push(pa.sourceRuleId)
+    }
+  }
+
+  for (const [key, info] of seenKeys.entries()) {
+    if (info.overwrittenRuleIds.length === 0) continue
+    const [accountId, scope, nodeId] = key.split(':')
+    budgetMergeLogs.push({
+      accountId,
+      scope,
+      nodeId,
+      keptRuleId: info.keptRuleId,
+      overwrittenRuleIds: info.overwrittenRuleIds
+    })
+  }
+
+  // 3. 将聚合后的预算 PendingAction 追加到合并结果中，保持按首次出现顺序输出
+  for (const key of budgetOrder) {
+    const pa = budgetByKey.get(key)
+    if (pa) merged.push(pa)
+  }
+
+  return { merged, budgetMergeLogs }
+}
+
+/**
  * 执行单个广告的动作并记录审计日志（M4：支持 runId、actionsOverride，审计日志写入 run_id）
  *
  * 【教学：actionsOverride 的作用】
@@ -167,6 +244,7 @@ export async function resolveNewBudgetCentsForAction(api, adsetId, action) {
  */
 export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId, runId = null, actionsOverride = null }) {
   const results = []
+  const pendingActions = []
 
   // M4：仲裁后只执行一条动作时用 actionsOverride，否则用规则配置的 actions
   const actions = Array.isArray(actionsOverride) && actionsOverride.length > 0
@@ -262,6 +340,17 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               break
             }
             cooldownKey = `ad:${matchedAd.ad_id}`
+            // 收集状态类 PendingAction（真实执行路径），Dry Run 仅作为模拟不收集
+            if (!isSimulation) {
+              pendingActions.push({
+                kind: 'status',
+                op: 'pause',
+                accountId,
+                adId: matchedAd.ad_id,
+                ruleId: rule.id,
+                runId
+              })
+            }
             logger.info(`    🔧 执行: 暂停广告 ${matchedAd.ad_id}`)
             apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'PAUSED' } })
             try {
@@ -301,6 +390,16 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               break
             }
             cooldownKey = `ad:${matchedAd.ad_id}`
+            if (!isSimulation) {
+              pendingActions.push({
+                kind: 'status',
+                op: 'activate',
+                accountId,
+                adId: matchedAd.ad_id,
+                ruleId: rule.id,
+                runId
+              })
+            }
             logger.info(`    🔧 执行: 激活广告 ${matchedAd.ad_id}`)
             apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'ACTIVE' } })
             try {
@@ -396,6 +495,19 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
                 logger.info(`      当前预算: ${currentCents} 分，新预算: ${newBudgetCents} 分`)
                 await api.updateAdsetBudget(adsetId, newBudgetCents, isDaily)
               }
+              if (!isSimulation) {
+                pendingActions.push({
+                  kind: 'budget',
+                  scope: 'adset',
+                  accountId,
+                  nodeId: adsetId,
+                  isDaily,
+                  newBudgetCents,
+                  sourceRuleId: rule.id,
+                  runId,
+                  rawAction: action
+                })
+              }
             } else {
               // CBO：预算在 Campaign
               const campaignId = matchedAd.campaign_id || null
@@ -449,6 +561,19 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
                 logger.info(`    🔧 执行: ${adjustDirection}${targetLabel} ${campaignId} 预算 ${paramLabel}`)
                 logger.info(`      当前预算: ${currentCents} 分，新预算: ${newBudgetCents} 分`)
                 await api.updateCampaignBudget(campaignId, newBudgetCents, isDaily)
+              }
+              if (!isSimulation) {
+                pendingActions.push({
+                  kind: 'budget',
+                  scope: 'campaign',
+                  accountId,
+                  nodeId: campaignId,
+                  isDaily,
+                  newBudgetCents,
+                  sourceRuleId: rule.id,
+                  runId,
+                  rawAction: action
+                })
               }
             }
 
@@ -522,6 +647,9 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     })
   }
 
+  // 为后续 Batch 执行预留 PendingAction 规划结果（不改变现有调用方行为）
+  // 调用方当前仍按原约定把 results 当数组使用；如需 Batch，可按需读取 results.pendingActions
+  results.pendingActions = pendingActions
   return results
 }
 
@@ -548,8 +676,161 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
 
   const isSimulation = rule.isSimulation || rule.is_simulation || false
   const modeLabel = isSimulation ? '[Dry Run]' : '[执行]'
+  const enableActionBatch = process.env.ENABLE_ACTION_BATCH === '1' || process.env.ENABLE_ACTION_BATCH === 'true'
   
   logger.info(`  ${modeLabel} 规则 "${rule.ruleName}" 将处理 ${matchedAds.length} 个广告`)
+
+  const ruleActions = Array.isArray(rule.actions) ? rule.actions : []
+  const singleAction = ruleActions.length === 1 ? ruleActions[0] : null
+  const isSingleStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction.type)
+  const canBatchSingleRuleStatus = enableActionBatch && !isSimulation && !!FACEBOOK_ACCESS_TOKEN && isSingleStatusAction
+  if (!canBatchSingleRuleStatus && !isSimulation) {
+    const maybeStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction?.type)
+    if (maybeStatusAction || ruleActions.some(a => ['pause_ad', 'activate_ad'].includes(a?.type))) {
+      logger.info(
+        `  [执行] 单规则未走 Batch，回退逐条执行：enableActionBatch=${enableActionBatch}, isSimulation=${isSimulation}, hasToken=${!!FACEBOOK_ACCESS_TOKEN}, actionsCount=${ruleActions.length}, singleStatusAction=${!!isSingleStatusAction}`
+      )
+    }
+  }
+
+  // 单条规则手动执行也支持状态动作 Batch，便于与调度路径保持一致
+  if (canBatchSingleRuleStatus) {
+    const actionType = singleAction.type
+    const actionUpper = String(actionType || '').toUpperCase()
+    const batchPlans = []
+
+    const insertBatchAuditLog = async ({ matchedAd, status, errorMessage = null, apiRequest = null, apiResponse = null }) => {
+      const metricsSnapshot = {
+        spend: matchedAd?.spend || 0,
+        cpc: matchedAd?.cpc ?? null,
+        ucpc: matchedAd?.ucpc ?? null,
+        roas: matchedAd?.roas ?? null,
+        cpa: matchedAd?.cpa ?? null,
+        purchases: matchedAd?.purchases || 0,
+        link_clicks: matchedAd?.link_clicks ?? 0,
+        unique_link_clicks: matchedAd?.unique_link_clicks ?? 0,
+        add_to_cart_count: matchedAd?.add_to_cart_count ?? 0,
+        initiate_checkout_count: matchedAd?.initiate_checkout_count ?? 0,
+        add_payment_info_count: matchedAd?.add_payment_info_count ?? 0,
+        ad_id: matchedAd?.ad_id,
+        ad_name: matchedAd?.ad_name,
+        status: matchedAd?.status ?? null
+      }
+      try {
+        await db.insert(automationLogs).values({
+          runId: runId || null,
+          accountId: String(accountId),
+          adId: String(matchedAd?.ad_id || ''),
+          adName: matchedAd?.ad_name || null,
+          ruleId: rule?.id || null,
+          ruleName: rule?.ruleName || rule?.rule_name || null,
+          ownerId: ownerId ?? 0,
+          metricsSnapshot,
+          actionType: actionUpper,
+          actionPayload: { type: actionType },
+          isSimulation,
+          apiRequest,
+          apiResponse,
+          status,
+          errorMessage,
+          triggeredAt: new Date()
+        })
+      } catch (logErr) {
+        logger.warn(`    ⚠️  写入 Batch 审计日志失败 ad=${matchedAd?.ad_id || 'unknown'}: ${logErr.message}`)
+      }
+    }
+
+    for (const matchedAd of matchedAds) {
+      const adId = String(matchedAd?.ad_id || '').trim()
+      if (!adId) continue
+      const adStatus = String(matchedAd?.status || '').toUpperCase()
+      const skipPause = actionType === 'pause_ad' && ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)
+      const skipActivateDone = actionType === 'activate_ad' && adStatus === 'ACTIVE'
+      const skipActivateForbidden = actionType === 'activate_ad' && ['ARCHIVED', 'DELETED'].includes(adStatus)
+      const preflightSkipped = skipPause || skipActivateDone || skipActivateForbidden
+
+      if (preflightSkipped) {
+        const reason = skipPause
+          ? 'already_paused'
+          : (skipActivateDone ? 'already_active' : 'cannot_activate')
+        stats.skippedCount++
+        stats.results.push({
+          adId,
+          results: [{ actionType, status: 'skipped', errorMessage: `目标已达成（status=${adStatus}）`, durationMs: 0 }]
+        })
+        await insertBatchAuditLog({
+          matchedAd,
+          status: 'skipped',
+          errorMessage: `目标已达成（status=${adStatus}）`,
+          apiRequest: JSON.stringify({ preFlight: true, status: adStatus }),
+          apiResponse: JSON.stringify({ skipped: true, reason })
+        })
+        continue
+      }
+
+      batchPlans.push({
+        adId,
+        matchedAd,
+        request: {
+          method: 'POST',
+          relative_url: adId,
+          body: actionType === 'pause_ad' ? 'status=PAUSED' : 'status=ACTIVE'
+        }
+      })
+    }
+
+    if (batchPlans.length > 0) {
+      try {
+        const api = new FacebookMarketingAPI(FACEBOOK_ACCESS_TOKEN)
+        const requests = batchPlans.map(plan => plan.request)
+        const batchResults = await api.batchRequests(requests, { priority: 'action', label: 'actions_batch' })
+        for (let i = 0; i < batchPlans.length; i++) {
+          const plan = batchPlans[i]
+          const res = batchResults[i]
+          const ok = Number(res?.code || 0) >= 200 && Number(res?.code || 0) < 300 && !res?.body?.error
+          const status = ok ? 'success' : 'fail'
+          const errorMessage = ok ? null : (res?.body?.error?.message || `Batch code=${res?.code || 0}`)
+          if (ok) {
+            logger.info(`    ✅ Batch 成功${actionType === 'pause_ad' ? '暂停' : '激活'}广告 ${plan.adId}`)
+          } else {
+            logger.warn(`    ❌ Batch 失败 ad=${plan.adId}: ${errorMessage}`)
+          }
+          if (ok) stats.successCount++
+          else stats.failCount++
+          stats.results.push({
+            adId: plan.adId,
+            results: [{ actionType, status, errorMessage, durationMs: 0, cooldownKey: `ad:${plan.adId}` }]
+          })
+          await insertBatchAuditLog({
+            matchedAd: plan.matchedAd,
+            status,
+            errorMessage,
+            apiRequest: JSON.stringify(requests[i]),
+            apiResponse: JSON.stringify(res?.body || res?.raw || null)
+          })
+        }
+        logger.info(`  [执行] Batch 状态动作完成: success=${stats.successCount}, fail=${stats.failCount}, skipped=${stats.skippedCount}`)
+      } catch (err) {
+        logger.error(`    ❌ 单规则 Batch 状态动作执行失败:`, err.message)
+        for (const plan of batchPlans) {
+          stats.failCount++
+          stats.results.push({
+            adId: plan.adId,
+            results: [{ actionType, status: 'fail', errorMessage: err.message, durationMs: 0, cooldownKey: `ad:${plan.adId}` }]
+          })
+          await insertBatchAuditLog({
+            matchedAd: plan.matchedAd,
+            status: 'fail',
+            errorMessage: err.message,
+            apiRequest: JSON.stringify(plan.request),
+            apiResponse: JSON.stringify({ error: err.message })
+          })
+        }
+      }
+    }
+
+    return stats
+  }
 
   for (const matchedAd of matchedAds) {
     try {

@@ -171,6 +171,22 @@ class FacebookMarketingService {
     const resp = await apiClient.post('/rules/dynamic-scope/refresh-account', payload)
     return resp.data || {}
   }
+
+  /**
+   * 预览动态范围全量 ID（与规则执行共用后端逻辑，消除 91 vs 101）
+   * @param {Object} params - account_ids, target_level, scope_filters, exclude_ids, max_dynamic_matches
+   * @returns {Promise<{ object_ids: string[], count: number, per_account?: Object }>}
+   */
+  async previewDynamicScope({ account_ids, target_level, scope_filters, exclude_ids, max_dynamic_matches }) {
+    const resp = await apiClient.post('/rules/preview-dynamic-scope', {
+      account_ids,
+      target_level: target_level || 'ad',
+      scope_filters,
+      exclude_ids: exclude_ids || null,
+      max_dynamic_matches
+    })
+    return resp.data || { object_ids: [], count: 0 }
+  }
 }
 
 export default new FacebookMarketingService()

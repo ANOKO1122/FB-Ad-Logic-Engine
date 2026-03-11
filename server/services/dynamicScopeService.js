@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon'
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
+import { normalizeAccountId } from '../utils/targetIdUtils.js'
 
 const DEFAULT_MAX_MATCHES =
   Number.isFinite(Number(process.env.DYNAMIC_SCOPE_DEFAULT_MAX_MATCHES))
@@ -27,6 +28,14 @@ function parseJsonSafe(value, fallback = null) {
   return value
 }
 
+/**
+ * 归一化复合 ID：保证 accountId 仅一层 act_ 前缀，返回 act_xxx:objId。
+ */
+function normalizeCompositeId(accountId, objId) {
+  const cleanAccountId = normalizeAccountId(accountId || '')
+  return `${cleanAccountId}:${String(objId || '').trim()}`
+}
+
 function getRuleTargetAccountIds(rule) {
   const targetByAccountRaw = rule?.targetByAccount ?? rule?.target_by_account
   const targetByAccount = parseJsonSafe(targetByAccountRaw, null)
@@ -49,19 +58,28 @@ function getRuleTargetAccountIds(rule) {
 }
 
 function getScopedTargetIdsForAccount(rule, accountId) {
+  const rawTargetIds = rule?.targetIds ?? rule?.target_ids ?? []
+  const parsedRaw = parseJsonSafe(rawTargetIds, rawTargetIds)
+  const ids = Array.isArray(parsedRaw) ? parsedRaw.map((id) => String(id || '').trim()).filter(Boolean) : []
+  const normalizedAccountId = normalizeAccountId(accountId)
+  const fromTargetIds = []
+  for (const compositeId of ids) {
+    const idx = compositeId.indexOf(':')
+    if (idx <= 0 || idx === compositeId.length - 1) continue
+    const prefix = compositeId.slice(0, idx)
+    const objId = compositeId.slice(idx + 1).trim()
+    if (normalizeAccountId(prefix) === normalizedAccountId && objId) {
+      fromTargetIds.push(objId)
+    }
+  }
+  if (fromTargetIds.length > 0) {
+    return [...new Set(fromTargetIds)]
+  }
   const targetByAccountRaw = rule?.targetByAccount ?? rule?.target_by_account
   const targetByAccount = parseJsonSafe(targetByAccountRaw, null)
   if (targetByAccount && typeof targetByAccount === 'object' && !Array.isArray(targetByAccount) && accountId in targetByAccount) {
     const arr = targetByAccount[accountId]
     return Array.isArray(arr) ? arr.map((id) => String(id || '').trim()).filter(Boolean) : []
-  }
-
-  const rawTargetIds = rule?.targetIds ?? rule?.target_ids ?? []
-  const parsedRaw = parseJsonSafe(rawTargetIds, rawTargetIds)
-  const ids = Array.isArray(parsedRaw) ? parsedRaw.map((id) => String(id || '').trim()).filter(Boolean) : []
-  const accountScoped = ids.filter((id) => id.startsWith(accountId + ':'))
-  if (accountScoped.length > 0) {
-    return accountScoped.map((s) => s.slice(s.indexOf(':') + 1)).filter(Boolean)
   }
   return ids
 }
@@ -296,6 +314,89 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
   }
 }
 
+/**
+ * 预览动态范围：对给定账户列表 + 监控条件 + 排除名单，按与规则刷新一致逻辑算出全量 ad_id，返回 act_xxx:id 数组。
+ * 内部仅调用 calculateMatchedAdIdsForRule，不新增 SQL；与规则执行共用同一时间基准（UTC now）。
+ *
+ * @param {string[]|string} accountIds - 广告账户 ID 列表（或逗号分隔字符串）
+ * @param {object} options
+ * @param {object} options.scopeFilters - 与规则表一致：{ level, conditions: [{ field, op/operator, value }] }
+ * @param {object} [options.excludeIds] - { ad_ids, adset_ids, campaign_ids } 字符串数组，与 expandExcludeIdsToAdLevel 一致
+ * @param {string} [options.targetLevel='ad'] - 'ad' | 'adset' | 'campaign'
+ * @param {number} [options.maxDynamicMatches] - 与规则表上限一致，默认使用 DEFAULT_MAX_MATCHES
+ * @returns {Promise<{ object_ids: string[], count: number, per_account?: Record<string, { status: string, errorMsg?: string }> }>}
+ */
+export async function previewDynamicScope(accountIds, options) {
+  const ids = Array.isArray(accountIds)
+    ? accountIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : String(accountIds || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+  const accountList = [...new Set(ids)]
+  if (accountList.length === 0) {
+    return { object_ids: [], count: 0 }
+  }
+
+  const rawExclude = options?.excludeIds ?? options?.exclude_ids ?? null
+  const excludeIds = !rawExclude || typeof rawExclude !== 'object'
+    ? { ad_ids: [], adset_ids: [], campaign_ids: [] }
+    : {
+        ad_ids: Array.isArray(rawExclude.ad_ids) ? rawExclude.ad_ids.map((id) => String(id)).filter(Boolean) : [],
+        adset_ids: Array.isArray(rawExclude.adset_ids) ? rawExclude.adset_ids.map((id) => String(id)).filter(Boolean) : [],
+        campaign_ids: Array.isArray(rawExclude.campaign_ids) ? rawExclude.campaign_ids.map((id) => String(id)).filter(Boolean) : []
+      }
+
+  const scopeFilters = options?.scopeFilters ?? options?.scope_filters ?? null
+  const targetLevel = options?.targetLevel ?? options?.target_level ?? 'ad'
+  const maxDynamicMatches = options?.maxDynamicMatches ?? options?.max_dynamic_matches ?? DEFAULT_MAX_MATCHES
+
+  const nowUtc = DateTime.utc()
+  const virtualRule = {
+    useDynamicScope: true,
+    use_dynamic_scope: true,
+    scopeFilters,
+    scope_filters: scopeFilters,
+    excludeIds,
+    exclude_ids: excludeIds,
+    targetLevel,
+    target_level: targetLevel,
+    maxDynamicMatches,
+    max_dynamic_matches: maxDynamicMatches,
+    targetIds: [],
+    target_ids: [],
+    targetByAccount: {},
+    target_by_account: {}
+  }
+  if (logger.debug) {
+    logger.debug('[DynamicScope] preview virtualRule keys: ' + Object.keys(virtualRule).join(','))
+  }
+
+  const objectIds = []
+  const perAccount = {}
+
+  for (const accountId of accountList) {
+    try {
+      const result = await calculateMatchedAdIdsForRule(accountId, virtualRule, nowUtc)
+      if (result.status === 'NORMAL' && Array.isArray(result.finalAdIds) && result.finalAdIds.length > 0) {
+        for (const adId of result.finalAdIds) {
+          objectIds.push(normalizeCompositeId(accountId, adId))
+        }
+      } else if (result.status && result.status !== 'NORMAL') {
+        perAccount[accountId] = { status: result.status, errorMsg: result.errorMsg ?? undefined }
+      }
+    } catch (err) {
+      perAccount[accountId] = { status: 'ERROR_REFRESH_FAILED', errorMsg: err.message }
+    }
+  }
+
+  return {
+    object_ids: objectIds,
+    count: objectIds.length,
+    ...(Object.keys(perAccount).length > 0 ? { per_account: perAccount } : {})
+  }
+}
+
 async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options = {}) {
   const nowUtc = DateTime.utc()
   const start = Date.now()
@@ -469,6 +570,15 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
     accountResults.push(result)
   }
 
+  // 删除该规则下已不在目标账户列表中的快照行，避免「目标账户缩小」后残留旧数据导致 matched_count 虚高
+  if (accountIds.length > 0) {
+    const placeholders = accountIds.map(() => '?').join(',')
+    await pool.execute(
+      `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (${placeholders})`,
+      [id, ...accountIds]
+    )
+  }
+
   // 规则级状态为多账户聚合结果（每账户仍按快照独立写入）
   const hasRefreshFailed = accountResults.some((r) => Number(r.refreshFailed || 0) > 0)
   const hasInvalid = accountResults.some((r) => Number(r.invalid || 0) > 0)
@@ -493,6 +603,28 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
      WHERE id = ?`,
     [finalStatus, finalErrorMsg, id]
   )
+
+  // 重算成功后，用 rule_matched_objects 快照回写 target_ids / target_by_account，使规则配置与当前匹配一致
+  if (finalStatus === 'NORMAL') {
+    const [matchedRows] = await pool.execute(
+      'SELECT account_id, object_id FROM rule_matched_objects WHERE rule_id = ?',
+      [id]
+    )
+    const byAccount = {}
+    const targetIds = []
+    for (const r of matchedRows || []) {
+      const acc = normalizeAccountId(r.account_id)
+      const objId = String(r.object_id ?? '').trim()
+      if (!acc || !objId) continue
+      if (!byAccount[acc]) byAccount[acc] = []
+      byAccount[acc].push(objId)
+      targetIds.push(`${acc}:${objId}`)
+    }
+    await pool.execute(
+      'UPDATE rules SET target_ids = ?, target_by_account = ? WHERE id = ?',
+      [JSON.stringify(targetIds), JSON.stringify(byAccount), id]
+    )
+  }
 
   return {
     ruleId: id,
@@ -547,6 +679,7 @@ export const _internals = {
   getScopedTargetIdsForAccount,
   expandManualTargetIdsToAdLevel,
   expandExcludeIdsToAdLevel,
-  calculateMatchedAdIdsForRule
+  calculateMatchedAdIdsForRule,
+  normalizeCompositeId
 }
 

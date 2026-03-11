@@ -13,6 +13,61 @@
     <div class="header-actions">
       <h2>自动化规则</h2>
       <div class="actions">
+        <div v-if="isAdminFromRules" ref="ownerDropdownRef" class="owner-filter-wrap">
+          <div
+            class="owner-filter-trigger"
+            role="button"
+            tabindex="0"
+            aria-haspopup="listbox"
+            :aria-expanded="ownerFilterOpen"
+            title="不选表示全部负责人；可多选筛选"
+            @click="ownerFilterOpen = !ownerFilterOpen"
+            @keydown.enter.prevent="ownerFilterOpen = !ownerFilterOpen"
+            @keydown.space.prevent="ownerFilterOpen = !ownerFilterOpen"
+          >
+            <div class="owner-filter-trigger-text">
+              <span class="owner-filter-label-inline">负责人:</span>
+              <span class="owner-filter-value">{{ ownerFilterDisplayValue }}</span>
+            </div>
+            <div class="owner-filter-trigger-actions">
+              <button
+                v-if="selectedOwnerIds.length > 0"
+                type="button"
+                class="owner-filter-clear"
+                aria-label="清除筛选"
+                @click.stop="clearOwnerFilter"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+              <span class="owner-filter-chevron" :class="{ open: ownerFilterOpen }">▼</span>
+            </div>
+          </div>
+          <Transition name="owner-dropdown">
+            <div v-show="ownerFilterOpen" class="owner-filter-panel" role="listbox">
+              <div
+                class="owner-filter-option owner-filter-option-clear"
+                role="option"
+                @click.stop="clearOwnerFilter"
+              >
+                清除筛选 (全选)
+              </div>
+              <div
+                v-for="o in ownersList"
+                :key="o.id"
+                class="owner-filter-option"
+                :class="{ selected: selectedOwnerIds.includes(o.id) }"
+                role="option"
+                :aria-selected="selectedOwnerIds.includes(o.id)"
+                @click.stop="toggleOwnerOption(o.id)"
+              >
+                <span class="owner-filter-checkbox" :class="{ selected: selectedOwnerIds.includes(o.id) }">
+                  <span v-show="selectedOwnerIds.includes(o.id)" class="owner-filter-check">✓</span>
+                </span>
+                <span class="owner-filter-option-label">{{ o.owner_name || o.ownerName || o.id }}</span>
+              </div>
+            </div>
+          </Transition>
+        </div>
         <button class="btn" @click="openCreateRule">
           <span class="icon">+</span> 新建规则
         </button>
@@ -53,6 +108,10 @@
             <span class="label">📊 账户:</span>
             <span class="account-id">{{ r.accountId }}</span>
           </div>
+          <div v-if="isAdminFromRules" class="section owner-info">
+            <span class="label">负责人:</span>
+            <span class="owner-name">{{ r.ownerName || '未分配' }}</span>
+          </div>
           <div class="section dynamic-meta">
             <span class="label">动态筛选：</span>
             <span class="pill" :class="r.useDynamicScope ? 'dynamic-on' : 'dynamic-off'">
@@ -61,6 +120,7 @@
             <span v-if="r.useDynamicScope" class="pill" :class="dynamicStatusClass(r.dynamicScopeStatus)">
               {{ dynamicStatusLabel(r.dynamicScopeStatus) }}
             </span>
+            <span v-if="r.useDynamicScope && r.matchedCount != null" class="muted" style="margin-left: 6px;">当前生效 {{ r.matchedCount }} 个对象</span>
           </div>
           <div v-if="r.excludeSummaryText" class="hint">
             {{ r.excludeSummaryText }}
@@ -311,18 +371,23 @@
               <div v-if="!selectedAccountIds.length" class="empty-hint">请先选择至少一个广告账户</div>
               <div v-else class="scope-list">
                 <div class="scope-actions">
-                  <span>已选 {{ ruleForm.targetIds.length }} 个</span>
+                  <span v-if="ruleForm.useDynamicScope && ruleForm.matchedCount != null">当前匹配 {{ ruleForm.matchedCount }} 个对象（规则配置共 {{ ruleForm.targetIds.length }} 个）</span>
+                  <span v-else>已选 {{ ruleForm.targetIds.length }} 个</span>
                   <div class="scope-buttons">
-                    <button class="btn-tiny" @click="selectAllScope" :disabled="!canSelectAll">全选</button>
-                    <button class="btn-tiny" @click="clearScopeSelection" :disabled="!ruleForm.targetIds.length">清空</button>
+                    <button v-if="showSyncButton" class="btn-tiny btn-sync-highlight" @click="syncConfigFromMatch" :disabled="isApplyingScopeConditions">同步</button>
+                    <button class="btn-tiny" @click="selectAllScope" :disabled="!canSelectAll || isApplyingScopeConditions">全选</button>
+                    <button class="btn-tiny" @click="clearScopeSelection" :disabled="!ruleForm.targetIds.length || isApplyingScopeConditions">清空</button>
                   </div>
                 </div>
+                <div v-if="syncJustDoneMessage" class="sync-just-done-hint">{{ syncJustDoneMessage }}</div>
                 <div v-if="ruleForm.targetIds.length" class="selected-preview">
-                  <span v-for="id in selectedTargetPreview" :key="id" class="tag" :class="{ 'tag-missing': resolvedSelectedMap.get(String(id))?.missing }">
-                    <span v-if="resolvedSelectedMap.get(String(id))?.name">
+                  <span v-for="id in selectedTargetPreview" :key="id" class="tag" :class="{ 'tag-missing': resolvedSelectedMap.get(String(id))?.missing, 'tag-invalid': invalidIdSet.has(String(id)) }">
+                    <span v-if="invalidIdSet.has(String(id))">{{ resolvedSelectedMap.get(String(id))?.name || id }} [已失效/未同步]</span>
+                    <span v-else-if="resolvedSelectedMap.get(String(id))?.name">
                       {{ resolvedSelectedMap.get(String(id)).name }}
                     </span>
                     <span v-else-if="resolvedSelectedMap.get(String(id))?.missing">{{ id }} (未同步)</span>
+                    <span v-else-if="!scopeLoadedIdSet.has(String(id))">[已勾选] 未加载数据 (ID: {{ id }})</span>
                     <span v-else>{{ id }}</span>
                   </span>
                   <span v-if="ruleForm.targetIds.length > selectedTargetPreview.length" class="muted">
@@ -596,7 +661,7 @@
 
         <div class="modal-footer">
           <button class="btn secondary" @click="showRuleModal = false">取消</button>
-          <button class="btn" @click="saveRule">保存规则</button>
+          <button class="btn" @click="saveRule" :disabled="isApplyingScopeConditions">保存规则</button>
         </div>
       </div>
     </div>
@@ -604,7 +669,7 @@
 </template>
 
 <script>
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { authFetch } from '../utils/authFetch.js'
 import facebookApi from '../services/facebookApi'
 import {
@@ -622,6 +687,16 @@ export default {
     const templates = ref([])
     const showRuleModal = ref(false)
     const editingRuleId = ref(null)
+    /** 规则列表接口返回的 isAdmin，用于显示负责人筛选与卡片负责人信息 */
+    const isAdminFromRules = ref(false)
+    /** 负责人列表（仅管理员可见，用于下拉多选） */
+    const ownersList = ref([])
+    /** 选中的负责人 ID 列表，空表示「全部负责人」 */
+    const selectedOwnerIds = ref([])
+    /** 负责人筛选下拉是否展开 */
+    const ownerFilterOpen = ref(false)
+    /** 负责人下拉容器（用于点击外部关闭） */
+    const ownerDropdownRef = ref(null)
     const running = ref(false)
     const runningRuleId = ref(null)
     const refreshingRuleId = ref(null)
@@ -648,7 +723,9 @@ export default {
       executionIntervalHoursCustom: null,
       executionTimeWindows: [],
       useDynamicScope: true,
-      maxDynamicMatches: 1000
+      maxDynamicMatches: 1000,
+      matchedCount: null,
+      invalidIds: []
     })
 
     const INTERVAL_PRESETS = [
@@ -691,6 +768,7 @@ export default {
     })
     const scopeConditionRows = ref([createDefaultScopeConditionRow()])
     const scopeApplyMessage = ref('') // 应用条件后的提示，如「已勾选 N 个对象」
+    const syncJustDoneMessage = ref('') // 点击「同步」后的引导：请点击保存规则以使更改永久生效
     const isApplyingScopeConditions = ref(false) // 为 true 时 watch(scopeSearch) 不触发
     /** 执行时间（北京时间）：全天 vs 指定时段，与 ruleForm.executionTimeWindows 双向同步 */
     const executionTimeAllDay = ref(true)
@@ -712,6 +790,15 @@ export default {
     const hasBudgetAction = computed(() =>
       (ruleForm.actions || []).some(a => a.type === 'increase_budget' || a.type === 'decrease_budget'))
     const zeroClickTemplate = computed(() => templates.value.find(t => t.slug === 'zero_click') || null)
+
+    /** 负责人筛选：触发器显示文案（未选=全部，已选=逗号拼接的负责人名） */
+    const ownerFilterDisplayValue = computed(() => {
+      if (!selectedOwnerIds.value.length) return '全部 (不选=全部)'
+      const names = ownersList.value
+        .filter(o => selectedOwnerIds.value.includes(o.id))
+        .map(o => o.owner_name || o.ownerName || String(o.id))
+      return names.length ? names.join(', ') : '全部 (不选=全部)'
+    })
 
     // v2 DNF 工具函数
     const parseJson = (val) => {
@@ -888,6 +975,21 @@ export default {
       return uniq.map(id => ({ level: safeLevel, id }))
     }
 
+    /** 预览接口用：从 excludeTargetIds（act_xxx:id 或 id）构造 exclude_ids { ad_ids, adset_ids, campaign_ids } */
+    const buildExcludeIdsForPreview = (excludeTargetIds, targetLevel) => {
+      const level = ['ad', 'adset', 'campaign'].includes(targetLevel) ? targetLevel : 'ad'
+      const uniq = [...new Set((excludeTargetIds || []).map(v => {
+        const s = String(v || '').trim()
+        if (!s) return ''
+        const idx = s.indexOf(':')
+        return idx >= 0 ? s.slice(idx + 1) : s
+      }).filter(Boolean))]
+      const ad_ids = level === 'ad' ? uniq : []
+      const adset_ids = level === 'adset' ? uniq : []
+      const campaign_ids = level === 'campaign' ? uniq : []
+      return { ad_ids, adset_ids, campaign_ids }
+    }
+
     const normalizeRule = (r) => {
       const raw = parseJson(r.conditions)
       const isV2 = isV2Conditions(raw)
@@ -917,7 +1019,11 @@ export default {
         maxDynamicMatches: r.maxDynamicMatches ?? r.max_dynamic_matches ?? 1000,
         dynamicScopeStatus: String(r.dynamicScopeStatus ?? r.dynamic_scope_status ?? 'NORMAL'),
         dynamicScopeErrorMsg: r.dynamicScopeErrorMsg ?? r.dynamic_scope_error_msg ?? '',
-        dynamicScopeUpdatedAt: r.dynamicScopeUpdatedAt ?? r.dynamic_scope_updated_at ?? null
+        dynamicScopeUpdatedAt: r.dynamicScopeUpdatedAt ?? r.dynamic_scope_updated_at ?? null,
+        matchedCount: r.matched_count != null ? Number(r.matched_count) : null,
+        invalidIds: Array.isArray(r.invalid_ids) ? r.invalid_ids : [],
+        ownerId: r.ownerId ?? r.owner_id ?? null,
+        ownerName: r.ownerName ?? r.owner_name ?? '未分配'
       }
     }
 
@@ -933,13 +1039,47 @@ export default {
 
     const loadRules = async () => {
       try {
-        const resp = await authFetch('/api/rules')
+        let url = '/api/rules'
+        if (isAdminFromRules.value && selectedOwnerIds.value.length > 0) {
+          const ids = selectedOwnerIds.value.map(id => Number(id)).filter(Number.isFinite)
+          if (ids.length > 0) url += '?ownerIds=' + ids.join(',')
+        }
+        const resp = await authFetch(url)
         const data = await resp.json()
         if (!resp.ok) throw new Error(data.error || '获取规则失败')
+        isAdminFromRules.value = data.isAdmin === true
+        if (data.isAdmin) {
+          try {
+            const oResp = await authFetch('/api/owners')
+            const oData = await oResp.json()
+            ownersList.value = oData.owners || []
+          } catch {
+            ownersList.value = []
+          }
+        }
         rules.value = (data.rules || []).map(normalizeRule)
       } catch (e) {
         alert(`加载规则失败：${e.message}`)
       }
+    }
+
+    /** 负责人筛选：清除已选并重新拉规则 */
+    const clearOwnerFilter = () => {
+      selectedOwnerIds.value = []
+      ownerFilterOpen.value = false
+      loadRules()
+    }
+
+    /** 负责人筛选：切换某一负责人的选中状态并重新拉规则 */
+    const toggleOwnerOption = (id) => {
+      const ids = selectedOwnerIds.value
+      const idx = ids.indexOf(id)
+      if (idx >= 0) {
+        selectedOwnerIds.value = ids.filter((_, i) => i !== idx)
+      } else {
+        selectedOwnerIds.value = [...ids, id]
+      }
+      loadRules()
     }
 
     const loadAccounts = async () => {
@@ -1077,9 +1217,21 @@ export default {
       return ruleForm.value.targetIds.slice(0, 6)
     })
 
+    /** 当前已加载的 scope 列表中的 id 集合（用于显示「未加载数据」） */
+    const scopeLoadedIdSet = computed(() => new Set(scopeItems.value.map(x => scopeItemValue(x))))
+
+    /** 后端返回的失效目标复合 ID 集合（规则配置中有但未进入 rule_matched_objects） */
+    const invalidIdSet = computed(() => new Set((ruleForm.value.invalidIds || []).map(String)))
+
+    /** 仅当「当前匹配数 ≠ 规则配置数」时显示 [同步] 按钮 */
+    const showSyncButton = computed(() =>
+      !!ruleForm.value.useDynamicScope &&
+      ruleForm.value.matchedCount != null &&
+      ruleForm.value.matchedCount !== (ruleForm.value.targetIds?.length ?? 0)
+    )
+
     const missingSelectedCount = computed(() => {
-      const set = new Set(scopeItems.value.map(x => scopeItemValue(x)))
-      return ruleForm.value.targetIds.filter(id => !set.has(String(id))).length
+      return ruleForm.value.targetIds.filter(id => !scopeLoadedIdSet.value.has(String(id))).length
     })
 
     /** 比值类指标口径提示：cpc/ucpc/cpa/roas 需搭配分母条件，否则为 null（TASKS 2.3 前端口径防呆） */
@@ -1204,6 +1356,34 @@ export default {
       return [...set]
     }
 
+    /** 将 targetIds（act_xxx:id）解析为可读标签并写入 resolvedSelectedMap；无 id 时清空。用于编辑回显与详情拉取后刷新。 */
+    function resolveSelectedTargetIds(rawIds) {
+      if (!rawIds?.length) {
+        resolvedSelectedMap.value = new Map()
+        return
+      }
+      const idParts = rawIds.map((id) => {
+        const s = String(id)
+        const idx = s.indexOf(':')
+        return idx >= 0 ? s.slice(idx + 1) : s
+      })
+      const uniqueIdParts = [...new Set(idParts)]
+      facebookApi.resolveObjectsByIds(uniqueIdParts)
+        .then((items) => {
+          const idToItem = new Map()
+          for (const it of items || []) idToItem.set(String(it.id), it)
+          const m = new Map()
+          for (const targetId of rawIds) {
+            const key = String(targetId)
+            const idPart = key.includes(':') ? key.slice(key.indexOf(':') + 1) : key
+            const item = idToItem.get(idPart)
+            m.set(key, item ? { ...item, id: idPart } : { id: idPart, missing: true })
+          }
+          resolvedSelectedMap.value = m
+        })
+        .catch(() => {})
+    }
+
     const openEditRule = (r) => {
       editingRuleId.value = r.id
       // 多账户：优先用后端返回的 target_account_ids；否则从 targetIds（act_xxx:id）解析
@@ -1234,7 +1414,9 @@ export default {
         executionIntervalHoursCustom: mapMinutesToPreset(r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15) === 'custom' ? ((r.executionIntervalMinutes ?? r.execution_interval_minutes ?? 15) / 60) : null,
         executionTimeWindows: (r.executionTimeWindows ?? r.execution_time_windows) && Array.isArray(r.executionTimeWindows ?? r.execution_time_windows) ? (r.executionTimeWindows ?? r.execution_time_windows) : [],
         useDynamicScope: r.useDynamicScope !== false,
-        maxDynamicMatches: Number(r.maxDynamicMatches ?? r.max_dynamic_matches ?? 1000) || 1000
+        maxDynamicMatches: Number(r.maxDynamicMatches ?? r.max_dynamic_matches ?? 1000) || 1000,
+        matchedCount: r.matched_count != null ? Number(r.matched_count) : null,
+        invalidIds: Array.isArray(r.invalid_ids) ? r.invalid_ids : []
       }))
       scopeConditionRows.value = buildScopeRowsFromFilters(r.scopeFilters || r.scope_filters || null)
       const normalizedCount = normalizeBudgetGuardsByAction(ruleForm.value.actions)
@@ -1257,33 +1439,27 @@ export default {
       executionTimeAllDay.value = win.length === 0
       executionTimeStart.value = win[0]?.start ? String(win[0].start).slice(0, 5) : '09:00'
       executionTimeEnd.value = win[0]?.end ? String(win[0].end).slice(0, 5) : '18:00'
-      // 回显：已选对象解析成可读标签。多账户时 targetIds 持久化为 act_xxx:id，后端 resolve 只认纯 id，故拆出 id 部分去请求
+      // 回显：已选对象解析成可读标签（抽成函数，详情拉取后更新 targetIds 时也会复用）
       resolvedSelectedMap.value = new Map()
-      if (ruleForm.value.targetIds?.length) {
-        const rawIds = ruleForm.value.targetIds
-        const idParts = rawIds.map(id => {
-          const s = String(id)
-          const idx = s.indexOf(':')
-          return idx >= 0 ? s.slice(idx + 1) : s
-        })
-        const uniqueIdParts = [...new Set(idParts)]
-        facebookApi.resolveObjectsByIds(uniqueIdParts)
-          .then((items) => {
-            const idToItem = new Map()
-            for (const it of items || []) idToItem.set(String(it.id), it)
-            const m = new Map()
-            for (const targetId of rawIds) {
-              const key = String(targetId)
-              const idPart = key.includes(':') ? key.slice(key.indexOf(':') + 1) : key
-              const item = idToItem.get(idPart)
-              m.set(key, item ? { ...item, id: idPart } : { id: idPart, missing: true })
+      resolveSelectedTargetIds(ruleForm.value.targetIds)
+      loadTemplates()
+      showRuleModal.value = true
+      // 动态规则：拉取规则详情以获取 matched_count、最新 target_ids（与 rule_matched_objects 一致），避免列表陈旧导致「规则配置共 N 个」滞后
+      if (r.id && ruleForm.value.useDynamicScope) {
+        authFetch(`/api/rules/${r.id}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.rule && ruleForm.value && editingRuleId.value === r.id) {
+              ruleForm.value.matchedCount = data.rule.matched_count != null ? Number(data.rule.matched_count) : null
+              ruleForm.value.invalidIds = Array.isArray(data.rule.invalid_ids) ? data.rule.invalid_ids : []
+              const fromApi = data.rule.targetIds ?? data.rule.target_ids
+              const nextTargetIds = Array.isArray(fromApi) ? [...fromApi] : (typeof fromApi === 'string' ? (() => { try { return JSON.parse(fromApi) } catch { return [] } })() : [])
+              ruleForm.value.targetIds = nextTargetIds
+              resolveSelectedTargetIds(nextTargetIds)
             }
-            resolvedSelectedMap.value = m
           })
           .catch(() => {})
       }
-      loadTemplates()
-      showRuleModal.value = true
     }
 
     /** 动作类型切换：预算类时设置默认 value_unit、value */
@@ -1442,6 +1618,7 @@ export default {
       submit.then(async (resp) => {
         const data = await resp.json()
         if (!resp.ok) throw new Error(data.error || '保存失败')
+        syncJustDoneMessage.value = ''
         showRuleModal.value = false
         await loadRules()
       }).catch((e) => {
@@ -1609,13 +1786,7 @@ export default {
           scopeItems.value = result.items || []
           scopePagingAfter.value = result.paging?.after ?? null
         }
-        // 层级/账户变更或刷新后：已选目标中只保留当前列表中的项，保证已选 ⊆ 当前列表（多账户用 act:id，单账户用 id）
-        if (scopeItems.value.length > 0) {
-          const multi = selectedAccountIds.value.length > 1
-          const allowedSet = new Set(scopeItems.value.map(it => multi ? `${it.account_id || ''}:${it.id}` : String(it.id)))
-          ruleForm.value.targetIds = ruleForm.value.targetIds.filter(id => allowedSet.has(String(id)))
-          ruleForm.value.excludeTargetIds = ruleForm.value.excludeTargetIds.filter(id => allowedSet.has(String(id)))
-        }
+        // 不再用当前页 scope 列表过滤 ruleForm.targetIds / excludeTargetIds，避免分页导致接口返回的 98 条被裁成 95 条；未出现在当前列表的 ID 仅做提示保留
         scopeReady.value = true
       } catch (e) {
         if (requestId !== scopeRequestId.value) return
@@ -1819,8 +1990,9 @@ export default {
       return null
     }
 
-    /** 应用监控范围条件。有名称/状态/创建时间段条件时用后端 SQL 过滤，只拉匹配项；单账户与多账户均拉全量匹配项并全部勾选。 */
+    /** 应用监控范围条件。有筛选条件时走预览接口，与规则执行共用后端逻辑（消除 91 vs 101）。 */
     const applyScopeConditions = async () => {
+      if (isApplyingScopeConditions.value) return
       scopeApplyMessage.value = ''
       const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
       if (completed.length === 0) {
@@ -1872,30 +2044,86 @@ export default {
       const needFetchAll = !!nameIncludeKeyword || !!nameExcludeKeyword || hasStatusCondition || hasCreatedWithinCondition
 
       if (needFetchAll) {
-        scopeApplyMessage.value = '正在拉取匹配结果…'
+        scopeApplyMessage.value = '正在计算监控范围…'
         scopeSearch.value = nameIncludeKeyword
         scopeNameExclude.value = nameExcludeKeyword || ''
         if (hasStatusCondition) scopeIncludePaused.value = true
         isApplyingScopeConditions.value = true
-        let pageCount = 1
         try {
-          await refreshScopeItems()
-          // 单账户与多账户均拉全量匹配项（后端 SQL 已过滤，每页仅返回匹配项，循环直到无下一页）
-          while (scopePagingAfter.value) {
-            await loadMoreScopeItems()
-            pageCount += 1
-            scopeApplyMessage.value = `正在按条件加载第 ${pageCount} 页，已加载 ${scopeItems.value.length} 条…`
-            await new Promise(r => setTimeout(r, 0))
+          const scope_filters = buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel)
+          const exclude_ids = buildExcludeIdsForPreview(ruleForm.value.excludeTargetIds, ruleForm.value.targetLevel)
+          const max_dynamic_matches = ruleForm.value.maxDynamicMatches != null && Number.isFinite(Number(ruleForm.value.maxDynamicMatches))
+            ? Number(ruleForm.value.maxDynamicMatches)
+            : undefined
+          const response = await facebookApi.previewDynamicScope({
+            account_ids: selectedAccountIds.value,
+            target_level: ruleForm.value.targetLevel,
+            scope_filters,
+            exclude_ids,
+            max_dynamic_matches
+          })
+          ruleForm.value.targetIds = response.object_ids || []
+          scopeApplyMessage.value = `已勾选 ${response.count} 个对象（与规则执行范围一致）`
+          if (response.per_account) {
+            const oversizedAccounts = Object.keys(response.per_account).filter(
+              accId => response.per_account[accId].status === 'ERROR_OVERSIZE'
+            )
+            if (oversizedAccounts.length > 0) {
+              scopeApplyMessage.value += ` (注意：账户 ${oversizedAccounts.join(', ')} 匹配数超限)`
+            }
           }
+        } catch (err) {
+          const data = err.response?.data
+          scopeApplyMessage.value = data?.error || err.message || '预览失败'
         } finally {
           isApplyingScopeConditions.value = false
         }
-      } else if (!scopeItems.value.length) {
+        return
+      }
+
+      if (!scopeItems.value.length) {
         scopeApplyMessage.value = '请先选择账户并加载列表'
         return
       }
 
       applyScopeConditionsToCurrentList(completed, multi)
+    }
+
+    /** 将「当前匹配」结果同步到表单 targetIds，并提示用户保存；仅在有差异时由 [同步] 按钮触发 */
+    const syncConfigFromMatch = async () => {
+      if (isApplyingScopeConditions.value) return
+      if (!ruleForm.value.useDynamicScope || !selectedAccountIds.value?.length) return
+      const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+      if (completed.length === 0) {
+        syncJustDoneMessage.value = '请先填写完整的监控范围条件'
+        return
+      }
+      syncJustDoneMessage.value = ''
+      isApplyingScopeConditions.value = true
+      try {
+        const scope_filters = buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel)
+        const exclude_ids = buildExcludeIdsForPreview(ruleForm.value.excludeTargetIds, ruleForm.value.targetLevel)
+        const max_dynamic_matches = ruleForm.value.maxDynamicMatches != null && Number.isFinite(Number(ruleForm.value.maxDynamicMatches))
+          ? Number(ruleForm.value.maxDynamicMatches)
+          : undefined
+        const prevLen = (ruleForm.value.targetIds || []).length
+        const response = await facebookApi.previewDynamicScope({
+          account_ids: selectedAccountIds.value,
+          target_level: ruleForm.value.targetLevel,
+          scope_filters,
+          exclude_ids,
+          max_dynamic_matches
+        })
+        ruleForm.value.targetIds = response.object_ids || []
+        if ((ruleForm.value.targetIds || []).length !== prevLen) {
+          syncJustDoneMessage.value = '配置已更新，请点击【保存规则】以使更改永久生效'
+        }
+      } catch (err) {
+        const data = err.response?.data
+        syncJustDoneMessage.value = data?.error || err.message || '同步失败'
+      } finally {
+        isApplyingScopeConditions.value = false
+      }
     }
 
     /** 按当前 scopeItems 与已完成的条件行，做 match 并写回 targetIds（供 applyScopeConditions 与加载更多后复用） */
@@ -1962,6 +2190,10 @@ export default {
       { deep: true }
     )
 
+    watch(showRuleModal, (v) => {
+      if (!v) syncJustDoneMessage.value = ''
+    })
+
     const addAction = () => {
       ruleForm.value.actions.push({ type: 'pause_ad', value: null })
     }
@@ -2021,9 +2253,26 @@ export default {
       ruleForm.value.actions = acts.length ? acts.map(a => ({ ...a })) : [{ type: 'pause_ad', value: null }]
     }
 
+    /** 负责人下拉：点击外部关闭的清理函数 */
+    let ownerFilterClickOutsideCleanup = null
+
     onMounted(async () => {
       await loadAccounts()
       await loadRules()
+
+      const handleOwnerFilterClickOutside = (e) => {
+        const el = ownerDropdownRef.value
+        if (el && !el.contains(e.target)) ownerFilterOpen.value = false
+      }
+      document.addEventListener('mousedown', handleOwnerFilterClickOutside)
+      ownerFilterClickOutsideCleanup = () => document.removeEventListener('mousedown', handleOwnerFilterClickOutside)
+    })
+
+    onBeforeUnmount(() => {
+      if (ownerFilterClickOutsideCleanup) {
+        ownerFilterClickOutsideCleanup()
+        ownerFilterClickOutsideCleanup = null
+      }
     })
 
     // 仅开发环境：挂到 window 供控制台验证阶段 1 转换函数（生产构建不会包含）
@@ -2037,20 +2286,24 @@ export default {
 
     return {
       rules, showRuleModal, editingRuleId, ruleForm, running, runningRuleId, refreshingRuleId,
+      isAdminFromRules, ownersList, selectedOwnerIds,
+      ownerFilterOpen, ownerFilterDisplayValue, ownerDropdownRef, clearOwnerFilter, toggleOwnerOption,
       whenLines, whenTimeWindow, whenCustomRange,
       linesToV2Groups, v2ToLines, v1ToLines,
       createDefaultWhenLine, ensureWhenLinesNonEmpty, getDefaultWhenCustomRange,
       accounts, selectedAccountIds, accountToAdd, accountsFilteredForAdd, accountLabel, onAddAccount, removeAccount, selectAllAccounts, clearAllAccounts,
-      scopeItems, scopeSearch, scopeLoading, scopeReady, filteredScopeItems, scopeItemKey, scopeItemValue,
+      scopeItems, scopeSearch, scopeLoading, scopeReady, filteredScopeItems, scopeItemKey, scopeItemValue, scopeLoadedIdSet,
       accountLoading, accountError, loadAccounts,
       canSelectAll, selectedTargetPreview,
       scopePagingAfter, loadMoreScopeItems, missingSelectedCount, resolvedSelectedMap,
+      isApplyingScopeConditions, invalidIdSet,
       levelOptions, hasBudgetAction,
       loadRules, loadTemplates, templates, zeroClickTemplate, metricLabel, opLabel, actionLabel, getActionClass, timeWindowLabel,
       formatExecutionTimeDisplay, formatIntervalDisplay, dynamicStatusLabel, dynamicStatusClass,
       ratioMetricTip,
       openCreateRule, openEditRule, saveRule, deleteRule, toggleRule, runThisRule, refreshDynamicScopeForRule,
       refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection, selectAllExcludeScope, clearExcludeScopeSelection,
+      showSyncButton, syncJustDoneMessage, syncConfigFromMatch,
       addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange,
       scopeConditionRows, SCOPE_CONDITION_MAX_ROWS, addScopeConditionRow, removeScopeConditionRow, onScopeConditionFieldChange,
       scopeConditionRowError, scopeApplyMessage,
@@ -2108,7 +2361,170 @@ export default {
 }
 
 .header-actions h2 { margin: 0; font-size: 24px; color: var(--text-primary); }
-.actions { display: flex; gap: 12px; }
+.actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+.owner-filter-wrap {
+  position: relative;
+  min-width: 240px;
+}
+
+.owner-filter-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 240px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid var(--border-color, #e5e7eb);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.owner-filter-trigger:hover {
+  border-color: var(--primary-color, #2563eb);
+  box-shadow: 0 0 0 1px var(--primary-color, #2563eb);
+}
+
+.owner-filter-trigger-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  min-width: 0;
+}
+.owner-filter-label-inline {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--text-secondary, #6b7280);
+}
+.owner-filter-value {
+  font-weight: 500;
+  color: var(--text-primary, #111827);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.owner-filter-trigger-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.owner-filter-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #6b7280);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 4px;
+}
+.owner-filter-clear:hover {
+  color: var(--danger-color, #dc2626);
+  background: #fef2f2;
+}
+.owner-filter-chevron {
+  font-size: 10px;
+  color: var(--text-secondary, #6b7280);
+  transition: transform 0.2s;
+}
+.owner-filter-chevron.open {
+  transform: rotate(180deg);
+}
+
+.owner-filter-panel {
+  position: absolute;
+  z-index: 50;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  background: #fff;
+  border: 1px solid var(--border-color, #e5e7eb);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.owner-filter-option {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--text-primary, #374151);
+  transition: background 0.15s;
+}
+.owner-filter-option:hover {
+  background: #f3f4f6;
+}
+.owner-filter-option.selected {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+.owner-filter-option-clear {
+  color: var(--text-secondary, #6b7280);
+  border-bottom: 1px solid var(--border-color, #e5e7eb);
+  margin-bottom: 4px;
+}
+.owner-filter-option-clear:hover {
+  background: #f9fafb;
+  color: var(--primary-color, #2563eb);
+}
+
+.owner-filter-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 10px;
+  flex-shrink: 0;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+  transition: border-color 0.2s, background 0.2s;
+}
+.owner-filter-option.selected .owner-filter-checkbox {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+.owner-filter-check {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.owner-filter-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 负责人下拉展开/收起过渡 */
+.owner-dropdown-enter-active,
+.owner-dropdown-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.owner-dropdown-enter-from,
+.owner-dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.owner-info .owner-name { color: var(--text-primary); }
 
 /* 卡片网格 */
 .rules-grid {
@@ -2301,6 +2717,7 @@ input:checked + .slider:before { transform: translateX(16px); }
 .link-add-scope:hover { text-decoration: underline; }
 .scope-apply-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .scope-apply-message { font-size: 12px; color: var(--text-secondary); }
+.sync-just-done-hint { font-size: 12px; color: var(--primary-color); margin-top: 6px; }
 .input-error { border-color: var(--danger-color) !important; }
 
 .btn-tiny {
@@ -2313,6 +2730,19 @@ input:checked + .slider:before { transform: translateX(16px); }
   margin-left: 8px;
 }
 .btn-tiny:hover { background: #f0f0f0; color: var(--primary-color); }
+
+@keyframes pulse-blue {
+  0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7); }
+  70% { box-shadow: 0 0 0 6px rgba(59, 130, 246, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+}
+.btn-sync-highlight {
+  animation: pulse-blue 2s infinite;
+  background-color: #3b82f6;
+  color: white;
+  border-color: #2563eb;
+}
+.btn-sync-highlight:hover { background: #2563eb; color: white; }
 
 .switch-label { margin-left: 8px; font-size: 13px; color: var(--text-secondary); }
 
@@ -2338,6 +2768,11 @@ input:checked + .slider:before { transform: translateX(16px); }
   background: #fef3c7;
   color: #92400e;
   border-color: #fcd34d;
+}
+.tag-invalid {
+  background: #e5e7eb;
+  color: #6b7280;
+  border-color: #d1d5db;
 }
 .selected-accounts-tags {
   display: flex;
