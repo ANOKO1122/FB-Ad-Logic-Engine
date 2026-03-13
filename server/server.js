@@ -22,6 +22,7 @@ import './index.js'  // 导入以注册 API 路由
 import app from './app.js'
 import { startCronJob, stopCronJob } from './services/cronService.js'
 import { getWriteQueueStats, processWriteQueue } from './services/ingestorService.js'
+import { flushHistoryQueue } from './services/structureSyncService.js'
 
 // 获取端口号（从环境变量或使用默认值）
 const PORT = process.env.PORT || 3001
@@ -70,11 +71,20 @@ async function gracefulShutdown(signal) {
   isShuttingDown = true
   logger.info('收到信号，开始优雅退出', { signal })
   try {
-    logger.info('[1/3] 停止定时任务...')
+    logger.info('[1/4] 停止定时任务...')
     await stopCronJob()
     logger.info('定时任务已停止')
+
+    logger.info('[2/4] 刷写 structure_ads_history 队列...')
+    const historyFlushTimeoutMs = 10000
+    const historyResult = await flushHistoryQueue(historyFlushTimeoutMs).catch((e) => {
+      logger.warn('structure_ads_history flush 异常', { message: e.message })
+      return { flushed: 0 }
+    })
+    logger.info('structure_ads_history 队列已刷写', { flushed: historyResult.flushed })
+
     const queueStats = getWriteQueueStats()
-    logger.info('[2/3] 检查写入队列状态', {
+    logger.info('[3/4] 检查写入队列状态', {
       queueLength: queueStats.queueLength,
       isWriting: queueStats.isWriting,
       totalQueued: queueStats.stats.totalQueued,
@@ -82,7 +92,7 @@ async function gracefulShutdown(signal) {
       totalErrors: queueStats.stats.totalErrors,
     })
     if (queueStats.queueLength > 0) {
-      logger.info('[3/3] 紧急写入剩余数据', { count: queueStats.queueLength })
+      logger.info('[4/4] 紧急写入剩余数据', { count: queueStats.queueLength })
       const timeout = 30000
       const startTime = Date.now()
       await Promise.race([
@@ -104,7 +114,7 @@ async function gracefulShutdown(signal) {
       const finalStats = getWriteQueueStats()
       logger.info('紧急写入完成', { elapsedMs: elapsed, remaining: finalStats.queueLength })
     } else {
-      logger.info('[3/3] 写入队列为空，无需处理')
+      logger.info('[4/4] 写入队列为空，无需处理')
     }
     logger.info('数据清理完毕，再见')
     setTimeout(() => process.exit(0), 100)

@@ -9,3 +9,10 @@ node server/scripts/cleanup-rules-and-snapshots.js --dry-run
 
 # 2）确认无误后，真正清理
 node server/scripts/cleanup-rules-and-snapshots.js --confirm
+
+# ========== 只清理「模拟」数据（模拟执行日志 + 开启模拟运行的规则）==========
+# 1）先看会删多少条模拟日志、多少条模拟规则、多少条关联快照
+node server/scripts/cleanup-simulation-only.js --dry-run
+
+# 2）确认无误后，真正删除
+node server/scripts/cleanup-simulation-only.js --confirm

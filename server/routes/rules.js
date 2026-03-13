@@ -472,7 +472,7 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
       executionIntervalMinutes: executionIntervalMinutes ?? 15,
       executionTimeWindows: executionTimeWindows ?? null,
       ...dynamicCheck.updates
-    })
+    }, ownerId ?? undefined)
 
     // TriggerB：规则保存后异步刷新动态快照（多账户规则按目标账户逐个防抖）
     if (isDynamicScopeFeatureEnabled()) {
@@ -669,7 +669,7 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     }
     
     // 更新规则（管理员可以更新所有规则）
-    const updatedRule = await rulesService.updateRule(ruleId, userId, updates, isAdmin)
+    const updatedRule = await rulesService.updateRule(ruleId, userId, updates, isAdmin, ownerId ?? undefined)
 
     // TriggerB：规则保存后异步刷新动态快照（多账户规则按目标账户逐个防抖）
     if (isDynamicScopeFeatureEnabled()) {
@@ -791,7 +791,7 @@ router.patch('/rules/:id/toggle', requireAuth, requireActive, async (req, res) =
     }
     
     // 启用/禁用规则（管理员可以操作所有规则）
-    const updatedRule = await rulesService.toggleRule(ruleId, userId, enabled, isAdmin)
+    const updatedRule = await rulesService.toggleRule(ruleId, userId, enabled, isAdmin, req.user.owner_id ?? undefined)
     
     res.json({
       message: `规则已${enabled ? '启用' : '禁用'}`,

@@ -1,8 +1,16 @@
 # FB Ad-Intelligence Server 任务清单（TASKS）
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
-> 
-> **最新更新（2026-03-11）**：**动态规则 UX 与快照一致性修复**：① **方案「动态规则_ux_与列表性能优化」已闭环**：优化 A（[同步] 按钮、syncJustDoneMessage、syncConfigFromMatch）与优化 B（GET /api/rules 附带 matched_count、规则卡片「当前生效 N 个对象」、rule_matched_objects.rule_id 索引）此前已落地，本窗口确认验收要点满足。② **编辑弹窗「规则配置」与「当前匹配」一致**：打开编辑时对动态规则拉取 GET /api/rules/:id 后，除 matchedCount/invalidIds 外，用接口返回的 target_ids 覆盖 ruleForm.targetIds，并调用 resolveSelectedTargetIds 刷新标签，避免列表陈旧导致「规则配置共 M 个」滞后于「当前匹配 N 个」。③ **重算时清理多余账户快照**：`refreshDynamicTargetsForRule` 在按当前 target_account_ids 刷新各账户快照后，执行 `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (当前账户列表)`，避免目标账户缩小后残留旧账户行导致 matched_count 虚高（如规则 603 仅 3 账户却显示 113 对象）。④ 抽取 `resolveSelectedTargetIds(rawIds)` 复用；临时数据修正 SQL 已提供。窗口总结见 `项目开发过程/项目总结-2026-03-11-动态规则UX与快照一致性修复.md`。
+>
+> **最新更新（2026-03-13）**：**24小时制时间段选择与UI优化 + 执行时间校验修复**：依据 `.cursor/plans/24小时制时间段选择与ui优化_56fa7594.plan.md`。① 新增 `TimePicker24.vue`（时/分双 select，纯 24 小时）；RuleManager 指定时间段改为两行「开始/结束时间」+ TimePicker24，说明文案单独成行；跨日展示「开始–次日 结束」。② 执行时间段后端：`isInExecutionWindow` 对 MySQL/Drizzle 返回的 JSON 字符串做 `JSON.parse`，修复「配置 20:00–04:00 却在 11:48 仍执行」的根因；单测 `executionWindow.test.js` 增加 JSON 字符串用例；SQL 验证 `rule_execution_summaries.skip_reason=outside_execution_window` 与 `rule_ad_execution_state.last_status=outside_window` 与预期一致。窗口总结见 `项目开发过程/项目总结-2026-03-13-24小时制时间段选择与执行时间验证.md`。可选后续：`executeSingleRule` 增加执行时间段校验使手动「运行此规则」也遵守时间段。
+>
+> **此前进度（2026-03-13）**：**动态筛选防误判与审计增强**：① **1.5 ID 归一化显式约定**：新增 `docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md`，明确保存/预览路径经 syncTargetByAccount、normalizeCompositeId 归一化；rulesService、dynamicScopeService 相关处补充注释。② **2.1/2.2 历史表计数维度**：迁移 040 为 `rule_matched_objects_history` 增加 `manual_count`、`dynamic_count`（INT NULL，幂等脚本）；`calculateMatchedAdIdsForRule` 返回 dynamicCount/manualCount；`refreshDynamicTargetsForRulesInAccount` 写历史时传入两列。验收：重算后新插入历史行 manual_count/dynamic_count 有值；trigger_type 区分 manual/rule_saved。
+>
+> **此前进度（2026-03-12）**：**历史数据与审计落地方案**：依据 `.cursor/plans/历史数据与审计落地方案_b874db26.plan.md`。① 迁移 037/038/039 建表 rule_history、rule_matched_objects_history、structure_ads_history；② ruleHistoryService + rulesService/dynamicScopeService 写入 rule_history（CREATE/UPDATE/TOGGLE/DELETE/SYSTEM_REFRESH）；deleteRule 同一事务内 SELECT→INSERT 历史→DELETE 快照与规则；③ dynamicScopeService 在 refresh 内 DELETE 前读快照、与 finalAdIds diff，仅变化时写 rule_matched_objects_history（双特征+大列表窄化 checksum）；④ structureSyncService 全账户 Map 预加载、循环内仅内存对比、变更推队列，队列上限 5000、满则丢弃并 Warn，四处写 structure_ads 路径均接历史；优雅停机前 flushHistoryQueue(10s)；⑤ cronService 每日 04:30 历史表清理（分批 DELETE LIMIT 10000、批间 sleep 500ms），可选 ENABLE_HISTORY_CLEANUP、HISTORY_RETENTION_DAYS_*；单次执行脚本 `node server/scripts/run-history-cleanup.js`。问题与解决：MySQL 预编译语句 LIMIT 不可用占位符 → 改为 SQL 内联常量；脚本保留期 0 被 `||` 当未设置 → 仅测试时可用 0，生产用默认 30/60 天。窗口总结见 `项目开发过程/项目总结-2026-03-12-历史数据与审计落地方案.md`。
+>
+> **此前进度（2026-03-11）**：**规则管理页负责人筛选（方案 B + 联表）**：① 后端 schema 新增 users/owners 最小只读表定义；rulesService.getUserRules 改为 rules→users→owners 联表、select 显式扁平化、仅 isAdmin 且 ownerIds 非空时按负责人过滤；GET /api/rules 解析 ownerIds 并传入。② 前端 RuleManager：仅管理员显示负责人自定义多选下拉（触发器 + 浮层 + 自定义复选框、「清除筛选 (全选)」、点击外部关闭）；loadRules 带 ownerIds；卡片展示负责人；setup return 补全 ownerFilterOpen/ownerFilterDisplayValue 等 5 项修复「not defined on instance」。③ 规则测试 targetIds 改为复合 ID 格式（方案 A），18 个用例通过；新增 `docs/规则管理负责人筛选_验证与测试.md`。窗口总结见 `项目开发过程/项目总结-2026-03-11-规则管理负责人筛选与前端UI优化.md`。
+>
+> **此前进度（2026-03-11）**：**动态规则 UX 与快照一致性修复**：① **方案「动态规则_ux_与列表性能优化」已闭环**：优化 A（[同步] 按钮、syncJustDoneMessage、syncConfigFromMatch）与优化 B（GET /api/rules 附带 matched_count、规则卡片「当前生效 N 个对象」、rule_matched_objects.rule_id 索引）此前已落地，本窗口确认验收要点满足。② **编辑弹窗「规则配置」与「当前匹配」一致**：打开编辑时对动态规则拉取 GET /api/rules/:id 后，除 matchedCount/invalidIds 外，用接口返回的 target_ids 覆盖 ruleForm.targetIds，并调用 resolveSelectedTargetIds 刷新标签，避免列表陈旧导致「规则配置共 M 个」滞后于「当前匹配 N 个」。③ **重算时清理多余账户快照**：`refreshDynamicTargetsForRule` 在按当前 target_account_ids 刷新各账户快照后，执行 `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (当前账户列表)`，避免目标账户缩小后残留旧账户行导致 matched_count 虚高（如规则 603 仅 3 账户却显示 113 对象）。④ 抽取 `resolveSelectedTargetIds(rawIds)` 复用；临时数据修正 SQL 已提供。窗口总结见 `项目开发过程/项目总结-2026-03-11-动态规则UX与快照一致性修复.md`。
 >
 > **最新更新（2026-03-07）**：**动态筛选多账户闭环（M3.5 + M4.x）完成并验收通过**：① 修复策略 B（`ERROR_OVERSIZE` 保留旧快照）：动态刷新改为 `NORMAL` 规则按 `rule_id + account_id` 原子替换，`ERROR_*` 仅更新状态不清空快照；② 单条执行路径统一到 Dispatcher（`executeSingleRule` 改走 `loadDataForAccount + evaluateRuleWithCache`），确保 `use_dynamic_scope=1` 时严格按 `rule_matched_objects(rule_id, account_id)` 取目标；③ 前后端打通动态筛选配置：规则页新增动态开关（默认开）、上限、状态展示、手动重算 TriggerC、排除名单 UI 与回显，执行语义对齐 `final = (动态 ∪ 手动) - 排除`；④ 多账户动态刷新闭环：TriggerB 保存后按规则涉及账户逐个防抖刷新，TriggerC 传 `ruleId` 自动刷新该规则全部目标账户并返回 `accountResults` 汇总；⑤ `op/operator` 双字段兼容、`act_xxx:id` 目标按账户隔离解析；⑥ 删除规则联动清理 `rule_matched_objects`，避免孤儿快照；⑦ 新增/扩展自动化测试：`ruleEngineDispatcher.test.js`（快照优先 + act:id 隔离）、`dynamicScopeService.helpers.test.js`（多账户账户解析与目标隔离）、`rules.test.js`（删规则联动清快照）。本窗口验证覆盖 TriggerB/TriggerC 多账户、A 超限 B 正常、执行与快照一致，全部通过。窗口总结见 `项目开发过程/项目总结-2026-03-07-动态筛选多账户闭环与项目收尾.md`。
 >
@@ -47,6 +55,44 @@
   打开编辑时若为动态规则，拉取 GET /api/rules/:id 后除 `matchedCount`、`invalidIds` 外，用 `data.rule.target_ids`/`targetIds` 覆盖 `ruleForm.targetIds`，并调用 `resolveSelectedTargetIds(nextTargetIds)` 刷新已选对象标签，使「规则配置共 N 个」与「当前匹配 N 个」一致。（RuleManager.vue：openEditRule 内详情 then、resolveSelectedTargetIds）
 - [x] **重算时删除已不在目标账户的快照行（本窗口）**  
   `refreshDynamicTargetsForRule` 在按 `accountIds` 循环刷新各账户快照之后，执行 `DELETE FROM rule_matched_objects WHERE rule_id = ? AND account_id NOT IN (当前 accountIds)`，避免目标账户从多改少后 matched_count 仍包含历史账户对象。（server/services/dynamicScopeService.js）
+
+---
+
+## 规则管理页负责人筛选（2026-03-11，方案 `.cursor/plans/规则管理负责人筛选_83cd8fe0.plan.md`）
+
+> 方案目标：管理员在规则列表页按负责人多选筛选规则；列表一次联表带出负责人信息；前端仅管理员显示负责人筛选与卡片负责人。
+
+- [x] **后端 Schema**  
+  在 `server/db/schema.js` 中新增 `users`、`owners` 最小只读表定义（id、owner_id→ownerId；id、owner_name→ownerName），供联表。
+- [x] **后端 Service**  
+  `getUserRules` 改为 from(rules).leftJoin(users).leftJoin(owners)；select 显式扁平化（getTableColumns(rules) + ownerId/ownerName）；仅当 isAdmin 且 ownerIds 非空时 inArray(users.ownerId, ownerIds)。
+- [x] **后端 Route**  
+  GET /api/rules 解析 req.query.ownerIds 为数字数组并传入 options.ownerIds；不传或空表示不按负责人过滤。
+- [x] **前端**  
+  仅管理员显示负责人自定义多选下拉（触发器 + 浮层 + 自定义复选框、「清除筛选 (全选)」、点击外部关闭）；loadRules 带 ownerIds；normalizeRule 映射 ownerId/ownerName；卡片展示「负责人: xxx」；setup return 补全 5 项。
+- [x] **测试与文档**  
+  规则测试 targetIds 改为复合 ID 格式（方案 A），18 个用例通过；新增 `docs/规则管理负责人筛选_验证与测试.md`。
+
+---
+
+## 历史数据与审计（2026-03-12，方案 `.cursor/plans/历史数据与审计落地方案_b874db26.plan.md`）
+
+> 目标：规则谁改过/改成什么、动态快照变动、结构表 name/status 变更可审计；Change-Only 写入；保留期 rule_history 60 天、rule_matched_objects_history 30 天、structure_ads_history 60 天；定时清理分批 DELETE + sleep。
+
+- [x] **步骤 1：建表**  
+  迁移 037_create_rule_history.sql、038_create_rule_matched_objects_history.sql、039_create_structure_ads_history.sql；索引 (rule_id, changed_at)/(rule_id, refreshed_at, account_id)/(account_id, ad_id, changed_at) 等。
+- [x] **步骤 2：rule_history 写入**  
+  ruleHistoryService.insertRuleHistory；createRule/updateRule/deleteRule/toggle 成功后写入（CREATE/UPDATE/DELETE/TOGGLE）；deleteRule 同一事务内 SELECT→INSERT rule_history(DELETE)→DELETE rule_matched_objects→DELETE rules→commit；dynamicScopeService 两处 UPDATE rules 后 SYSTEM_REFRESH。
+- [x] **步骤 3：dynamicScopeService SYSTEM_REFRESH**  
+  已合入步骤 2，target_ids/target_by_account 与 dynamic_scope_status 更新后写 rule_history。
+- [x] **步骤 4：rule_matched_objects_history**  
+  refreshDynamicTargetsForRulesInAccount 内 DELETE 前读当前快照，与 finalAdIds diff；仅 added_count 或 removed_count>0 时 INSERT；object_count>500 时 snapshot 前 100 + object_ids_checksum(MD5)。
+- [x] **步骤 4 补充（2026-03-13）：manual_count / dynamic_count**  
+  迁移 040 增加 manual_count、dynamic_count（INT NULL）；calculateMatchedAdIdsForRule 返回两计数；写历史时传入，便于排障区分「筛选异常」与「手动勾选变化」。见 `docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md`。
+- [x] **步骤 5：structure_ads_history**  
+  structureSyncService 队列（上限 5000）、loadStructureAdsMapForAccount 预加载、四处写 structure_ads 路径（doStructureAdsUpsertAndStatus、piggyback、pseudo_increment、applyMergedFastSyncPayload）内存对比后 push；定时 flush、优雅停机 flushHistoryQueue(10s)。
+- [x] **步骤 6：历史表定时清理**  
+  cronService 每日 04:30（`30 4 * * *`）；runNightlyHistoryCleanup 三表分批 DELETE LIMIT 10000、批间 sleep(500ms)；ENABLE_HISTORY_CLEANUP、HISTORY_RETENTION_DAYS_MATCHED/ADS/RULE 环境变量；单次脚本 `server/scripts/run-history-cleanup.js`。
 
 ---
 
@@ -379,6 +425,16 @@
 - [x] **阶段七：API 与前端**：规则创建/更新/查询支持 execution_interval_minutes、execution_time_windows；前端编辑表单「5. 执行频率与执行时间」、列表卡片展示「执行频率」「执行时间」短文案；单条「运行此规则」保留。
 - [x] **前端修复（保存后回显）**：RuleManager.vue 的 normalizeRule 补全 executionIntervalMinutes、executionTimeWindows，避免保存后再编辑恢复默认值。
 - **API 约定**：规则更新使用 **PUT /api/rules/:id**，可只传需改字段（如执行间隔、执行时间段）；**不支持 PATCH 更新规则体**，PATCH 仅用于 `/api/rules/:id/toggle`。
+
+### 2.6.2 24小时制时间段选择与UI优化（2026-03-13 完成）
+
+> 依据 `.cursor/plans/24小时制时间段选择与ui优化_56fa7594.plan.md`。取消 AM/PM，统一 24 小时制，优化「允许执行时间」区块布局与风格。
+
+- [x] **TimePicker24 组件**：`src/components/TimePicker24.vue`，时 0–23、分 0–59 双 select，modelValue 为 `"HH:mm"`，emit 补零；样式与项目 `.select` 一致。
+- [x] **RuleManager 接入**：指定时间段时用两行「开始时间」「结束时间」各接 TimePicker24；说明文案单独成行（.execution-time-range / .execution-time-hint）。
+- [x] **跨日展示**：formatExecutionTimeDisplay 对跨日时段显示「开始–次日 结束」（如 20:00–次日 05:00）。
+- [x] **执行时间段后端修复**：`isInExecutionWindow` 对 `execution_time_windows` 为字符串时 JSON.parse，解决 Drizzle/MySQL JSON 列返回字符串导致始终视为全天的问题；单测与 SQL 验证（rule_execution_summaries / rule_ad_execution_state）通过。
+- [ ] **可选**：`executeSingleRule` 增加执行时间段校验，使「运行此规则」也遵守 execution_time_windows。
 
 ### 2.6.1 预算冷却与 Pre-Flight 重构（scope_key + cooldownKey + 双写）（2026-03-02 前窗口完成）
 

@@ -7,9 +7,12 @@ import { getTableColumns } from 'drizzle-orm'
 import { getAccountTimezone } from './ruleDataService.js'
 import pool from '../db/connection.js'
 import { parseCompositeId } from '../utils/targetIdUtils.js'
+import { insertRuleHistory, buildRuleSnapshot } from './ruleHistoryService.js'
+import logger from '../utils/logger.js'
 
 /**
- * 以 target_ids 为唯一真理，强制生成并覆盖 target_by_account，并归一化 target_ids（去 act_act_ 等脏数据）
+ * 以 target_ids 为唯一真理，强制生成并覆盖 target_by_account，并归一化 target_ids（去 act_act_ 等脏数据）。
+ * 约定：保存规则时 createRule/updateRule 必须经此归一化后再落库，见 docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md
  * @param {object} rule - 含 target_ids / targetIds 的对象，会被原地修改
  */
 function syncTargetByAccount(rule) {
@@ -37,9 +40,10 @@ function syncTargetByAccount(rule) {
  * 创建规则
  * @param {number} userId - 用户 ID
  * @param {object} ruleData - 规则数据
+ * @param {number|null} [ownerId] - 负责人 ID（可选，用于 rule_history.changed_by_owner_id）
  * @returns {Promise<object>} 新创建的规则
  */
-export async function createRule(userId, ruleData) {
+export async function createRule(userId, ruleData, ownerId = null) {
   // 时区：空字符串/全空格/'UTC' 视为未指定，落库用账户时区
   const tzRaw = ruleData.timezoneName ?? ruleData.timezone_name
   const tzNorm = typeof tzRaw === 'string' ? tzRaw.trim() : ''
@@ -79,7 +83,20 @@ export async function createRule(userId, ruleData) {
     .where(eq(rules.id, newRuleId))
     .limit(1)
   
-  return newRule[0]
+  const rule = newRule[0]
+  try {
+    await insertRuleHistory({
+      ruleId: newRuleId,
+      changeType: 'CREATE',
+      source: 'api_save',
+      changedByUserId: userId,
+      changedByOwnerId: ownerId ?? null,
+      ruleSnapshot: buildRuleSnapshot(rule)
+    })
+  } catch (e) {
+    logger.warn('[rule_history] createRule insert history failed', { ruleId: newRuleId, err: e.message })
+  }
+  return rule
 }
 
 /**
@@ -166,9 +183,10 @@ export async function getRuleById(ruleId, userId, isAdmin = false) {
  * @param {number} userId - 用户 ID（用于验证权限）
  * @param {object} updates - 要更新的字段
  * @param {boolean} isAdmin - 是否为管理员（管理员可更新所有规则）
+ * @param {number|null} [ownerId] - 负责人 ID（可选，用于 rule_history.changed_by_owner_id）
  * @returns {Promise<object>} 更新结果
  */
-export async function updateRule(ruleId, userId, updates, isAdmin = false) {
+export async function updateRule(ruleId, userId, updates, isAdmin = false, ownerId = null) {
   // 构建查询条件
   let whereCondition = eq(rules.id, ruleId)
   
@@ -193,6 +211,22 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false) {
   
   // 返回更新后的规则（管理员可以查看所有规则）
   const updatedRule = await getRuleById(ruleId, userId, isAdmin)
+  const changeType = (Object.keys(updates).length === 1 && Object.prototype.hasOwnProperty.call(updates, 'enabled'))
+    ? 'TOGGLE'
+    : 'UPDATE'
+  const source = changeType === 'TOGGLE' ? 'api_toggle' : 'api_save'
+  try {
+    await insertRuleHistory({
+      ruleId,
+      changeType,
+      source,
+      changedByUserId: userId,
+      changedByOwnerId: ownerId ?? null,
+      ruleSnapshot: buildRuleSnapshot(updatedRule)
+    })
+  } catch (e) {
+    logger.warn('[rule_history] updateRule insert history failed', { ruleId, err: e.message })
+  }
   return updatedRule
 }
 
@@ -208,22 +242,46 @@ export async function deleteRule(ruleId, userId, isAdmin = false) {
   try {
     await connection.beginTransaction()
 
+    // 1) SELECT 规则快照（同一事务内，用于写入 rule_history）
+    const selectSql = isAdmin
+      ? 'SELECT * FROM rules WHERE id = ? LIMIT 1'
+      : 'SELECT * FROM rules WHERE id = ? AND user_id = ? LIMIT 1'
+    const selectParams = isAdmin ? [ruleId] : [ruleId, userId]
+    const [selectResult] = await connection.execute(selectSql, selectParams)
+    const row = selectResult?.[0]
+    if (!row) {
+      await connection.rollback()
+      throw new Error('规则不存在或无权访问')
+    }
+
+    // 2) INSERT rule_history（DELETE 类型，快照仅配置字段）
+    const snapshot = buildRuleSnapshot(row)
+    await insertRuleHistory({
+      ruleId,
+      changeType: 'DELETE',
+      source: 'api_save',
+      changedByUserId: userId,
+      changedByOwnerId: null,
+      ruleSnapshot: snapshot,
+      connection
+    })
+
+    // 3) DELETE rule_matched_objects
+    await connection.execute(
+      'DELETE FROM rule_matched_objects WHERE rule_id = ?',
+      [ruleId]
+    )
+
+    // 4) DELETE rules
     const deleteRuleSql = isAdmin
       ? 'DELETE FROM rules WHERE id = ? LIMIT 1'
       : 'DELETE FROM rules WHERE id = ? AND user_id = ? LIMIT 1'
     const deleteRuleParams = isAdmin ? [ruleId] : [ruleId, userId]
     const [ruleResult] = await connection.execute(deleteRuleSql, deleteRuleParams)
-
     if (!ruleResult || ruleResult.affectedRows === 0) {
       await connection.rollback()
       throw new Error('规则不存在或无权访问')
     }
-
-    // 联动清理动态快照，避免留下 rule_matched_objects 孤儿数据
-    await connection.execute(
-      'DELETE FROM rule_matched_objects WHERE rule_id = ?',
-      [ruleId]
-    )
 
     await connection.commit()
     return true
@@ -243,11 +301,12 @@ export async function deleteRule(ruleId, userId, isAdmin = false) {
  * @param {number} userId - 用户 ID（用于验证权限）
  * @param {boolean} enabled - 是否启用
  * @param {boolean} isAdmin - 是否为管理员（管理员可操作所有规则）
+ * @param {number|null} [ownerId] - 负责人 ID（可选，用于 rule_history）
  * @returns {Promise<object>} 更新后的规则
  */
-export async function toggleRule(ruleId, userId, enabled, isAdmin = false) {
+export async function toggleRule(ruleId, userId, enabled, isAdmin = false, ownerId = null) {
   // 对应 SQL: UPDATE rules SET enabled = ? WHERE id = ? [AND user_id = ?]
-  return await updateRule(ruleId, userId, { enabled }, isAdmin)
+  return await updateRule(ruleId, userId, { enabled }, isAdmin, ownerId)
 }
 
 

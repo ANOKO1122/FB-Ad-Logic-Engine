@@ -2,6 +2,7 @@
  * 结构同步服务（顺序2 阶段 2.4）
  * 从 FB 拉取指定账户的 ads 结构并写入 structure_ads 表，供选择器读库使用。
  * 约束：账户级锁 + 冷却期 2 分钟。
+ * 历史数据与审计 P2：structure_ads 的 name/effective_status 变更写入 structure_ads_history（Change-Only、异步队列、背压、优雅停机）
  */
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
@@ -15,6 +16,104 @@ const PAGE_DELAY_MS = 1200
 const ADS_FIELDS = 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time,created_time'
 const CAMPAIGNS_FIELDS = 'id,name,effective_status,status,updated_time,created_time'
 const ADSETS_FIELDS = 'id,name,effective_status,status,campaign_id,updated_time,created_time'
+
+/** structure_ads_history 异步队列硬上限（方案 P2 背压） */
+const STRUCTURE_ADS_HISTORY_QUEUE_MAX = Number(process.env.STRUCTURE_ADS_HISTORY_QUEUE_MAX) || 5000
+/** 内存队列（仅 name/effective_status 变更时 push） */
+const structureAdsHistoryQueue = []
+/** 定时 flush 间隔（ms） */
+const HISTORY_FLUSH_INTERVAL_MS = 5000
+let historyFlushTimer = null
+
+/**
+ * 加载某账户当前 structure_ads 的 ad_id -> { name, effective_status } 用于变更检测（禁止在循环内 SELECT）
+ * @param {Object|null} connectionOrPool - 事务内传 connection，否则传 null 用 pool
+ * @param {string} accountId
+ * @returns {Promise<Map<string,{ name: string|null, effective_status: string|null }>>}
+ */
+async function loadStructureAdsMapForAccount(connectionOrPool, accountId) {
+  const conn = connectionOrPool || pool
+  const [rows] = await conn.execute(
+    'SELECT ad_id, name, effective_status FROM structure_ads WHERE account_id = ?',
+    [accountId]
+  )
+  const map = new Map()
+  for (const r of rows || []) {
+    const id = String(r.ad_id ?? '')
+    if (!id) continue
+    map.set(id, { name: r.name ?? null, effective_status: r.effective_status ?? null })
+  }
+  return map
+}
+
+/**
+ * 将一条 structure_ads 变更推入 history 队列；队列满则丢弃并打 Warn（方案 P2 背压）
+ * @param {{ account_id: string, ad_id: string, name: string|null, effective_status: string|null, source?: string }}
+ */
+function pushStructureAdsHistory(record) {
+  if (structureAdsHistoryQueue.length >= STRUCTURE_ADS_HISTORY_QUEUE_MAX) {
+    logger.warn('[structure_ads_history] queue full, dropping audit record', { account_id: record.account_id, ad_id: record.ad_id })
+    return
+  }
+  structureAdsHistoryQueue.push(record)
+  startHistoryFlushTimer()
+}
+
+/**
+ * 将队列中的记录批量写入 structure_ads_history，然后清空队列（方案 P2 优雅停机）
+ * @param {number} [timeoutMs] - 可选超时，超时则放弃剩余并打 Warn
+ * @returns {Promise<{ flushed: number }>}
+ */
+export async function flushHistoryQueue(timeoutMs = 0) {
+  if (structureAdsHistoryQueue.length === 0) {
+    return { flushed: 0 }
+  }
+  const toFlush = structureAdsHistoryQueue.splice(0, structureAdsHistoryQueue.length)
+  const run = async () => {
+    const BATCH = 200
+    let total = 0
+    for (let i = 0; i < toFlush.length; i += BATCH) {
+      const chunk = toFlush.slice(i, i + BATCH)
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?)').join(', ')
+      const values = []
+      for (const r of chunk) {
+        values.push(r.account_id, r.ad_id, r.name ?? null, r.effective_status ?? null, r.source ?? null)
+      }
+      await pool.execute(
+        `INSERT INTO structure_ads_history (account_id, ad_id, name, effective_status, source) VALUES ${placeholders}`,
+        values
+      )
+      total += chunk.length
+    }
+    return total
+  }
+  try {
+    if (timeoutMs > 0) {
+      const result = await Promise.race([
+        run(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('flush timeout')), timeoutMs))
+      ])
+      return { flushed: result }
+    }
+    const flushed = await run()
+    return { flushed }
+  } catch (e) {
+    if (e.message === 'flush timeout') {
+      logger.warn('[structure_ads_history] flush timeout, dropping remaining', { remaining: toFlush.length })
+      return { flushed: 0 }
+    }
+    logger.warn('[structure_ads_history] flush failed', { err: e.message })
+    return { flushed: 0 }
+  }
+}
+
+function startHistoryFlushTimer() {
+  if (historyFlushTimer) return
+  historyFlushTimer = setInterval(() => {
+    if (structureAdsHistoryQueue.length === 0) return
+    flushHistoryQueue().catch((e) => logger.warn('[structure_ads_history] interval flush failed', { err: e.message }))
+  }, HISTORY_FLUSH_INTERVAL_MS)
+}
 
 /** AdsPolar 标准：拉取除 DELETED/ARCHIVED 外的所有状态，避免漏掉「准备中」等中间态（官方 Ad effective_status 无 PENDING_PROCESS，准备中多为 IN_PROCESS/PREAPPROVED 等） */
 const EFFECTIVE_STATUS_FILTER = [
@@ -577,12 +676,18 @@ export async function piggybackStructureFromToday(accountId, activeAdIds, struct
     for (const adId of needUpdate) {
       const payload = structurePayload[String(adId)]
       if (payload) {
+        const name = payload.name ?? null
+        const eff = payload.effective_status ?? null
+        const old = existing.get(String(adId))
+        if (name !== old?.name || eff !== old?.effective_status) {
+          pushStructureAdsHistory({ account_id: accountId, ad_id: String(adId), name, effective_status: eff, source: 'piggyback' })
+        }
         const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(payload.updated_time)
         const createdTimeNorm = normalizeUpdatedTimeToUtcZ(payload.created_time)
         await pool.execute(UPSERT_STRUCTURE_SQL, [
           accountId, adId,
-          payload.adset_id ?? null, payload.campaign_id ?? null, payload.name ?? null,
-          payload.effective_status ?? null, payload.status ?? null, payload.configured_status ?? null,
+          payload.adset_id ?? null, payload.campaign_id ?? null, name,
+          eff, payload.status ?? null, payload.configured_status ?? null,
           updatedTimeNorm ?? null,
           createdTimeNorm ?? payload.created_time ?? null
         ])
@@ -596,12 +701,18 @@ export async function piggybackStructureFromToday(accountId, activeAdIds, struct
       const resolved = await facebookApi.resolveObjectsByIds(gapIds, { fields: ADS_FIELDS })
       for (const ad of resolved) {
         const id = String(ad.id || '')
+        const name = ad.name ?? null
+        const eff = ad.effective_status ?? null
+        const old = existing.get(id)
+        if (name !== old?.name || eff !== old?.effective_status) {
+          pushStructureAdsHistory({ account_id: accountId, ad_id: id, name, effective_status: eff, source: 'piggyback' })
+        }
         const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(ad.updated_time)
         const createdTimeNorm = normalizeUpdatedTimeToUtcZ(ad.created_time)
         await pool.execute(UPSERT_STRUCTURE_SQL, [
           accountId, id,
-          ad.adset_id ?? null, ad.campaign_id ?? null, ad.name ?? null,
-          ad.effective_status ?? null, ad.status ?? null, ad.configured_status ?? null,
+          ad.adset_id ?? null, ad.campaign_id ?? null, name,
+          eff, ad.status ?? null, ad.configured_status ?? null,
           updatedTimeNorm ?? null,
           createdTimeNorm ?? ad.created_time ?? null
         ])
@@ -649,16 +760,23 @@ export async function runPseudoIncrementForAccount(accountId, activeAdIds, faceb
       return { touched: 0 }
     }
 
+    const oldMap = await loadStructureAdsMapForAccount(null, accountId)
     const resolved = await facebookApi.resolveObjectsByIds(diffIds, { fields: ADS_FIELDS })
     let touched = 0
     for (const ad of resolved) {
       const id = String(ad.id || '')
+      const name = ad.name ?? null
+      const eff = ad.effective_status ?? null
+      const old = oldMap.get(id)
+      if (name !== old?.name || eff !== old?.effective_status) {
+        pushStructureAdsHistory({ account_id: accountId, ad_id: id, name, effective_status: eff, source: 'pseudo_increment' })
+      }
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(ad.updated_time)
       const createdTimeNorm = normalizeUpdatedTimeToUtcZ(ad.created_time)
       await pool.execute(UPSERT_STRUCTURE_SQL, [
         accountId, id,
-        ad.adset_id ?? null, ad.campaign_id ?? null, ad.name ?? null,
-        ad.effective_status ?? null, ad.status ?? null, ad.configured_status ?? null,
+        ad.adset_id ?? null, ad.campaign_id ?? null, name,
+        eff, ad.status ?? null, ad.configured_status ?? null,
         updatedTimeNorm ?? null,
         createdTimeNorm ?? ad.created_time ?? null
       ])
@@ -683,6 +801,9 @@ export async function runPseudoIncrementForAccount(accountId, activeAdIds, faceb
  */
 async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems, cursorTs, isFullRun, filterSinceSec = null) {
   const UPSERT_BATCH_SIZE = 50
+  // P2：全账户内存预加载，禁止在循环内 SELECT
+  const oldMap = await loadStructureAdsMapForAccount(lockConnection, accountId)
+
   const upsertBase = `
     INSERT INTO structure_ads
       (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, created_time, last_synced_at)
@@ -705,6 +826,15 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
     const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
     const values = []
     for (const item of chunk) {
+      const adId = String(item.id ?? '')
+      const name = item.name ?? null
+      const eff = item.effective_status ?? null
+      const old = oldMap.get(adId)
+      if (name !== old?.name || eff !== old?.effective_status) {
+        pushStructureAdsHistory({ account_id: accountId, ad_id: adId, name, effective_status: eff, source: 'structure_sync' })
+      }
+      oldMap.set(adId, { name, effective_status: eff })
+
       const updatedTimeNorm = normalizeUpdatedTimeToUtcZ(item.updated_time)
       const createdTimeNorm = normalizeUpdatedTimeToUtcZ(item.created_time)
       values.push(
@@ -712,8 +842,8 @@ async function doStructureAdsUpsertAndStatus(lockConnection, accountId, allItems
         item.id,
         item.adset_id ?? null,
         item.campaign_id ?? null,
-        item.name ?? null,
-        item.effective_status ?? null,
+        name,
+        eff,
         item.status ?? null,
         item.configured_status ?? null,
         updatedTimeNorm ?? item.updated_time ?? null,
@@ -1458,6 +1588,11 @@ export async function applyMergedFastSyncPayload(payloads, opts = {}) {
 
   async function upsertAds(rows) {
     if (rows.length === 0) return
+    const accountIds = [...new Set(rows.map((r) => r.account_id))]
+    const accountMaps = new Map()
+    for (const aid of accountIds) {
+      accountMaps.set(aid, await loadStructureAdsMapForAccount(null, aid))
+    }
     const base = `
       INSERT INTO structure_ads
         (account_id, ad_id, adset_id, campaign_id, name, effective_status, status, configured_status, updated_time, created_time, last_synced_at)
@@ -1480,13 +1615,23 @@ export async function applyMergedFastSyncPayload(payloads, opts = {}) {
       const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')
       const values = []
       for (const r of chunk) {
+        const aid = r.account_id
+        const adId = String(r.id ?? '')
+        const name = r.name ?? null
+        const eff = r.effective_status ?? null
+        const old = accountMaps.get(aid)?.get(adId)
+        if (name !== old?.name || eff !== old?.effective_status) {
+          pushStructureAdsHistory({ account_id: aid, ad_id: adId, name, effective_status: eff, source: 'track2_fast_sync' })
+        }
+        if (!accountMaps.has(aid)) accountMaps.set(aid, new Map())
+        accountMaps.get(aid).set(adId, { name, effective_status: eff })
         values.push(
-          r.account_id,
+          aid,
           r.id,
           r.adset_id ?? null,
           r.campaign_id ?? null,
-          r.name ?? null,
-          r.effective_status ?? null,
+          name,
+          eff,
           r.status ?? null,
           r.configured_status ?? null,
           normalizeUpdatedTimeToUtcZ(r.updated_time) ?? null,

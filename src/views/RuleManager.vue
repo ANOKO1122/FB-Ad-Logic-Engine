@@ -650,11 +650,16 @@
               <label><input type="radio" :value="true" v-model="executionTimeAllDay"> 全天</label>
               <label><input type="radio" :value="false" v-model="executionTimeAllDay"> 指定时间段</label>
             </div>
-            <div v-if="!executionTimeAllDay" class="form-row">
-              <label class="label">时间段</label>
-              <input type="time" v-model="executionTimeStart" class="input-text" step="1" /> —
-              <input type="time" v-model="executionTimeEnd" class="input-text" step="1" />
-              <span class="muted">（可只填一个时段，暂不支持跨日）</span>
+            <div v-if="!executionTimeAllDay" class="execution-time-range">
+              <div class="execution-time-row">
+                <label class="label">开始时间</label>
+                <TimePicker24 v-model="executionTimeStart" />
+              </div>
+              <div class="execution-time-row">
+                <label class="label">结束时间</label>
+                <TimePicker24 v-model="executionTimeEnd" />
+              </div>
+              <p class="execution-time-hint muted">可只填一个时段；24 小时制。结束时间早于开始时间表示到次日（如 20:00–05:00 表示当晚 20:00 至次日 05:00）。</p>
             </div>
           </div>
         </div>
@@ -679,9 +684,11 @@ import {
   createDefaultWhenLine,
   getDefaultWhenCustomRange
 } from '../utils/conditionsTransform'
+import TimePicker24 from '../components/TimePicker24.vue'
 
 export default {
   name: 'RuleManager',
+  components: { TimePicker24 },
   setup() {
     const rules = ref([])
     const templates = ref([])
@@ -1147,13 +1154,21 @@ export default {
       return base
     }
 
-    /** 列表展示：执行时间段 → 「全天」或「09:00–18:00, 21:00–23:30」（文档 §8.2） */
+    /** 列表展示：执行时间段 → 「全天」或「09:00–18:00」或跨日「20:00–次日 05:00」（文档 §8.2 + 跨日方案） */
     const formatExecutionTimeDisplay = (windows) => {
       if (!windows || !Array.isArray(windows) || windows.length === 0) return '全天'
       return windows.map(w => {
         const s = (w.start || '').toString().slice(0, 5)
         const e = (w.end || '').toString().slice(0, 5)
-        return s && e ? `${s}–${e}` : (s || e || '')
+        if (!s && !e) return ''
+        if (!s || !e) return s || e
+        // 比较 HH:mm 字符串即可判断是否跨日（ end 早于或等于 start 视为跨日）
+        const [sh, sm] = s.split(':').map(Number)
+        const [eh, em] = e.split(':').map(Number)
+        const startMin = (sh || 0) * 60 + (sm || 0)
+        const endMin = (eh || 0) * 60 + (em || 0)
+        const isCrossDay = endMin <= startMin
+        return isCrossDay ? `${s}–次日 ${e}` : `${s}–${e}`
       }).filter(Boolean).join(', ')
     }
 
@@ -2688,6 +2703,10 @@ input:checked + .slider:before { transform: translateX(16px); }
   margin-bottom: 12px;
 }
 .form-row { display: flex; gap: 16px; }
+.execution-time-range { margin-top: 8px; }
+.execution-time-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.execution-time-row .label { margin-bottom: 0; min-width: 72px; }
+.execution-time-hint { margin: 10px 0 0 0; font-size: 12px; line-height: 1.45; }
 .flex-1 { flex: 1; }
 .flex-2 { flex: 2; }
 .dynamic-scope-row { align-items: center; justify-content: space-between; }

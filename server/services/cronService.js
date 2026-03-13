@@ -122,13 +122,21 @@ import pLimit from 'p-limit'
 const ZONE_BJ = 'Asia/Shanghai'
 
 /**
- * 判断当前北京时间是否落在规则的允许执行时间段内
+ * 判断当前北京时间是否落在规则的允许执行时间段内（支持跨日窗口，见方案：执行时间跨日与24小时制）
  * @param {Object} rule - 规则（含 execution_time_windows / executionTimeWindows）
  * @param {import('luxon').DateTime} nowBJ - 当前北京时间（Luxon DateTime, zone=Asia/Shanghai）
  * @returns {boolean} 空/NULL/非数组视为全天允许 → true
  */
-function isInExecutionWindow(rule, nowBJ) {
-  const windows = rule.executionTimeWindows ?? rule.execution_time_windows
+export function isInExecutionWindow(rule, nowBJ) {
+  let windows = rule.executionTimeWindows ?? rule.execution_time_windows
+  // MySQL/Drizzle 的 JSON 列可能返回字符串而非数组，需解析后再判断（见 BUG #744）
+  if (typeof windows === 'string') {
+    try {
+      windows = JSON.parse(windows)
+    } catch {
+      return true
+    }
+  }
   if (windows == null || !Array.isArray(windows) || windows.length === 0) return true
   const hour = nowBJ.hour
   const minute = nowBJ.minute
@@ -141,8 +149,18 @@ function isInExecutionWindow(rule, nowBJ) {
     const [eh, em, es] = end.split(':').map(Number)
     const startSec = (sh || 0) * 3600 + (sm || 0) * 60 + (ss || 0)
     const endSec = (eh || 0) * 3600 + (em || 0) * 60 + (es || 0)
-    if (startSec >= endSec) continue
-    if (currentSec >= startSec && currentSec <= endSec) return true
+    // 同日内：当前秒数在 [startSec, endSec] 内则命中
+    if (startSec < endSec) {
+      if (currentSec >= startSec && currentSec <= endSec) return true
+      continue
+    }
+    // 跨日（startSec > endSec）：当日 start 至次日 end，命中条件为 currentSec >= startSec || currentSec <= endSec
+    if (startSec > endSec) {
+      if (currentSec >= startSec || currentSec <= endSec) return true
+      continue
+    }
+    // 相等（startSec === endSec）：视为全天该窗口恒命中（与 24:00–24:00 语义一致）
+    return true
   }
   return false
 }
@@ -1348,6 +1366,7 @@ export function startCronJob() {
   logger.info(`  4. Track2 Fast Sync: 每小时 3 次 (Cron: 7,27,52 * * * *) [flag=${enableTrack2FastSync ? 'on' : 'off'}, 并发=${track2Concurrency}, 白名单=${track2AccountWhitelist.length}, bufferSec=${track2BufferSec}, usageSkip>=${track2UsageSkipThreshold}%, mergedUpsert=${track2MergedUpsert ? 'on' : 'off'}]`)
   logger.info(`  5. Track1 结构轮转（近3天）: 每小时 :12 (Cron: 12 * * * *) [每次 6 账户，账户并发 5，usage 高跳过，unifiedBatch=${enableUnifiedStructureBatch ? 'on' : 'off'}]`)
   logger.info('  6. 热表清理: 每日 04:00 (Cron: 0 4 * * *) [删除 ad_snapshots 超过 2 天的快照]')
+  logger.info('  7. 历史表清理: 每日 04:30 (Cron: 30 4 * * *) [rule_matched_objects_history 30 天、structure_ads_history/rule_history 60 天，分批+sleep]')
   logger.info('')
   logger.info('🔒 锁机制: 账户级锁（rule:account:xxx）+ 5分钟超时保险丝')
   logger.info('⚡ 优势: 零空转、高并发、无僵尸锁')
@@ -1552,6 +1571,27 @@ export function startCronJob() {
     }
   })
 
+  // 9. 每日 04:30 历史表清理（方案 §6：rule_matched_objects_history 30 天、structure_ads_history / rule_history 60 天，分批 DELETE + 批间 sleep）
+  const enableHistoryCleanup = process.env.ENABLE_HISTORY_CLEANUP !== '0' && process.env.ENABLE_HISTORY_CLEANUP !== 'false'
+  const retentionDaysMatched = Number(process.env.HISTORY_RETENTION_DAYS_MATCHED) || 30
+  const retentionDaysAds = Number(process.env.HISTORY_RETENTION_DAYS_ADS) || 60
+  const retentionDaysRule = Number(process.env.HISTORY_RETENTION_DAYS_RULE) || 60
+  cron.schedule('30 4 * * *', async () => {
+    if (!enableHistoryCleanup) return
+    try {
+      const result = await runNightlyHistoryCleanup({
+        retentionDaysMatched,
+        retentionDaysAds,
+        retentionDaysRule
+      })
+      if (result.totalDeleted > 0) {
+        logger.info(`[历史表清理] 完成，rule_matched_objects_history=${result.matchedDeleted}, structure_ads_history=${result.adsDeleted}, rule_history=${result.ruleDeleted}`)
+      }
+    } catch (err) {
+      logger.warn('[历史表清理] 失败:', err.message)
+    }
+  })
+
   // 7. Track1 结构轮转（近3天）：每小时 :12 执行，每次最多 6 个账户（P1，让路 P0；usage 高/熔断时跳过；账户并发 5）
   // 通过环境变量 PAUSE_STRUCTURE_SYNC=1 可暂停，便于补数/限流恢复后再开启
   cron.schedule('12 * * * *', async () => {
@@ -1657,6 +1697,69 @@ export async function manualCleanupAdSnapshots() {
   } catch (error) {
     logger.error('❌ 热表清理失败:', error.message)
     throw error
+  }
+}
+
+const HISTORY_CLEANUP_BATCH_SIZE = 10000
+const HISTORY_CLEANUP_SLEEP_MS = 500
+
+/**
+ * 历史表分批清理（方案 §6：rule_matched_objects_history / structure_ads_history / rule_history）
+ * 每批 DELETE LIMIT 10000，批间 sleep 500ms，避免占满磁盘 IO 影响凌晨同步。
+ * @param {{ retentionDaysMatched?: number, retentionDaysAds?: number, retentionDaysRule?: number }}
+ * @returns {{ matchedDeleted: number, adsDeleted: number, ruleDeleted: number, totalDeleted: number }}
+ */
+export async function runNightlyHistoryCleanup(opts = {}) {
+  const retentionMatched = Number(opts.retentionDaysMatched) || 30
+  const retentionAds = Number(opts.retentionDaysAds) || 60
+  const retentionRule = Number(opts.retentionDaysRule) || 60
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  let matchedDeleted = 0
+  let adsDeleted = 0
+  let ruleDeleted = 0
+
+  // rule_matched_objects_history: refreshed_at
+  while (true) {
+    const [res] = await pool.execute(
+      `DELETE FROM rule_matched_objects_history WHERE refreshed_at < NOW() - INTERVAL ? DAY LIMIT ${HISTORY_CLEANUP_BATCH_SIZE}`,
+      [retentionMatched]
+    )
+    const n = res?.affectedRows ?? 0
+    matchedDeleted += n
+    if (n < HISTORY_CLEANUP_BATCH_SIZE) break
+    await sleep(HISTORY_CLEANUP_SLEEP_MS)
+  }
+
+  // structure_ads_history: changed_at
+  while (true) {
+    const [res] = await pool.execute(
+      `DELETE FROM structure_ads_history WHERE changed_at < NOW() - INTERVAL ? DAY LIMIT ${HISTORY_CLEANUP_BATCH_SIZE}`,
+      [retentionAds]
+    )
+    const n = res?.affectedRows ?? 0
+    adsDeleted += n
+    if (n < HISTORY_CLEANUP_BATCH_SIZE) break
+    await sleep(HISTORY_CLEANUP_SLEEP_MS)
+  }
+
+  // rule_history: changed_at
+  while (true) {
+    const [res] = await pool.execute(
+      `DELETE FROM rule_history WHERE changed_at < NOW() - INTERVAL ? DAY LIMIT ${HISTORY_CLEANUP_BATCH_SIZE}`,
+      [retentionRule]
+    )
+    const n = res?.affectedRows ?? 0
+    ruleDeleted += n
+    if (n < HISTORY_CLEANUP_BATCH_SIZE) break
+    await sleep(HISTORY_CLEANUP_SLEEP_MS)
+  }
+
+  return {
+    matchedDeleted,
+    adsDeleted,
+    ruleDeleted,
+    totalDeleted: matchedDeleted + adsDeleted + ruleDeleted
   }
 }
 

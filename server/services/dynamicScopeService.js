@@ -1,7 +1,9 @@
 import { DateTime } from 'luxon'
+import crypto from 'crypto'
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { normalizeAccountId } from '../utils/targetIdUtils.js'
+import { insertRuleHistory } from './ruleHistoryService.js'
 
 const DEFAULT_MAX_MATCHES =
   Number.isFinite(Number(process.env.DYNAMIC_SCOPE_DEFAULT_MAX_MATCHES))
@@ -30,6 +32,7 @@ function parseJsonSafe(value, fallback = null) {
 
 /**
  * 归一化复合 ID：保证 accountId 仅一层 act_ 前缀，返回 act_xxx:objId。
+ * 约定：执行/预览路径返回或写入的复合 ID 均经此生成，见 docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md
  */
 function normalizeCompositeId(accountId, objId) {
   const cleanAccountId = normalizeAccountId(accountId || '')
@@ -235,7 +238,9 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
       return {
         status: 'ERROR_FILTER_INVALID',
         errorMsg: e.message || 'invalid scopeFilters',
-        finalAdIds: null
+        finalAdIds: null,
+        dynamicCount: 0,
+        manualCount: manualSet.size
       }
     }
 
@@ -303,14 +308,18 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
     return {
       status: 'ERROR_OVERSIZE',
       errorMsg: `matched ${finalAdIds.length} ads, exceed max_dynamic_matches=${safeMax}`,
-      finalAdIds: null
+      finalAdIds: null,
+      dynamicCount: dynamicSet.size,
+      manualCount: manualSet.size
     }
   }
 
   return {
     status: 'NORMAL',
     errorMsg: null,
-    finalAdIds
+    finalAdIds,
+    dynamicCount: dynamicSet.size,
+    manualCount: manualSet.size
   }
 }
 
@@ -435,6 +444,22 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
   try {
     await connection.beginTransaction()
 
+    // 上一份 ID 集合：在 DELETE 之前读取，用于 rule_matched_objects_history 的 diff（方案 P1）
+    const normalRuleIds = perRule.filter((r) => r.status === 'NORMAL').map((r) => r.ruleId)
+    const oldIdsByRule = new Map()
+    if (normalRuleIds.length > 0) {
+      const placeholders = normalRuleIds.map(() => '?').join(',')
+      const [oldRows] = await connection.execute(
+        `SELECT rule_id, object_id FROM rule_matched_objects WHERE account_id = ? AND rule_id IN (${placeholders})`,
+        [accountId, ...normalRuleIds]
+      )
+      for (const row of oldRows || []) {
+        const rid = row.rule_id
+        if (!oldIdsByRule.has(rid)) oldIdsByRule.set(rid, new Set())
+        oldIdsByRule.get(rid).add(String(row.object_id || '').trim())
+      }
+    }
+
     // 策略 B（保留上一版快照）：
     // - 仅对 status=NORMAL 的规则做「按 rule 维度原子替换」；
     // - ERROR_OVERSIZE / ERROR_FILTER_INVALID / ERROR_REFRESH_FAILED 仅更新 rules 状态，不动旧快照。
@@ -466,6 +491,53 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
       }
     }
 
+    // rule_matched_objects_history：仅变动时写入，同一事务内（方案 P1）
+    const SNAPSHOT_MAX_FULL = 200
+    const SNAPSHOT_MAX_NARROW = 100
+    const LARGE_LIST_THRESHOLD = 500
+    for (const r of perRule) {
+      if (r.status !== 'NORMAL') continue
+      const oldSet = oldIdsByRule.get(r.ruleId) || new Set()
+      const newIds = Array.isArray(r.finalAdIds) ? r.finalAdIds : []
+      const newSet = new Set(newIds.map((id) => String(id).trim()).filter(Boolean))
+      const added = [...newSet].filter((id) => !oldSet.has(id))
+      const removed = [...oldSet].filter((id) => !newSet.has(id))
+      const addedCount = added.length
+      const removedCount = removed.length
+      if (addedCount === 0 && removedCount === 0) continue
+
+      const objectCount = newIds.length
+      let objectIdsSnapshot = null
+      let objectIdsChecksum = null
+      if (objectCount <= LARGE_LIST_THRESHOLD) {
+        objectIdsSnapshot = newIds.slice(0, SNAPSHOT_MAX_FULL)
+      } else {
+        objectIdsSnapshot = newIds.slice(0, SNAPSHOT_MAX_NARROW)
+        const sorted = [...newIds].sort()
+        objectIdsChecksum = crypto.createHash('md5').update(sorted.join(',')).digest('hex')
+      }
+
+      const dynamicCount = r.dynamicCount != null ? r.dynamicCount : null
+      const manualCount = r.manualCount != null ? r.manualCount : null
+      await connection.execute(
+        `INSERT INTO rule_matched_objects_history
+         (rule_id, account_id, refreshed_at, trigger_type, object_count, manual_count, dynamic_count, added_count, removed_count, object_ids_snapshot, object_ids_checksum)
+         VALUES (?, ?, NOW(6), ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          r.ruleId,
+          accountId,
+          trigger,
+          objectCount,
+          manualCount,
+          dynamicCount,
+          addedCount,
+          removedCount,
+          objectIdsSnapshot != null ? JSON.stringify(objectIdsSnapshot) : null,
+          objectIdsChecksum
+        ]
+      )
+    }
+
     const updateIds = []
     for (const r of perRule) {
       updateIds.push(r.ruleId)
@@ -495,6 +567,21 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
         `,
         [...params, ...idsParams]
       )
+      for (const rid of updateIds) {
+        try {
+          await insertRuleHistory({
+            ruleId: rid,
+            changeType: 'SYSTEM_REFRESH',
+            source: 'dynamic_scope_refresh',
+            changedByUserId: null,
+            changedByOwnerId: null,
+            ruleSnapshot: null,
+            connection
+          })
+        } catch (e) {
+          logger.warn('[rule_history] SYSTEM_REFRESH batch insert failed', { ruleId: rid, err: e.message })
+        }
+      }
     }
 
     await connection.commit()
@@ -603,8 +690,20 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
      WHERE id = ?`,
     [finalStatus, finalErrorMsg, id]
   )
+  try {
+    await insertRuleHistory({
+      ruleId: id,
+      changeType: 'SYSTEM_REFRESH',
+      source: 'dynamic_scope_refresh',
+      changedByUserId: null,
+      changedByOwnerId: null,
+      ruleSnapshot: null
+    })
+  } catch (e) {
+    logger.warn('[rule_history] SYSTEM_REFRESH single status insert failed', { ruleId: id, err: e.message })
+  }
 
-  // 重算成功后，用 rule_matched_objects 快照回写 target_ids / target_by_account，使规则配置与当前匹配一致
+  // 重算成功后，用 rule_matched_objects 快照回写 target_ids / target_by_account，使规则配置与当前匹配一致（ID 归一化约定：用 normalizeAccountId 拼 act_xxx:objId）
   if (finalStatus === 'NORMAL') {
     const [matchedRows] = await pool.execute(
       'SELECT account_id, object_id FROM rule_matched_objects WHERE rule_id = ?',
@@ -624,6 +723,18 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
       'UPDATE rules SET target_ids = ?, target_by_account = ? WHERE id = ?',
       [JSON.stringify(targetIds), JSON.stringify(byAccount), id]
     )
+    try {
+      await insertRuleHistory({
+        ruleId: id,
+        changeType: 'SYSTEM_REFRESH',
+        source: 'dynamic_scope_refresh',
+        changedByUserId: null,
+        changedByOwnerId: null,
+        ruleSnapshot: null
+      })
+    } catch (e) {
+      logger.warn('[rule_history] SYSTEM_REFRESH target backwrite insert failed', { ruleId: id, err: e.message })
+    }
   }
 
   return {
