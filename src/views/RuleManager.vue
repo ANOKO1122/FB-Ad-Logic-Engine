@@ -1621,6 +1621,7 @@ export default {
         return out
       })
       // 方案 B：按账户分组目标 ID，供后端 target_by_account 落库与执行按账户取。多账户时 targetIds 以 act_xxx:id 持久化，避免跨账户 ID 歧义
+      // 单选账户时前端 ruleForm.targetIds 为裸 id，后端 parseCompositeId 要求 "act_xxx:id" 格式，故此处统一转为复合 ID 再提交
       const ids = ruleForm.value.targetIds || []
       const byAccount = {}
       const accountSet = new Set(selectedAccountIds.value)
@@ -1639,6 +1640,12 @@ export default {
           byAccount[acc].push(s)
         }
       }
+      const normalizedTargetIds = []
+      for (const acc of Object.keys(byAccount)) {
+        for (const objId of byAccount[acc]) {
+          normalizedTargetIds.push(`${acc}:${objId}`)
+        }
+      }
       const payload = {
         ruleName: ruleForm.value.name.trim(),
         accountId: selectedAccountIds.value[0],
@@ -1646,7 +1653,7 @@ export default {
         actions: actionsPayload,
         enabled: ruleForm.value.enabled,
         targetLevel: ruleForm.value.targetLevel,
-        targetIds: ruleForm.value.targetIds,
+        targetIds: normalizedTargetIds,
         targetAccounts: selectedAccountIds.value,
         target_by_account: Object.keys(byAccount).length ? byAccount : null,
         logicOperator: ruleForm.value.logicOperator,

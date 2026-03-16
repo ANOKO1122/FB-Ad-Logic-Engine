@@ -19,7 +19,7 @@ function syncTargetByAccount(rule) {
   const raw = rule.target_ids ?? rule.targetIds
   const targetIds = Array.isArray(raw) ? raw : (typeof raw === 'string' ? (() => { try { return JSON.parse(raw) } catch { return [] } })() : [])
   const newMap = {}
-  const normalizedTargetIds = []
+  let normalizedTargetIds = []
   for (const compositeId of targetIds) {
     const parsed = parseCompositeId(compositeId)
     if (!parsed) continue
@@ -28,6 +28,27 @@ function syncTargetByAccount(rule) {
     if (!newMap[accountId].includes(objId)) {
       newMap[accountId].push(objId)
       normalizedTargetIds.push(`${accountId}:${objId}`)
+    }
+  }
+  // 兜底：targetIds 为裸 id 时 parse 全失败，用前端传来的 target_by_account 反推复合 ID 再落库
+  const byAccountRaw = rule.target_by_account ?? rule.targetByAccount
+  if (normalizedTargetIds.length === 0 && byAccountRaw && typeof byAccountRaw === 'object' && Object.keys(byAccountRaw).length > 0) {
+    const fallbackMap = {}
+    for (const accountId of Object.keys(byAccountRaw)) {
+      const arr = byAccountRaw[accountId]
+      if (!Array.isArray(arr)) continue
+      fallbackMap[accountId] = []
+      for (const objId of arr) {
+        const s = String(objId || '').trim()
+        if (!s) continue
+        if (!fallbackMap[accountId].includes(s)) {
+          fallbackMap[accountId].push(s)
+          normalizedTargetIds.push(`${accountId}:${s}`)
+        }
+      }
+    }
+    if (Object.keys(fallbackMap).length > 0) {
+      Object.assign(newMap, fallbackMap)
     }
   }
   rule.targetByAccount = newMap

@@ -4,6 +4,7 @@
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { queryRuleData, getAccountTimezone } from './ruleDataService.js'
+import { _internals as dynamicScopeInternals } from './dynamicScopeService.js'
 
 /**
  * 解析单条规则的目标广告 ID 列表（与 index.js RuleEngine.evaluateRule 口径一致）
@@ -88,6 +89,24 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
       }
     }
   }
+
+  // 关闭动态时：目标 = target_ids/target_by_account − exclude_ids，与动态规则口径一致
+  const rawExclude = rule.excludeIds ?? rule.exclude_ids
+  if (!useDynamicScope && rawExclude && typeof rawExclude === 'object' && targetAdIds.length > 0) {
+    try {
+      const excludeSet = await dynamicScopeInternals.expandExcludeIdsToAdLevel(accountId, rawExclude)
+      if (excludeSet.size > 0) {
+        const before = targetAdIds.length
+        targetAdIds = targetAdIds.filter(id => !excludeSet.has(String(id)))
+        if (targetAdIds.length < before) {
+          logger.debug(`   [Dispatcher] 规则 ${rule.id} 排除 ${before - targetAdIds.length} 个后剩余 ${targetAdIds.length} 个目标`)
+        }
+      }
+    } catch (err) {
+      logger.warn(`   [Dispatcher] 规则 ${rule.id} 展开 exclude_ids 失败，未应用排除:`, err.message)
+    }
+  }
+
   return { targetAdIds, queryCount }
 }
 

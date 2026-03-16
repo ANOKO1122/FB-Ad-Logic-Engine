@@ -2,7 +2,7 @@
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
 >
-> **最新更新（2026-03-16）**：① **做法 A：开启动态禁手动目标与排除搜索**：依据 `.cursor/plans/做法a_开启动态禁手动目标与排除搜索_66a27693.plan.md`。后端有 scope 时 union 仅用 dynamicSet；前端开启动态时关闭 2s 防抖与「加载更多」写 targetIds，目标区仅展示「当前匹配 N 个对象」，排除区独立搜索框与 filteredExcludeScopeItems、全选并集；新建/编辑清空 excludeScopeSearch。② **动态匹配数展示与搜索精准化 + 排除区 ID 搜索**：依据 `.cursor/plans/动态匹配数展示与搜索精准化_49bd6f7d.plan.md`。开启动态后防抖 watch 仅更新 matchedCount；目标区/排除区搜索改为 q+limit=50 服务端单页；排除区单账户下支持按广告 ID 搜索（isIdSearch + resolveObjectsByIds 合并）。窗口总结见 `项目开发过程/项目总结-2026-03-16-做法A开启动态禁手动目标与排除搜索.md` 与 `项目开发过程/项目总结-2026-03-16-动态匹配数展示与搜索精准化及排除区ID搜索.md`。
+> **最新更新（2026-03-16）**：① **做法 A：开启动态禁手动目标与排除搜索**：依据 `.cursor/plans/做法a_开启动态禁手动目标与排除搜索_66a27693.plan.md`。后端有 scope 时 union 仅用 dynamicSet；前端开启动态时关闭 2s 防抖与「加载更多」写 targetIds，目标区仅展示「当前匹配 N 个对象」，排除区独立搜索框与 filteredExcludeScopeItems、全选并集；新建/编辑清空 excludeScopeSearch。② **动态匹配数展示与搜索精准化 + 排除区 ID 搜索**：依据 `.cursor/plans/动态匹配数展示与搜索精准化_49bd6f7d.plan.md`。开启动态后防抖 watch 仅更新 matchedCount；目标区/排除区搜索改为 q+limit=50 服务端单页；排除区单账户下支持按广告 ID 搜索（isIdSearch + resolveObjectsByIds 合并）。③ **目标误判与关闭动态排除修复**：完善「本想只打一个广告却打了整个账户」的误判场景（target_ids/target_by_account 归一化与兜底）；关闭动态筛选后排除名单不生效：在 ruleEngineDispatcher.resolveTargetAdIdsForRule 中，当 use_dynamic_scope=0 且规则存在 exclude_ids 时，调用 expandExcludeIdsToAdLevel 对 targetAdIds 做「所选 − 排除」过滤。验收：选 4 排 2 → matched_count=2、executed_count=2。窗口总结见 `项目开发过程/项目总结-2026-03-16-做法A开启动态禁手动目标与排除搜索.md`、`项目开发过程/项目总结-2026-03-16-动态匹配数展示与搜索精准化及排除区ID搜索.md`、`项目开发过程/项目总结-2026-03-16-目标误判与关闭动态排除修复.md`。
 >
 > **此前进度（2026-03-13）**：**24小时制时间段选择与UI优化 + 执行时间校验修复**：依据 `.cursor/plans/24小时制时间段选择与ui优化_56fa7594.plan.md`。① 新增 `TimePicker24.vue`（时/分双 select，纯 24 小时）；RuleManager 指定时间段改为两行「开始/结束时间」+ TimePicker24，说明文案单独成行；跨日展示「开始–次日 结束」。② 执行时间段后端：`isInExecutionWindow` 对 MySQL/Drizzle 返回的 JSON 字符串做 `JSON.parse`，修复「配置 20:00–04:00 却在 11:48 仍执行」的根因；单测 `executionWindow.test.js` 增加 JSON 字符串用例；SQL 验证 `rule_execution_summaries.skip_reason=outside_execution_window` 与 `rule_ad_execution_state.last_status=outside_window` 与预期一致。窗口总结见 `项目开发过程/项目总结-2026-03-13-24小时制时间段选择与执行时间验证.md`。可选后续：`executeSingleRule` 增加执行时间段校验使手动「运行此规则」也遵守时间段。
 >
@@ -101,6 +101,19 @@
   单账户且关键词满足 `/^\d{10,}$/` 时，与列表请求并行调用 resolveObjectsByIds，合并非 missing 且未在列表中的项并补 account_id；多账户与目标区一致不做 ID 解析合并。根因：后端 q 只按 name 过滤，排除区原无 isIdSearch+resolve。
 
 窗口总结见 `项目开发过程/项目总结-2026-03-16-动态匹配数展示与搜索精准化及排除区ID搜索.md`。
+
+---
+
+## 目标误判与关闭动态排除修复（2026-03-16，已完成）
+
+> 目标：① 完善「本想只打一个广告却打了整个账户」的误判场景；② 修复关闭动态筛选后排除名单不生效的问题。
+
+- [x] **误判场景完善**  
+  target_ids/target_by_account 归一化与兜底（此前已通过 syncTargetByAccount、normalizeCompositeId、evaluateRule 无目标账户不查全量、getRuleAccountIds 仅非空数组账户等落地），确保「只选一个广告」时不会误打成整个账户。
+- [x] **关闭动态时排除生效**  
+  `ruleEngineDispatcher.resolveTargetAdIdsForRule` 中，当 `use_dynamic_scope=0` 且规则存在 exclude_ids/excludeIds 时，调用 `dynamicScopeInternals.expandExcludeIdsToAdLevel(accountId, rawExclude)` 得到排除 ad 集合，对 targetAdIds 做 `targetAdIds = targetAdIds.filter(id => !excludeSet.has(String(id)))`，使「目标 = 所选 − 排除」。动态规则仍由 rule_matched_objects 快照负责，不在 Dispatcher 重复减 exclude。
+- [x] **验收**  
+  规则选 4 个广告、排除 2 个 → matched_count=2、executed_count=2；automation_logs 最新执行仅对 2 个未排除广告写日志。窗口总结见 `项目开发过程/项目总结-2026-03-16-目标误判与关闭动态排除修复.md`。
 
 ---
 
