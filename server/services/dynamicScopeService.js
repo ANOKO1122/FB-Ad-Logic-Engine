@@ -228,9 +228,22 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
   const dynamicSet = new Set()
   const manualSet = await expandManualTargetIdsToAdLevel(accountId, rule)
   const excludeSet = await expandExcludeIdsToAdLevel(accountId, rule.excludeIds || rule.exclude_ids)
+  /** 有 scope_filters 时仅用 dynamicSet 作为作用范围，不并 manualSet（做法 A：开启动态禁手动目标） */
+  let scopeOnlyForUnion = false
 
   if (rule.useDynamicScope || rule.use_dynamic_scope) {
     const scopeFilters = rule.scopeFilters || rule.scope_filters
+    // 1.1 实质性范围条件：无 conditions 或 conditions 为空视为未配置，避免空条件误选全量
+    const conditions = Array.isArray(scopeFilters?.conditions) ? scopeFilters.conditions : []
+    if (conditions.length === 0) {
+      return {
+        status: 'ERROR_FILTER_INVALID',
+        errorMsg: 'scope_filters.conditions 不能为空',
+        finalAdIds: null,
+        dynamicCount: 0,
+        manualCount: manualSet.size
+      }
+    }
     let filter
     try {
       filter = buildStructureFilter(scopeFilters, accountId, now)
@@ -293,9 +306,10 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
         }
       }
     }
+    scopeOnlyForUnion = true
   }
 
-  const union = new Set([...dynamicSet, ...manualSet])
+  const union = scopeOnlyForUnion ? new Set(dynamicSet) : new Set([...dynamicSet, ...manualSet])
   const finalAdIds = []
   for (const id of union) {
     if (!excludeSet.has(id)) finalAdIds.push(id)
@@ -406,6 +420,11 @@ export async function previewDynamicScope(accountIds, options) {
   }
 }
 
+/**
+ * 按账户刷新多条规则的动态匹配快照（rule_matched_objects + history + rules.dynamic_scope_status）。
+ * 事务约定：仅写快照表与状态，不回写 rules.target_ids；commit 成功后才视为刷新成功。
+ * 职责解耦：rules 为「合同」，rule_matched_objects 为「工单」，见 docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md
+ */
 async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options = {}) {
   const nowUtc = DateTime.utc()
   const start = Date.now()
@@ -460,9 +479,18 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
       }
     }
 
-    // 策略 B（保留上一版快照）：
-    // - 仅对 status=NORMAL 的规则做「按 rule 维度原子替换」；
-    // - ERROR_OVERSIZE / ERROR_FILTER_INVALID / ERROR_REFRESH_FAILED 仅更新 rules 状态，不动旧快照。
+    // 策略 B（Fail-Closed）：
+    // - 仅 ERROR_FILTER_INVALID 时清空该规则该账户快照（配置无效，旧快照无意义）；
+    // - ERROR_OVERSIZE / ERROR_REFRESH_FAILED 保留旧快照；
+    // - NORMAL 时原子替换（DELETE 后 INSERT）。
+    for (const r of perRule) {
+      if (r.status === 'ERROR_FILTER_INVALID') {
+        await connection.execute(
+          `DELETE FROM rule_matched_objects WHERE account_id = ? AND rule_id = ?`,
+          [accountId, r.ruleId]
+        )
+      }
+    }
     let inserted = 0
     for (const r of perRule) {
       if (r.status !== 'NORMAL') continue
@@ -703,39 +731,8 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
     logger.warn('[rule_history] SYSTEM_REFRESH single status insert failed', { ruleId: id, err: e.message })
   }
 
-  // 重算成功后，用 rule_matched_objects 快照回写 target_ids / target_by_account，使规则配置与当前匹配一致（ID 归一化约定：用 normalizeAccountId 拼 act_xxx:objId）
-  if (finalStatus === 'NORMAL') {
-    const [matchedRows] = await pool.execute(
-      'SELECT account_id, object_id FROM rule_matched_objects WHERE rule_id = ?',
-      [id]
-    )
-    const byAccount = {}
-    const targetIds = []
-    for (const r of matchedRows || []) {
-      const acc = normalizeAccountId(r.account_id)
-      const objId = String(r.object_id ?? '').trim()
-      if (!acc || !objId) continue
-      if (!byAccount[acc]) byAccount[acc] = []
-      byAccount[acc].push(objId)
-      targetIds.push(`${acc}:${objId}`)
-    }
-    await pool.execute(
-      'UPDATE rules SET target_ids = ?, target_by_account = ? WHERE id = ?',
-      [JSON.stringify(targetIds), JSON.stringify(byAccount), id]
-    )
-    try {
-      await insertRuleHistory({
-        ruleId: id,
-        changeType: 'SYSTEM_REFRESH',
-        source: 'dynamic_scope_refresh',
-        changedByUserId: null,
-        changedByOwnerId: null,
-        ruleSnapshot: null
-      })
-    } catch (e) {
-      logger.warn('[rule_history] SYSTEM_REFRESH target backwrite insert failed', { ruleId: id, err: e.message })
-    }
-  }
+  // 方案约定（动态筛选防误判与审计增强）：不将 rule_matched_objects 结果回写 rules.target_ids / target_by_account。
+  // rules 表为「合同」（用户配置），rule_matched_objects 为「工单」（执行快照）；取消回写避免运行时结果覆盖配置。
 
   return {
     ruleId: id,

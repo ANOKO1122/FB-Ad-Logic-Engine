@@ -33,7 +33,7 @@
 | 类型 | 文件与位置 | 说明 |
 |------|------------|------|
 | 写 rules.target_ids | `server/services/rulesService.js` | createRule：第 52 行 syncTargetByAccount(ruleData) 后 db.insert；updateRule：第 196-197 行含 targetIds 时 syncTargetByAccount(updates) 后 db.update。 |
-| 写 rules.target_ids | `server/services/dynamicScopeService.js` | refreshDynamicTargetsForRule 内约 704-713 行：从 rule_matched_objects 读出后用 normalizeAccountId(acc) 拼 targetIds，再 UPDATE rules。 |
+| 写 rules.target_ids | `server/services/dynamicScopeService.js` | **已取消回写**：不再将 rule_matched_objects 结果写回 rules；rules 为合同、快照为工单，见方案约定。 |
 | 返回复合 ID 给前端 | `server/services/dynamicScopeService.js` | previewDynamicScope：约 385 行 objectIds.push(normalizeCompositeId(accountId, adId))，返回 object_ids。 |
 | 返回 target_ids（来自 DB） | 规则 API GET /api/rules、GET /api/rules/:id | 数据来源仅为上两处写入，已归一化；新增写 rules.target_ids 的路径时须经 syncTargetByAccount 或等价归一化。 |
 

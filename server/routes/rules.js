@@ -15,6 +15,17 @@ import { refreshDynamicTargetsForAccount, refreshDynamicTargetsForRule, schedule
 
 const router = Router()
 
+/**
+ * 保存规则时分层错误响应（方案 1.4）：业务错误 400/404，系统错误 500，便于前端区分展示。
+ */
+function mapRuleErrorToResponse(error) {
+  const msg = error?.message || ''
+  if (msg === '规则不存在或无权访问') return { statusCode: 404, code: 'NOT_FOUND' }
+  if (/^INVALID_|^RULE_NOT_FOUND|ACCOUNT_NOT_FOUND|ACCOUNT_FORBIDDEN/.test(msg)) return { statusCode: 400, code: msg.split(' ')[0] || 'BAD_REQUEST' }
+  if (msg.includes('必填') || msg.includes('必须是') || msg.includes('仅支持')) return { statusCode: 400, code: 'VALIDATION_ERROR' }
+  return { statusCode: 500, code: 'ERROR' }
+}
+
 function parseDynamicScopePayload(body = {}) {
   const hasUse = Object.prototype.hasOwnProperty.call(body, 'useDynamicScope')
   const hasFilters = Object.prototype.hasOwnProperty.call(body, 'scopeFilters')
@@ -283,6 +294,22 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
         if (p) configuredSet.add(`${p.accountId}:${p.objId}`)
       }
       rule.invalid_ids = [...configuredSet].filter((c) => !matchedSet.has(c))
+      // 可选：最近一次历史中的 manual_count / dynamic_count，便于界面展示「动态 X / 手动 Y」
+      const [historyRows] = await pool.execute(
+        `SELECT manual_count, dynamic_count, refreshed_at, trigger_type
+         FROM rule_matched_objects_history
+         WHERE rule_id = ? ORDER BY refreshed_at DESC LIMIT 1`,
+        [ruleId]
+      )
+      if (historyRows?.[0]) {
+        const h = historyRows[0]
+        rule.last_matched_history = {
+          manualCount: h.manual_count,
+          dynamicCount: h.dynamic_count,
+          refreshedAt: h.refreshed_at,
+          triggerType: h.trigger_type
+        }
+      }
     }
 
     res.json({ rule })
@@ -485,7 +512,8 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
     })
   } catch (error) {
     logger.error('创建规则失败:', error)
-    res.status(500).json({ error: error.message })
+    const mapped = mapRuleErrorToResponse(error)
+    res.status(mapped.statusCode).json({ error: error.message, code: mapped.code })
   }
 })
 
@@ -681,11 +709,9 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
       rule: updatedRule
     })
   } catch (error) {
-    if (error.message === '规则不存在或无权访问') {
-      return res.status(404).json({ error: error.message })
-    }
     logger.error('更新规则失败:', error)
-    res.status(500).json({ error: error.message })
+    const mapped = mapRuleErrorToResponse(error)
+    res.status(mapped.statusCode).json({ error: error.message, code: mapped.code })
   }
 })
 

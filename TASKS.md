@@ -2,9 +2,11 @@
 
 > 建议执行顺序：从「高价值、低耦合」的后端能力开始（数据层 → 规则层 → 动作层 → 反馈层），前端逐步跟进。
 >
-> **最新更新（2026-03-13）**：**24小时制时间段选择与UI优化 + 执行时间校验修复**：依据 `.cursor/plans/24小时制时间段选择与ui优化_56fa7594.plan.md`。① 新增 `TimePicker24.vue`（时/分双 select，纯 24 小时）；RuleManager 指定时间段改为两行「开始/结束时间」+ TimePicker24，说明文案单独成行；跨日展示「开始–次日 结束」。② 执行时间段后端：`isInExecutionWindow` 对 MySQL/Drizzle 返回的 JSON 字符串做 `JSON.parse`，修复「配置 20:00–04:00 却在 11:48 仍执行」的根因；单测 `executionWindow.test.js` 增加 JSON 字符串用例；SQL 验证 `rule_execution_summaries.skip_reason=outside_execution_window` 与 `rule_ad_execution_state.last_status=outside_window` 与预期一致。窗口总结见 `项目开发过程/项目总结-2026-03-13-24小时制时间段选择与执行时间验证.md`。可选后续：`executeSingleRule` 增加执行时间段校验使手动「运行此规则」也遵守时间段。
+> **最新更新（2026-03-16）**：① **做法 A：开启动态禁手动目标与排除搜索**：依据 `.cursor/plans/做法a_开启动态禁手动目标与排除搜索_66a27693.plan.md`。后端有 scope 时 union 仅用 dynamicSet；前端开启动态时关闭 2s 防抖与「加载更多」写 targetIds，目标区仅展示「当前匹配 N 个对象」，排除区独立搜索框与 filteredExcludeScopeItems、全选并集；新建/编辑清空 excludeScopeSearch。② **动态匹配数展示与搜索精准化 + 排除区 ID 搜索**：依据 `.cursor/plans/动态匹配数展示与搜索精准化_49bd6f7d.plan.md`。开启动态后防抖 watch 仅更新 matchedCount；目标区/排除区搜索改为 q+limit=50 服务端单页；排除区单账户下支持按广告 ID 搜索（isIdSearch + resolveObjectsByIds 合并）。窗口总结见 `项目开发过程/项目总结-2026-03-16-做法A开启动态禁手动目标与排除搜索.md` 与 `项目开发过程/项目总结-2026-03-16-动态匹配数展示与搜索精准化及排除区ID搜索.md`。
 >
-> **此前进度（2026-03-13）**：**动态筛选防误判与审计增强**：① **1.5 ID 归一化显式约定**：新增 `docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md`，明确保存/预览路径经 syncTargetByAccount、normalizeCompositeId 归一化；rulesService、dynamicScopeService 相关处补充注释。② **2.1/2.2 历史表计数维度**：迁移 040 为 `rule_matched_objects_history` 增加 `manual_count`、`dynamic_count`（INT NULL，幂等脚本）；`calculateMatchedAdIdsForRule` 返回 dynamicCount/manualCount；`refreshDynamicTargetsForRulesInAccount` 写历史时传入两列。验收：重算后新插入历史行 manual_count/dynamic_count 有值；trigger_type 区分 manual/rule_saved。
+> **此前进度（2026-03-13）**：**24小时制时间段选择与UI优化 + 执行时间校验修复**：依据 `.cursor/plans/24小时制时间段选择与ui优化_56fa7594.plan.md`。① 新增 `TimePicker24.vue`（时/分双 select，纯 24 小时）；RuleManager 指定时间段改为两行「开始/结束时间」+ TimePicker24，说明文案单独成行；跨日展示「开始–次日 结束」。② 执行时间段后端：`isInExecutionWindow` 对 MySQL/Drizzle 返回的 JSON 字符串做 `JSON.parse`，修复「配置 20:00–04:00 却在 11:48 仍执行」的根因；单测 `executionWindow.test.js` 增加 JSON 字符串用例；SQL 验证 `rule_execution_summaries.skip_reason=outside_execution_window` 与 `rule_ad_execution_state.last_status=outside_window` 与预期一致。窗口总结见 `项目开发过程/项目总结-2026-03-13-24小时制时间段选择与执行时间验证.md`。可选后续：`executeSingleRule` 增加执行时间段校验使手动「运行此规则」也遵守时间段。
+>
+> **此前进度（2026-03-13）**：**动态筛选防误判与审计增强**：① **1.5 ID 归一化显式约定**：新增 `docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md`，明确保存/预览路径经 syncTargetByAccount、normalizeCompositeId 归一化；rulesService、dynamicScopeService 相关处补充注释。② **2.1/2.2 历史表计数维度**：迁移 040 为 `rule_matched_objects_history` 增加 `manual_count`、`dynamic_count`（INT NULL，幂等脚本）；`calculateMatchedAdIdsForRule` 返回 dynamicCount/manualCount；`refreshDynamicTargetsForRulesInAccount` 写历史时传入两列。验收：重算后新插入历史行 manual_count/dynamic_count 有值；trigger_type 区分 manual/rule_saved。窗口总结见 `项目开发过程/项目总结-2026-03-13-动态筛选防误判与审计增强.md`。
 >
 > **此前进度（2026-03-12）**：**历史数据与审计落地方案**：依据 `.cursor/plans/历史数据与审计落地方案_b874db26.plan.md`。① 迁移 037/038/039 建表 rule_history、rule_matched_objects_history、structure_ads_history；② ruleHistoryService + rulesService/dynamicScopeService 写入 rule_history（CREATE/UPDATE/TOGGLE/DELETE/SYSTEM_REFRESH）；deleteRule 同一事务内 SELECT→INSERT 历史→DELETE 快照与规则；③ dynamicScopeService 在 refresh 内 DELETE 前读快照、与 finalAdIds diff，仅变化时写 rule_matched_objects_history（双特征+大列表窄化 checksum）；④ structureSyncService 全账户 Map 预加载、循环内仅内存对比、变更推队列，队列上限 5000、满则丢弃并 Warn，四处写 structure_ads 路径均接历史；优雅停机前 flushHistoryQueue(10s)；⑤ cronService 每日 04:30 历史表清理（分批 DELETE LIMIT 10000、批间 sleep 500ms），可选 ENABLE_HISTORY_CLEANUP、HISTORY_RETENTION_DAYS_*；单次执行脚本 `node server/scripts/run-history-cleanup.js`。问题与解决：MySQL 预编译语句 LIMIT 不可用占位符 → 改为 SQL 内联常量；脚本保留期 0 被 `||` 当未设置 → 仅测试时可用 0，生产用默认 30/60 天。窗口总结见 `项目开发过程/项目总结-2026-03-12-历史数据与审计落地方案.md`。
 >
@@ -72,6 +74,44 @@
   仅管理员显示负责人自定义多选下拉（触发器 + 浮层 + 自定义复选框、「清除筛选 (全选)」、点击外部关闭）；loadRules 带 ownerIds；normalizeRule 映射 ownerId/ownerName；卡片展示「负责人: xxx」；setup return 补全 5 项。
 - [x] **测试与文档**  
   规则测试 targetIds 改为复合 ID 格式（方案 A），18 个用例通过；新增 `docs/规则管理负责人筛选_验证与测试.md`。
+
+---
+
+## 做法 A：开启动态禁手动目标与排除搜索（2026-03-16，已完成）
+
+> 方案：`.cursor/plans/做法a_开启动态禁手动目标与排除搜索_66a27693.plan.md`。开启动态时后端仅用 dynamicSet，前端禁手动目标、排除名单加搜索；关闭动态恢复 2s 防抖与目标区完整操作。
+
+- [x] **后端** 有 scope 时 union 仅 dynamicSet（scopeOnlyForUnion）。
+- [x] **前端** 开启动态时关闭 2s 防抖与加载更多写 targetIds；目标区仅展示当前匹配数；排除区独立搜索+filteredExcludeScopeItems+全选并集；新建/编辑时清空 excludeScopeSearch。
+- [x] **文档** access-permissions-keycloak-review 做法 A 缺口标记已修复。窗口总结见 `项目开发过程/项目总结-2026-03-16-做法A开启动态禁手动目标与排除搜索.md`。
+
+---
+
+## 动态匹配数展示与搜索精准化（2026-03-16，已完成）
+
+> 方案：`.cursor/plans/动态匹配数展示与搜索精准化_49bd6f7d.plan.md`。开启动态后防抖仅更新匹配数展示；目标区/排除区搜索统一为 q+limit=50 服务端单页；排除区支持按广告 ID 搜索（单账户）。
+
+- [x] **阶段 A — 动态匹配数展示**  
+  防抖 watch（3s）依赖 scopeConditionRows/selectedAccountIds/targetLevel/excludeTargetIds/maxDynamicMatches/useDynamicScope；开启动态且条件合法时调 previewDynamicScope，仅写 ruleForm.matchedCount，不写 targetIds。
+- [x] **阶段 B — 目标区搜索**  
+  SCOPE_SEARCH_LIMIT=50；refreshScopeItems 有关键词时 limit=50、after=null，成功后 scopePagingAfter=null（搜索模式无加载更多）；无关键词保持 limit=500 与 after。
+- [x] **阶段 C — 排除区搜索**  
+  excludeScopeItems、excludeScopeLoading、excludeRequestId；refreshExcludeScopeItems（仅 excludeScopeSearch 非空时请求，q+limit=50）；filteredExcludeScopeItems（有关键词用 excludeScopeItems，无关键词用 scopeItems）；excludeScopeSearch 防抖 watch；excludeAreaLoading；新建/编辑、清空账户时清空 excludeScopeItems。
+- [x] **排除区 ID 搜索（补充）**  
+  单账户且关键词满足 `/^\d{10,}$/` 时，与列表请求并行调用 resolveObjectsByIds，合并非 missing 且未在列表中的项并补 account_id；多账户与目标区一致不做 ID 解析合并。根因：后端 q 只按 name 过滤，排除区原无 isIdSearch+resolve。
+
+窗口总结见 `项目开发过程/项目总结-2026-03-16-动态匹配数展示与搜索精准化及排除区ID搜索.md`。
+
+---
+
+## 动态筛选防误判与审计增强（2026-03-13，方案 `.cursor/plans/动态筛选防误判与审计增强_10f402f2.plan.md`）
+
+> 目标：在 v2 基础上纳入观测性（历史表 manual_count/dynamic_count）与一致性（保存/预览 ID 归一化显式约定），便于排障与配置表源头洁净。
+
+- [x] **1.5 ID 归一化显式约定**  
+  新增 `docs/动态筛选防误判与审计增强_ID归一化与审计计数约定.md`，明确保存规则经 syncTargetByAccount、执行/预览经 normalizeCompositeId；Code Review 清单；rulesService、dynamicScopeService 相关处补充注释。
+- [x] **2.1/2.2 历史表 manual_count / dynamic_count**  
+  迁移 040 幂等增加 manual_count、dynamic_count（INT NULL）；calculateMatchedAdIdsForRule 返回两计数；refreshDynamicTargetsForRulesInAccount 写历史时传入；验收：重算后新行两列有值，trigger_type 区分 manual/rule_saved。
 
 ---
 

@@ -361,7 +361,7 @@
 
             <div class="form-group">
               <label>选择目标对象（可多选）</label>
-              <div class="scope-filters">
+              <div v-if="!ruleForm.useDynamicScope" class="scope-filters">
                 <input
                   v-model="scopeSearch"
                   class="input-text"
@@ -369,68 +369,81 @@
                 />
               </div>
               <div v-if="!selectedAccountIds.length" class="empty-hint">请先选择至少一个广告账户</div>
-              <div v-else class="scope-list">
-                <div class="scope-actions">
-                  <span v-if="ruleForm.useDynamicScope && ruleForm.matchedCount != null">当前匹配 {{ ruleForm.matchedCount }} 个对象（规则配置共 {{ ruleForm.targetIds.length }} 个）</span>
-                  <span v-else>已选 {{ ruleForm.targetIds.length }} 个</span>
-                  <div class="scope-buttons">
-                    <button v-if="showSyncButton" class="btn-tiny btn-sync-highlight" @click="syncConfigFromMatch" :disabled="isApplyingScopeConditions">同步</button>
-                    <button class="btn-tiny" @click="selectAllScope" :disabled="!canSelectAll || isApplyingScopeConditions">全选</button>
-                    <button class="btn-tiny" @click="clearScopeSelection" :disabled="!ruleForm.targetIds.length || isApplyingScopeConditions">清空</button>
+              <template v-else>
+                <!-- 开启动态：仅展示当前匹配数，不可勾选目标（做法 A） -->
+                <div v-if="ruleForm.useDynamicScope" class="scope-list">
+                  <div class="scope-dynamic-summary">当前匹配 {{ ruleForm.matchedCount ?? 0 }} 个对象（按监控条件实时计算，无需选择目标）</div>
+                </div>
+                <!-- 关闭动态：完整搜索、勾选、同步/全选/清空、加载更多 -->
+                <div v-else class="scope-list">
+                  <div class="scope-actions">
+                    <span>已选 {{ ruleForm.targetIds.length }} 个</span>
+                    <div class="scope-buttons">
+                      <button v-if="showSyncButton" class="btn-tiny btn-sync-highlight" @click="syncConfigFromMatch" :disabled="isApplyingScopeConditions">同步</button>
+                      <button class="btn-tiny" @click="selectAllScope" :disabled="!canSelectAll || isApplyingScopeConditions">全选</button>
+                      <button class="btn-tiny" @click="clearScopeSelection" :disabled="!ruleForm.targetIds.length || isApplyingScopeConditions">清空</button>
+                    </div>
+                  </div>
+                  <div v-if="syncJustDoneMessage" class="sync-just-done-hint">{{ syncJustDoneMessage }}</div>
+                  <div v-if="ruleForm.targetIds.length" class="selected-preview">
+                    <span v-for="id in selectedTargetPreview" :key="id" class="tag" :class="{ 'tag-missing': resolvedSelectedMap.get(String(id))?.missing, 'tag-invalid': invalidIdSet.has(String(id)) }">
+                      <span v-if="invalidIdSet.has(String(id))">{{ resolvedSelectedMap.get(String(id))?.name || id }} [已失效/未同步]</span>
+                      <span v-else-if="resolvedSelectedMap.get(String(id))?.name">
+                        {{ resolvedSelectedMap.get(String(id)).name }}
+                      </span>
+                      <span v-else-if="resolvedSelectedMap.get(String(id))?.missing">{{ id }} (未同步)</span>
+                      <span v-else-if="!scopeLoadedIdSet.has(String(id))">[已勾选] 未加载数据 (ID: {{ id }})</span>
+                      <span v-else>{{ id }}</span>
+                    </span>
+                    <span v-if="ruleForm.targetIds.length > selectedTargetPreview.length" class="muted">
+                      还有 {{ ruleForm.targetIds.length - selectedTargetPreview.length }} 个
+                    </span>
+                  </div>
+                  <div v-if="missingSelectedCount > 0" class="hint">
+                    注意：有 {{ missingSelectedCount }} 个已选对象未出现在当前列表中（可能未加载到当前页或已被删除），但仍会保留在规则里。
+                  </div>
+                  <div v-if="scopeLoading" class="loading">正在加载列表...</div>
+                  <div v-else-if="!filteredScopeItems.length" class="empty-hint">暂无可选对象</div>
+                  <div v-else class="scope-items">
+                    <label v-for="item in filteredScopeItems" :key="scopeItemKey(item)" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
+                      <input type="checkbox" :value="scopeItemValue(item)" v-model="ruleForm.targetIds">
+                      <span class="name">{{ item.name || '-' }}</span>
+                      <span class="id">{{ item.id }}</span>
+                      <span v-if="selectedAccountIds.length > 1" class="account-badge">{{ item.account_id || '' }}</span>
+                    </label>
+                  </div>
+                  <div v-if="scopePagingAfter" class="scope-more">
+                    <button class="btn-tiny" @click="loadMoreScopeItems" :disabled="scopeLoading">
+                      {{ scopeLoading ? '加载中...' : '加载更多' }}
+                    </button>
                   </div>
                 </div>
-                <div v-if="syncJustDoneMessage" class="sync-just-done-hint">{{ syncJustDoneMessage }}</div>
-                <div v-if="ruleForm.targetIds.length" class="selected-preview">
-                  <span v-for="id in selectedTargetPreview" :key="id" class="tag" :class="{ 'tag-missing': resolvedSelectedMap.get(String(id))?.missing, 'tag-invalid': invalidIdSet.has(String(id)) }">
-                    <span v-if="invalidIdSet.has(String(id))">{{ resolvedSelectedMap.get(String(id))?.name || id }} [已失效/未同步]</span>
-                    <span v-else-if="resolvedSelectedMap.get(String(id))?.name">
-                      {{ resolvedSelectedMap.get(String(id)).name }}
-                    </span>
-                    <span v-else-if="resolvedSelectedMap.get(String(id))?.missing">{{ id }} (未同步)</span>
-                    <span v-else-if="!scopeLoadedIdSet.has(String(id))">[已勾选] 未加载数据 (ID: {{ id }})</span>
-                    <span v-else>{{ id }}</span>
-                  </span>
-                  <span v-if="ruleForm.targetIds.length > selectedTargetPreview.length" class="muted">
-                    还有 {{ ruleForm.targetIds.length - selectedTargetPreview.length }} 个
-                  </span>
-                </div>
-                <div v-if="missingSelectedCount > 0" class="hint">
-                  注意：有 {{ missingSelectedCount }} 个已选对象未出现在当前列表中（可能未加载到当前页或已被删除），但仍会保留在规则里。
-                </div>
-                <div v-if="scopeLoading" class="loading">正在加载列表...</div>
-                <div v-else-if="!filteredScopeItems.length" class="empty-hint">暂无可选对象</div>
-                <div v-else class="scope-items">
-                  <label v-for="item in filteredScopeItems" :key="scopeItemKey(item)" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
-                    <input type="checkbox" :value="scopeItemValue(item)" v-model="ruleForm.targetIds">
-                    <span class="name">{{ item.name || '-' }}</span>
-                    <span class="id">{{ item.id }}</span>
-                    <span v-if="selectedAccountIds.length > 1" class="account-badge">{{ item.account_id || '' }}</span>
-                  </label>
-                </div>
-                <div v-if="scopePagingAfter" class="scope-more">
-                  <button class="btn-tiny" @click="loadMoreScopeItems" :disabled="scopeLoading">
-                    {{ scopeLoading ? '加载中...' : '加载更多' }}
-                  </button>
-                </div>
-              </div>
+              </template>
             </div>
 
             <div class="form-group">
               <label>排除名单（可选）</label>
               <div class="hint">命中的对象会从最终作用范围中剔除（公式：最终 = 动态 ∪ 手动 - 排除）</div>
+              <div class="scope-filters">
+                <input
+                  v-model="excludeScopeSearch"
+                  class="input-text"
+                  placeholder="搜索名称或ID"
+                />
+              </div>
               <div v-if="!selectedAccountIds.length" class="empty-hint">请先选择至少一个广告账户并加载列表</div>
               <div v-else class="scope-list">
                 <div class="scope-actions">
                   <span>已排除 {{ ruleForm.excludeTargetIds.length }} 个</span>
                   <div class="scope-buttons">
-                    <button class="btn-tiny" @click="selectAllExcludeScope" :disabled="!canSelectAll">全选</button>
+                    <button class="btn-tiny" @click="selectAllExcludeScope" :disabled="!canSelectAllExclude">全选</button>
                     <button class="btn-tiny" @click="clearExcludeScopeSelection" :disabled="!ruleForm.excludeTargetIds.length">清空</button>
                   </div>
                 </div>
-                <div v-if="scopeLoading" class="loading">正在加载列表...</div>
-                <div v-else-if="!filteredScopeItems.length" class="empty-hint">暂无可选对象</div>
+                <div v-if="excludeAreaLoading" class="loading">正在加载列表...</div>
+                <div v-else-if="!filteredExcludeScopeItems.length" class="empty-hint">暂无可选对象</div>
                 <div v-else class="scope-items">
-                  <label v-for="item in filteredScopeItems" :key="`exclude-${scopeItemKey(item)}`" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
+                  <label v-for="item in filteredExcludeScopeItems" :key="`exclude-${scopeItemKey(item)}`" class="scope-item" :class="{ 'scope-item-active': item.effective_status === 'ACTIVE', 'scope-item-paused': item.effective_status === 'PAUSED' }">
                     <input type="checkbox" :value="scopeItemValue(item)" v-model="ruleForm.excludeTargetIds">
                     <span class="name">{{ item.name || '-' }}</span>
                     <span class="id">{{ item.id }}</span>
@@ -732,7 +745,8 @@ export default {
       useDynamicScope: true,
       maxDynamicMatches: 1000,
       matchedCount: null,
-      invalidIds: []
+      invalidIds: [],
+      lastMatchedHistory: null
     })
 
     const INTERVAL_PRESETS = [
@@ -758,11 +772,16 @@ export default {
     const accountToAdd = ref('') // 用于「添加账户」下拉，选完后加入 selectedAccountIds 并清空
     const scopeItems = ref([])
     const scopeSearch = ref('')
+    const excludeScopeSearch = ref('') // 排除名单独立搜索，与目标区 scopeSearch 分离（做法 A）
     const scopeIncludePaused = ref(true)  // 固定为 true：默认显示开启+暂停，不再提供状态下拉
     const scopeLoading = ref(false)
     const scopeReady = ref(false)
     const scopeRequestId = ref(0)
     const scopePagingAfter = ref(null)
+    /** 排除区有关键词时独立请求结果（q+limit=50，无 after）；无关键词时用 scopeItems */
+    const excludeScopeItems = ref([])
+    const excludeScopeLoading = ref(false)
+    const excludeRequestId = ref(0)
     const resolvedSelectedMap = ref(new Map()) // id -> {id,name,...}
     // 监控范围条件（作用对象区）：名称/状态 多行 AND，用于按条件勾选下方列表
     const SCOPE_CONDITION_MAX_ROWS = 3
@@ -788,6 +807,8 @@ export default {
     const scopeCreatedWithinHours = ref(null) // 创建时间段：近 N 小时内（数字或 null），传给后端 scope_created_within_hours
     /** 结构列表每页条数上限（首屏与加载更多共用） */
     const SCOPE_PAGE_LIMIT = 500
+    /** 搜索模式单页条数（q 非空时 limit=50、after=null，不展示加载更多） */
+    const SCOPE_SEARCH_LIMIT = 50
     // 2.3.1 方案B：线性条件列表状态（全局时间窗口 + whenLines）
     const whenLines = ref([])            // [{ join, metric, operator, value }]，首行 join=null
     const whenTimeWindow = ref('today')  // 全局 time_window
@@ -1214,6 +1235,16 @@ export default {
       })
     })
 
+    /** 排除区：有关键词时用服务端结果 excludeScopeItems（q+limit=50）；无关键词时用 scopeItems */
+    const filteredExcludeScopeItems = computed(() => {
+      const key = String(excludeScopeSearch.value || '').trim()
+      const list = key ? excludeScopeItems.value : scopeItems.value
+      return [...list].sort((a, b) => {
+        const order = (x) => (x.effective_status === 'ACTIVE' ? 0 : 1)
+        return order(a) - order(b)
+      })
+    })
+
     /** 多选时用 account_id:id 作为唯一键与表单值；单选时用 id（兼容旧逻辑） */
     const scopeItemKey = (item) => selectedAccountIds.value.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
     const scopeItemValue = (item) => selectedAccountIds.value.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
@@ -1226,6 +1257,14 @@ export default {
 
     const canSelectAll = computed(() => {
       return scopeReady.value && !scopeLoading.value && filteredScopeItems.value.length > 0
+    })
+    /** 排除区加载中：有关键词用 excludeScopeLoading，无关键词用 scopeLoading（与目标区共用列表） */
+    const excludeAreaLoading = computed(() => {
+      const key = String(excludeScopeSearch.value || '').trim()
+      return key ? excludeScopeLoading.value : scopeLoading.value
+    })
+    const canSelectAllExclude = computed(() => {
+      return scopeReady.value && !excludeAreaLoading.value && filteredExcludeScopeItems.value.length > 0
     })
 
     const selectedTargetPreview = computed(() => {
@@ -1295,6 +1334,8 @@ export default {
       accountToAdd.value = ''
       scopeItems.value = []
       scopeSearch.value = ''
+      excludeScopeSearch.value = ''
+      excludeScopeItems.value = []
       scopePagingAfter.value = null
       resolvedSelectedMap.value = new Map()
       scopeConditionRows.value = [createDefaultScopeConditionRow()]
@@ -1407,6 +1448,8 @@ export default {
       accountToAdd.value = ''
       scopeItems.value = []
       scopeSearch.value = ''
+      excludeScopeSearch.value = ''
+      excludeScopeItems.value = []
       scopePagingAfter.value = null
       scopeConditionRows.value = [createDefaultScopeConditionRow()]
       scopeStatusFilter.value = ''
@@ -1467,6 +1510,7 @@ export default {
             if (data.rule && ruleForm.value && editingRuleId.value === r.id) {
               ruleForm.value.matchedCount = data.rule.matched_count != null ? Number(data.rule.matched_count) : null
               ruleForm.value.invalidIds = Array.isArray(data.rule.invalid_ids) ? data.rule.invalid_ids : []
+              ruleForm.value.lastMatchedHistory = data.rule.last_matched_history || null
               const fromApi = data.rule.targetIds ?? data.rule.target_ids
               const nextTargetIds = Array.isArray(fromApi) ? [...fromApi] : (typeof fromApi === 'string' ? (() => { try { return JSON.parse(fromApi) } catch { return [] } })() : [])
               ruleForm.value.targetIds = nextTargetIds
@@ -1759,13 +1803,15 @@ export default {
       const type = level
       const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
       const keyword = String(scopeSearch.value || '').trim()
+      const isSearchMode = keyword.length > 0
+      const limit = isSearchMode ? SCOPE_SEARCH_LIMIT : SCOPE_PAGE_LIMIT
       const isIdSearch = /^\d{10,}$/.test(keyword)
       try {
         if (ids.length === 1) {
           const promises = [
             facebookApi.getStructureObjects(levelKey, ids[0], {
               q: keyword,
-              limit: SCOPE_PAGE_LIMIT,
+              limit,
               after: null,
               include_paused: scopeIncludePaused.value,
               scope_status: scopeStatusFilter.value || undefined,
@@ -1785,11 +1831,11 @@ export default {
             }
           }
           scopeItems.value = items
-          scopePagingAfter.value = results[0]?.paging?.after ?? null
+          scopePagingAfter.value = isSearchMode ? null : (results[0]?.paging?.after ?? null)
         } else {
           const result = await facebookApi.getStructureObjectsMulti(type, ids, {
             q: keyword,
-            limit: SCOPE_PAGE_LIMIT,
+            limit,
             after: null,
             include_paused: scopeIncludePaused.value,
             scope_status: scopeStatusFilter.value || undefined,
@@ -1799,7 +1845,7 @@ export default {
           })
           if (requestId !== scopeRequestId.value) return
           scopeItems.value = result.items || []
-          scopePagingAfter.value = result.paging?.after ?? null
+          scopePagingAfter.value = isSearchMode ? null : (result.paging?.after ?? null)
         }
         // 不再用当前页 scope 列表过滤 ruleForm.targetIds / excludeTargetIds，避免分页导致接口返回的 98 条被裁成 95 条；未出现在当前列表的 ID 仅做提示保留
         scopeReady.value = true
@@ -1810,6 +1856,71 @@ export default {
         scopePagingAfter.value = null
       } finally {
         if (requestId === scopeRequestId.value) scopeLoading.value = false
+      }
+    }
+
+    /** 排除区有关键词时请求 q+limit=50+after=null，结果写 excludeScopeItems；无关键词不请求。
+     * 与目标区一致：当关键词为纯数字且长度≥10 时视为 ID 搜索，额外调 resolve 并合并，使按广告 ID 也能搜到。 */
+    const refreshExcludeScopeItems = async () => {
+      const keyword = String(excludeScopeSearch.value || '').trim()
+      if (!keyword || !selectedAccountIds.value?.length) {
+        excludeScopeItems.value = []
+        return
+      }
+      excludeScopeLoading.value = true
+      const requestId = ++excludeRequestId.value
+      const ids = selectedAccountIds.value
+      const level = ruleForm.value.targetLevel
+      const type = level
+      const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
+      const isIdSearch = /^\d{10,}$/.test(keyword)
+      try {
+        if (ids.length === 1) {
+          const promises = [
+            facebookApi.getStructureObjects(levelKey, ids[0], {
+              q: keyword,
+              limit: SCOPE_SEARCH_LIMIT,
+              after: null,
+              include_paused: scopeIncludePaused.value,
+              scope_status: scopeStatusFilter.value || undefined,
+              scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+              name_exclude: scopeNameExclude.value || undefined,
+              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+            })
+          ]
+          if (isIdSearch) promises.push(facebookApi.resolveObjectsByIds(keyword).catch(() => []))
+          const results = await Promise.all(promises)
+          if (requestId !== excludeRequestId.value) return
+          let items = results[0]?.items || []
+          if (isIdSearch && results[1]?.length > 0) {
+            const existingIds = new Set(items.map(it => String(it.id)))
+            for (const resolved of results[1]) {
+              if (resolved.missing) continue
+              const id = String(resolved.id || '').trim()
+              if (!id || existingIds.has(id)) continue
+              existingIds.add(id)
+              items = [{ id, name: resolved.name || '', effective_status: resolved.effective_status ?? null, account_id: ids[0] }, ...items]
+            }
+          }
+          excludeScopeItems.value = items
+        } else {
+          const result = await facebookApi.getStructureObjectsMulti(type, ids, {
+            q: keyword,
+            limit: SCOPE_SEARCH_LIMIT,
+            after: null,
+            include_paused: scopeIncludePaused.value,
+            scope_status: scopeStatusFilter.value || undefined,
+            scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
+            name_exclude: scopeNameExclude.value || undefined,
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+          })
+          if (requestId !== excludeRequestId.value) return
+          excludeScopeItems.value = result.items || []
+        }
+      } catch {
+        if (requestId === excludeRequestId.value) excludeScopeItems.value = []
+      } finally {
+        if (requestId === excludeRequestId.value) excludeScopeLoading.value = false
       }
     }
 
@@ -1850,8 +1961,8 @@ export default {
           if (requestId !== scopeRequestId.value) return false
           scopeItems.value = [...scopeItems.value, ...(result.items || [])]
           scopePagingAfter.value = result.paging?.after ?? null
-          // 非后台拉全量时，加载更多后对当前列表重新应用勾选；后台拉全量时在结束时统一应用
-          if (!isApplyingScopeConditions.value) {
+          // 非后台拉全量时，加载更多后对当前列表重新应用勾选；开启动态时不写 targetIds（做法 A）
+          if (!isApplyingScopeConditions.value && !ruleForm.value.useDynamicScope) {
             const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
             if (completed.length > 0) applyScopeConditionsToCurrentList(completed, true)
           }
@@ -1876,7 +1987,8 @@ export default {
     }
 
     const selectAllExcludeScope = () => {
-      ruleForm.value.excludeTargetIds = filteredScopeItems.value.map(item => scopeItemValue(item))
+      const toAdd = filteredExcludeScopeItems.value.map(item => scopeItemValue(item))
+      ruleForm.value.excludeTargetIds = [...new Set([...ruleForm.value.excludeTargetIds, ...toAdd])]
     }
 
     const clearExcludeScopeSelection = () => {
@@ -1906,6 +2018,7 @@ export default {
     watch(selectedAccountIds, (val) => {
       if (!val?.length) {
         scopeItems.value = []
+        excludeScopeItems.value = []
         scopeReady.value = false
         scopePagingAfter.value = null
         if (!isEditing.value) ruleForm.value.targetIds = []
@@ -1913,6 +2026,7 @@ export default {
         return
       }
       scopeItems.value = []
+      excludeScopeItems.value = []
       scopeReady.value = false
       scopePagingAfter.value = null
       if (!isEditing.value) ruleForm.value.targetIds = []
@@ -1942,6 +2056,24 @@ export default {
         scopeReady.value = false
         scopePagingAfter.value = null
         refreshScopeItems()
+      }, 300)
+    })
+
+    // 排除区搜索：防抖后有关键词则请求 q+limit=50，无关键词用 scopeItems
+    let excludeSearchTimer = null
+    watch(excludeScopeSearch, () => {
+      const keyword = String(excludeScopeSearch.value || '').trim()
+      if (!keyword) {
+        excludeScopeItems.value = []
+        if (excludeSearchTimer) clearTimeout(excludeSearchTimer)
+        excludeSearchTimer = null
+        return
+      }
+      if (!selectedAccountIds.value?.length) return
+      if (excludeSearchTimer) clearTimeout(excludeSearchTimer)
+      excludeSearchTimer = setTimeout(() => {
+        excludeSearchTimer = null
+        refreshExcludeScopeItems()
       }, 300)
     })
 
@@ -2195,12 +2327,62 @@ export default {
         const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
         if (scopeAutoApplyTimer) clearTimeout(scopeAutoApplyTimer)
         scopeAutoApplyTimer = null
-        if (completed.length > 0 && selectedAccountIds.value.length > 0) {
+        if (completed.length > 0 && selectedAccountIds.value.length > 0 && !ruleForm.value.useDynamicScope) {
           scopeAutoApplyTimer = setTimeout(() => {
             scopeAutoApplyTimer = null
             applyScopeConditions()
           }, 2000)
         }
+      },
+      { deep: true }
+    )
+
+    /** 开启动态时仅更新 matchedCount 的防抖预览（不写 targetIds，做法 A） */
+    let matchedCountPreviewTimer = null
+    watch(
+      [
+        scopeConditionRows,
+        selectedAccountIds,
+        () => ruleForm.value.targetLevel,
+        () => ruleForm.value.excludeTargetIds,
+        () => ruleForm.value.maxDynamicMatches,
+        () => ruleForm.value.useDynamicScope
+      ],
+      () => {
+        if (ruleForm.value.useDynamicScope !== true) return
+        if (!selectedAccountIds.value?.length) {
+          if (matchedCountPreviewTimer) clearTimeout(matchedCountPreviewTimer)
+          matchedCountPreviewTimer = null
+          return
+        }
+        const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
+        if (completed.length === 0) {
+          ruleForm.value.matchedCount = null
+          if (matchedCountPreviewTimer) clearTimeout(matchedCountPreviewTimer)
+          matchedCountPreviewTimer = null
+          return
+        }
+        if (matchedCountPreviewTimer) clearTimeout(matchedCountPreviewTimer)
+        matchedCountPreviewTimer = setTimeout(async () => {
+          matchedCountPreviewTimer = null
+          try {
+            const scope_filters = buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel)
+            const exclude_ids = buildExcludeIdsForPreview(ruleForm.value.excludeTargetIds, ruleForm.value.targetLevel)
+            const max_dynamic_matches = ruleForm.value.maxDynamicMatches != null && Number.isFinite(Number(ruleForm.value.maxDynamicMatches))
+              ? Number(ruleForm.value.maxDynamicMatches)
+              : undefined
+            const response = await facebookApi.previewDynamicScope({
+              account_ids: selectedAccountIds.value,
+              target_level: ruleForm.value.targetLevel,
+              scope_filters,
+              exclude_ids,
+              max_dynamic_matches
+            })
+            ruleForm.value.matchedCount = response.count != null ? Number(response.count) : null
+          } catch {
+            ruleForm.value.matchedCount = null
+          }
+        }, 3000)
       },
       { deep: true }
     )
@@ -2307,9 +2489,9 @@ export default {
       linesToV2Groups, v2ToLines, v1ToLines,
       createDefaultWhenLine, ensureWhenLinesNonEmpty, getDefaultWhenCustomRange,
       accounts, selectedAccountIds, accountToAdd, accountsFilteredForAdd, accountLabel, onAddAccount, removeAccount, selectAllAccounts, clearAllAccounts,
-      scopeItems, scopeSearch, scopeLoading, scopeReady, filteredScopeItems, scopeItemKey, scopeItemValue, scopeLoadedIdSet,
+      scopeItems, scopeSearch, excludeScopeSearch, scopeLoading, scopeReady, excludeAreaLoading, filteredScopeItems, filteredExcludeScopeItems, scopeItemKey, scopeItemValue, scopeLoadedIdSet,
       accountLoading, accountError, loadAccounts,
-      canSelectAll, selectedTargetPreview,
+      canSelectAll, canSelectAllExclude, selectedTargetPreview,
       scopePagingAfter, loadMoreScopeItems, missingSelectedCount, resolvedSelectedMap,
       isApplyingScopeConditions, invalidIdSet,
       levelOptions, hasBudgetAction,
@@ -2828,6 +3010,11 @@ input:checked + .slider:before { transform: translateX(16px); }
   border-radius: 6px;
   padding: 8px;
   background: #fff;
+}
+.scope-dynamic-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0;
 }
 .scope-actions {
   display: flex;
