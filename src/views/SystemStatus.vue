@@ -94,7 +94,7 @@
       </div>
     </div>
 
-    <!-- 定时任务状态（规则由每分钟 Cron 自动执行；单条规则请在「自动化规则」页使用「运行此规则」） -->
+    <!-- 定时任务（与 server/services/cronService.js 一致；单条规则请在「自动化规则」页使用「运行此规则」） -->
     <div class="card">
       <div class="card-header">
         <h3>定时任务</h3>
@@ -102,8 +102,8 @@
       <div class="card-body">
         <div class="cron-info">
           <div class="cron-item">
-            <div class="cron-name">Today 数据同步</div>
-            <div class="cron-desc">每 10 分钟拉取最新广告数据</div>
+            <div class="cron-name">规则引擎扫描</div>
+            <div class="cron-desc">每分钟调度，对每账户做规则评估与执行；同一规则对同一广告有执行间隔（默认 15 分钟）与执行时间段限制。<br/>联动：依赖「统一心跳」拉取的数据；冷却与心跳周期一致。</div>
             <div class="cron-status">
               <span v-if="cronStatus.is_running" class="running">
                 <span class="pulse"></span> 运行中
@@ -111,42 +111,50 @@
               <span v-else class="idle">空闲</span>
             </div>
           </div>
-          
+
           <div class="cron-item">
-            <div class="cron-name">规则引擎扫描</div>
-            <div class="cron-desc">每分钟检查（冷却期 15 分钟）</div>
+            <div class="cron-name">统一心跳（数据同步 + 归档）</div>
+            <div class="cron-desc">每 15 分钟拉取最新广告数据（Today / 近 3 天等），并按账户时区做冷数据双窗口归档（≥02:00 初步归档，≥12:00 深度对账）。<br/>联动：为规则引擎提供数据；与 Track2/Track1 共用熔断与使用率。</div>
             <div class="cron-status">
               <span class="idle">按计划</span>
             </div>
           </div>
-          
+
           <div class="cron-item">
-            <div class="cron-name">分层回补 - 24h</div>
-            <div class="cron-desc">每 2 小时回补最近 24 小时数据</div>
+            <div class="cron-name">Track2 Fast Sync（可选）</div>
+            <div class="cron-desc">每小时 :07/:27/:52 执行，近 3 天增量结构/数据快速同步；使用率高或熔断时跳过。<br/>联动：与 Track1 结构轮转错峰；与统一心跳共用熔断与 API 使用率。</div>
             <div class="cron-status">
               <span class="idle">按计划</span>
             </div>
           </div>
-          
+
           <div class="cron-item">
-            <div class="cron-name">分层回补 - 3天</div>
-            <div class="cron-desc">每 6 小时回补过去 2-3 天数据</div>
+            <div class="cron-name">账户列表同步</div>
+            <div class="cron-desc">每小时整点从 Facebook API 同步账户列表到 DB。<br/>联动：独立任务，为其它任务提供活跃账户列表。</div>
             <div class="cron-status">
               <span class="idle">按计划</span>
             </div>
           </div>
-          
+
           <div class="cron-item">
-            <div class="cron-name">分层回补 - 7天</div>
-            <div class="cron-desc">每天凌晨 3:00 回补历史数据</div>
+            <div class="cron-name">Track1 结构轮转（近 3 天）</div>
+            <div class="cron-desc">每小时 :12 执行，全量结构轮转，每次最多 6 个账户；账户级 2 分钟冷却，使用率≥85% 时整轮跳过。<br/>联动：与 Track2 错开时间；与统一心跳共用熔断与使用率。</div>
             <div class="cron-status">
               <span class="idle">按计划</span>
             </div>
           </div>
-          
+
           <div class="cron-item">
-            <div class="cron-name">冷数据归档</div>
-            <div class="cron-desc">每天中午 12:00 归档昨日数据（延迟归档策略）</div>
+            <div class="cron-name">热表清理</div>
+            <div class="cron-desc">每日 04:00 删除 ad_snapshots 超过 2 天的快照，控制热表体积。<br/>联动：在历史表清理前执行，减轻后续清理压力。</div>
+            <div class="cron-status">
+              <span class="idle">按计划</span>
+            </div>
+          </div>
+
+          <div class="cron-item">
+            <div class="cron-name">历史表清理</div>
+            <div class="cron-desc">每日 04:30 按保留天数清理 rule_matched_objects_history（30 天）、structure_ads_history / rule_history（60 天）。<br/>联动：在热表清理之后执行，避免与热表清理同时抢锁。</div>
             <div class="cron-status">
               <span class="idle">按计划</span>
             </div>

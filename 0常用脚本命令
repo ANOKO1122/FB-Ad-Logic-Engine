@@ -16,3 +16,27 @@ node server/scripts/cleanup-simulation-only.js --dry-run
 
 # 2）确认无误后，真正删除
 node server/scripts/cleanup-simulation-only.js --confirm
+
+
+在项目根目录执行：
+
+```bash
+node server/scripts/check-all-status.js
+```
+
+运行前请确保：
+
+- 若要看「后端 API + Token」为通过，需先启动后端：`npm run dev:server`
+- 若要看「MySQL + 心跳锁」为通过，需先启动 MySQL 服务
+
+---
+
+## 相关脚本与接口
+
+| 用途 | 命令或接口 |
+|------|------------|
+| 一键检查（本清单 1～4 项） | `node server/scripts/check-all-status.js` |
+| 仅检查心跳锁 | `node server/scripts/check-lock-status.js` |
+| 强制释放心跳锁 | `node server/scripts/force-release-heartbeat-lock.js` |
+| 无需登录的存活检查 | `GET http://localhost:3001/api/health`（端口以 .env 为准） |
+| 需登录的完整系统状态 | `GET http://localhost:3001/api/system/health`（需带登录 cookie） |
