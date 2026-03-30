@@ -26,6 +26,9 @@ import { flushHistoryQueue } from './services/structureSyncService.js'
 
 // 获取端口号（从环境变量或使用默认值）
 const PORT = process.env.PORT || 3001
+// 定时任务总闸：默认开启（未配置时为 true，保证云端默认行为不回归）
+// 仅当显式配置为 false/0/no/off 时才关闭，避免因拼写差异导致误关
+const ENABLE_CRON = !['0', 'false', 'no', 'off'].includes(String(process.env.ENABLE_CRON ?? 'true').trim().toLowerCase())
 
 // 启动服务器（监听所有网卡，允许局域网访问）
 app.listen(PORT, '0.0.0.0', () => {
@@ -41,8 +44,13 @@ app.listen(PORT, '0.0.0.0', () => {
     logger.info('Token前10位: ' + token.substring(0, 10) + '...')
   }
   logger.info('查看控制台/日志以获取详细的API调用信息')
-  // 启动定时任务（每 15 分钟自动执行规则）
-  startCronJob()
+  // 本地防抢跑：当 ENABLE_CRON=false 时跳过定时任务初始化，避免与云端重复动作
+  if (ENABLE_CRON) {
+    logger.info('cron enabled / init cron scheduler')
+    startCronJob()
+  } else {
+    logger.warn('cron disabled / skip cron init (ENABLE_CRON=false)')
+  }
 })
 
 // ============================================
