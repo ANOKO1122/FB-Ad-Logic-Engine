@@ -4,6 +4,7 @@ import { authFetch } from '../utils/authFetch.js'
 const Login = () => import('../views/Login.vue')
 const Register = () => import('../views/Register.vue')
 const Pending = () => import('../views/Pending.vue')
+const Bind = () => import('../views/Bind.vue')
 const Dashboard = () => import('../views/Dashboard.vue')
 const RuleManager = () => import('../views/RuleManager.vue')
 const Logs = () => import('../views/Logs.vue')
@@ -19,6 +20,7 @@ const router = createRouter({
   routes: [
     { path: '/login', component: Login, meta: { requiresAuth: false } },
     { path: '/register', component: Register, meta: { requiresAuth: false } },
+    { path: '/bind', component: Bind, meta: { requiresAuth: false } },
     { path: '/pending', component: Pending, meta: { requiresAuth: true, allowPending: true } },
 
     {
