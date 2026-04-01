@@ -4,7 +4,29 @@
       <h1>注册账号</h1>
       <p class="subtitle">注册后需管理员审核</p>
 
-      <form @submit.prevent="handleRegister" class="auth-form">
+      <div v-if="loadingAuthOptions" class="gate-card">
+        <div class="gate-title">正在检查注册入口...</div>
+        <div class="gate-desc">请稍候，系统正在确认是否需要先走钉钉门禁。</div>
+      </div>
+
+      <div v-else-if="dingtalkGateEnabled" class="gate-card">
+        <div v-if="dingtalkEnabled">
+          <div class="gate-title">注册入口已关闭，正在跳转到钉钉验证...</div>
+          <div class="gate-desc">
+            本系统不再开放公开注册页。请先通过钉钉扫码验证身份，未绑定用户将在扫码后进入“绑定/注册并绑定”流程。
+          </div>
+          <a class="btn btn-primary" href="/api/auth/dingtalk/login">继续前往钉钉扫码登录</a>
+        </div>
+        <div v-else>
+          <div class="gate-title">门禁模式已开启，但钉钉入口未开放</div>
+          <div class="gate-desc">
+            当前公开注册入口已关闭，但钉钉登录开关未开启。请联系管理员检查
+            `ENABLE_DINGTALK_AUTH` 配置。
+          </div>
+        </div>
+      </div>
+
+      <form v-else @submit.prevent="handleRegister" class="auth-form">
         <div class="form-group">
           <label>用户名</label>
           <input v-model="username" type="text" required placeholder="2-50 个字符" />
@@ -36,7 +58,7 @@
         </button>
       </form>
 
-      <div class="auth-footer">
+      <div v-if="!loadingAuthOptions && !dingtalkGateEnabled" class="auth-footer">
         <router-link to="/login">已有账号？立即登录</router-link>
       </div>
     </div>
@@ -59,6 +81,9 @@ export default {
     const error = ref('')
     const success = ref('')
     const loading = ref(false)
+    const dingtalkEnabled = ref(false)
+    const dingtalkGateEnabled = ref(false)
+    const loadingAuthOptions = ref(true)
 
     const loadOwners = async () => {
       try {
@@ -68,9 +93,27 @@ export default {
       } catch {}
     }
 
+    const loadAuthOptions = async () => {
+      try {
+        const resp = await fetch('/api/auth/options', { credentials: 'include' })
+        const data = await resp.json().catch(() => ({}))
+        dingtalkEnabled.value = !!data?.dingtalkEnabled
+        dingtalkGateEnabled.value = !!data?.dingtalkGateEnabled
+      } catch {
+        dingtalkEnabled.value = false
+        dingtalkGateEnabled.value = false
+      } finally {
+        loadingAuthOptions.value = false
+      }
+    }
+
     const handleRegister = async () => {
       error.value = ''
       success.value = ''
+      if (dingtalkGateEnabled.value) {
+        error.value = '注册入口已关闭，请先通过钉钉扫码验证'
+        return
+      }
       if (password.value !== confirmPassword.value) {
         error.value = '两次密码不一致'
         return
@@ -100,8 +143,29 @@ export default {
       }
     }
 
-    onMounted(loadOwners)
-    return { username, password, confirmPassword, ownerId, owners, error, success, loading, handleRegister }
+    onMounted(async () => {
+      await loadAuthOptions()
+      if (dingtalkGateEnabled.value && dingtalkEnabled.value) {
+        window.location.replace('/api/auth/dingtalk/login')
+        return
+      }
+      if (!dingtalkGateEnabled.value) await loadOwners()
+    })
+
+    return {
+      username,
+      password,
+      confirmPassword,
+      ownerId,
+      owners,
+      error,
+      success,
+      loading,
+      handleRegister,
+      dingtalkEnabled,
+      dingtalkGateEnabled,
+      loadingAuthOptions,
+    }
   }
 }
 </script>
@@ -111,6 +175,10 @@ export default {
 .auth-card { background: #fff; border-radius: 12px; padding: 40px; width: 100%; max-width: 420px; box-shadow: 0 10px 40px rgba(0,0,0,.2); }
 h1 { margin: 0 0 8px; color: #1877f2; text-align: center; }
 .subtitle { color: #666; text-align: center; margin-bottom: 24px; }
+.gate-card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px; background: #f9fafb; margin-bottom: 16px; }
+.gate-title { font-weight: 700; color: #111827; margin-bottom: 6px; }
+.gate-desc { font-size: 13px; color: #374151; line-height: 1.6; margin-bottom: 10px; }
+.alt-hint { font-size: 13px; color: #6b7280; text-align: center; margin-top: 8px; }
 .auth-form { display: flex; flex-direction: column; gap: 16px; }
 .form-group { display: flex; flex-direction: column; gap: 8px; }
 input,select { padding: 12px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; }
@@ -119,6 +187,7 @@ input,select { padding: 12px 14px; border: 1px solid #ddd; border-radius: 8px; f
 .btn { padding: 12px 16px; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; }
 .btn-primary { background: #1877f2; color: #fff; }
 .btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+.btn.disabled { opacity: 0.6; cursor: not-allowed; pointer-events: none; }
 .auth-footer { margin-top: 16px; text-align: center; }
 </style>
 

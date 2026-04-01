@@ -39,6 +39,44 @@ function parseBooleanEnv(value) {
   return null
 }
 
+function isDingTalkAuthEnabled() {
+  /**
+   * 钉钉登录功能总开关（用于“先开发、暂不上线”）
+   * - 默认关闭：避免云端半成品被误用
+   * - 只有显式设置 ENABLE_DINGTALK_AUTH=true 才开启
+   */
+  const explicit = parseBooleanEnv(process.env.ENABLE_DINGTALK_AUTH)
+  if (explicit !== null) return explicit
+  return false
+}
+
+function isDingTalkGateEnabled() {
+  /**
+   * 钉钉“前置门禁模式”开关（最终形态）
+   * - 开启后：公开入口不再提供“用户名密码登录/公开注册”，必须先钉钉扫码
+   * - 默认关闭：保持当前过渡态（便于逐步上线）
+   */
+  const explicit = parseBooleanEnv(process.env.ENABLE_DINGTALK_GATE)
+  if (explicit !== null) return explicit
+  return false
+}
+
+function requireDingTalkAuthEnabled(req, res, next) {
+  if (isDingTalkAuthEnabled()) return next()
+  return res.status(404).json({
+    error: '钉钉登录功能未开启',
+    code: 'DINGTALK_AUTH_DISABLED',
+  })
+}
+
+function rejectWhenGateEnabled(req, res, code) {
+  if (!isDingTalkGateEnabled()) return false
+  return res.status(404).json({
+    error: '请先通过钉钉扫码登录',
+    code,
+  })
+}
+
 function shouldUseSecureCookie() {
   // 联调兜底：允许通过环境变量显式关闭 secure，便于 HTTP 场景验证。
   // 长期生产建议保持 true（尤其是切到 HTTPS 后）。
@@ -101,7 +139,17 @@ function readPendingBindFromRequest(req) {
   return { payload }
 }
 
+router.get('/auth/options', (req, res) => {
+  // 给前端提供“运行时开关”，避免为显示/隐藏入口反复重建前端。
+  return res.json({
+    success: true,
+    dingtalkEnabled: isDingTalkAuthEnabled(),
+    dingtalkGateEnabled: isDingTalkGateEnabled(),
+  })
+})
+
 router.post('/auth/register', async (req, res) => {
+  if (rejectWhenGateEnabled(req, res, 'REGISTER_DISABLED_BY_DINGTALK_GATE')) return
   try {
     const { username, password, owner_id } = req.body
     if (!username || !password || !owner_id) {
@@ -148,6 +196,7 @@ router.post('/auth/register', async (req, res) => {
 })
 
 router.post('/auth/login', async (req, res) => {
+  if (rejectWhenGateEnabled(req, res, 'PASSWORD_LOGIN_DISABLED_BY_DINGTALK_GATE')) return
   try {
     const { username, password } = req.body
     if (!username || !password) {
@@ -201,7 +250,7 @@ router.post('/auth/login', async (req, res) => {
   }
 })
 
-router.get('/auth/dingtalk/login', async (req, res) => {
+router.get('/auth/dingtalk/login', requireDingTalkAuthEnabled, async (req, res) => {
   try {
     // 每次发起授权都生成新的 state，避免重放攻击。
     const state = generateOAuthState()
@@ -214,7 +263,7 @@ router.get('/auth/dingtalk/login', async (req, res) => {
   }
 })
 
-router.get('/auth/dingtalk/callback', async (req, res) => {
+router.get('/auth/dingtalk/callback', requireDingTalkAuthEnabled, async (req, res) => {
   const clientMeta = getRequestClientMeta(req)
 
   try {
@@ -409,7 +458,7 @@ router.get('/auth/dingtalk/callback', async (req, res) => {
   }
 })
 
-router.get('/auth/dingtalk/pending-bind', async (req, res) => {
+router.get('/auth/dingtalk/pending-bind', requireDingTalkAuthEnabled, async (req, res) => {
   // 读取待绑定态：前端绑定页用它展示 identity，并驱动后续“绑定旧账号/首次注册并绑定”接口
   const token = req.cookies?.[DINGTALK_PENDING_BIND_COOKIE_KEY]
   if (!token) {
@@ -437,7 +486,7 @@ router.get('/auth/dingtalk/pending-bind', async (req, res) => {
   })
 })
 
-router.post('/auth/dingtalk/bind-existing', async (req, res) => {
+router.post('/auth/dingtalk/bind-existing', requireDingTalkAuthEnabled, async (req, res) => {
   const clientMeta = getRequestClientMeta(req)
   const pending = readPendingBindFromRequest(req)
   if (pending.error === 'missing') {
@@ -602,7 +651,7 @@ router.post('/auth/dingtalk/bind-existing', async (req, res) => {
   }
 })
 
-router.post('/auth/dingtalk/register-and-bind', async (req, res) => {
+router.post('/auth/dingtalk/register-and-bind', requireDingTalkAuthEnabled, async (req, res) => {
   const clientMeta = getRequestClientMeta(req)
   const pending = readPendingBindFromRequest(req)
   if (pending.error === 'missing') {

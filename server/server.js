@@ -2,6 +2,7 @@
 // 注意：dotenv.config() 必须在第一行，确保环境变量在应用加载前就配置好
 import dotenv from 'dotenv'
 dotenv.config()
+dotenv.config({ path: '.env.auth' })
 
 // 配置全局代理环境变量（分别回填 lowercase，不覆盖已有值，不强制合并 HTTP/HTTPS）
 if (process.env.HTTP_PROXY && !process.env.http_proxy) {
