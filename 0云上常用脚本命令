@@ -1,0 +1,13 @@
+1) 重启 FB 后端服务
+sudo systemctl restart fb-ad-logic-engine.service
+2) 立刻看服务状态
+sudo systemctl status fb-ad-logic-engine.service --no-pager -l
+预期：
+Active: active (running)
+没有连续报错重启
+3) 看最近日志（确认启动后无异常）
+sudo journalctl -u fb-ad-logic-engine.service -n 120 --no-pager
+重点看：
+是否有 缺少必需环境变量: DINGTALK_APP_SECRET 之类错误
+是否有 listen 端口错误（正常不该有）
+是否有你新增登录路由触发日志（后面请求时会出现）
