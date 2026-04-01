@@ -7,3 +7,5 @@ logs/
 .vscode/
 .idea/
 
+.env.auth
+
