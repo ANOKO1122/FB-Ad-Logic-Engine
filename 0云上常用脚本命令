@@ -11,3 +11,12 @@ sudo journalctl -u fb-ad-logic-engine.service -n 120 --no-pager
 是否有 缺少必需环境变量: DINGTALK_APP_SECRET 之类错误
 是否有 listen 端口错误（正常不该有）
 是否有你新增登录路由触发日志（后面请求时会出现）
+
+
+cd /root/work/FB-Ad-Logic-Engine
+node server/scripts/upsert-account-mapping.js
+
+用来新增FB系统的广告账户，需要提供FB的广告账户ID，然后根据FB的广告账户ID，新增到数据库中。无负责人可以添加。
+
+ mysql -h 127.0.0.1 -P 3306 -u root -p fb_ad_brain
+这是进入云端数据库的命令
