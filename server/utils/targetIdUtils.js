@@ -9,10 +9,14 @@
  * @returns {string} act_123 形式
  */
 function normalizeAccountId(accountId) {
-  const s = String(accountId ?? '').trim()
-  if (!s) return s
-  const cleaned = s.replace(/^act_+/i, '')
-  return cleaned ? `act_${cleaned}` : s
+  const raw = String(accountId ?? '').trim()
+  if (!raw) return raw
+  // 反复剥掉前缀 act_，避免 act_act_xxx 归一化后仍带双层前缀（旧实现只剥一次会卡在 act_act_999）
+  let core = raw
+  while (/^act_/i.test(core)) {
+    core = core.replace(/^act_/i, '')
+  }
+  return core ? `act_${core}` : raw
 }
 
 /**
