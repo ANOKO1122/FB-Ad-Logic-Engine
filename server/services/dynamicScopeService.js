@@ -39,25 +39,47 @@ function normalizeCompositeId(accountId, objId) {
   return `${cleanAccountId}:${String(objId || '').trim()}`
 }
 
+/**
+ * 规则在「动态范围刷新」路径上的适用账户全集（去重、归一化后排序）。
+ * Applicable accounts for dynamic scope refresh: union of three sources, deduped, normalized.
+ *
+ * 来源并集：(1) target_by_account 中数组长度 > 0 的 key；(2) target_account_ids；(3) rules.account_id。
+ * fetch / refresh / schedule 均依赖此集合；不得在有 target_by_account 时丢弃 target_account_ids。
+ */
 function getRuleTargetAccountIds(rule) {
+  const ids = new Set()
+
+  /** @param {unknown} raw trim 后经 normalizeAccountId 写入集合 */
+  const addAccount = (raw) => {
+    const n = normalizeAccountId(String(raw ?? '').trim())
+    if (n) ids.add(n)
+  }
+
+  // (1) 按户配置过非空手动物体列表的账户
   const targetByAccountRaw = rule?.targetByAccount ?? rule?.target_by_account
   const targetByAccount = parseJsonSafe(targetByAccountRaw, null)
   if (targetByAccount && typeof targetByAccount === 'object' && !Array.isArray(targetByAccount)) {
-    const accounts = Object.keys(targetByAccount).filter((accountId) => {
+    for (const accountId of Object.keys(targetByAccount)) {
       const arr = targetByAccount[accountId]
-      return Array.isArray(arr) && arr.length > 0
-    })
-    if (accounts.length > 0) return accounts
+      if (Array.isArray(arr) && arr.length > 0) {
+        addAccount(accountId)
+      }
+    }
   }
 
+  // (2) 多账户名单
   const targetAccountIdsRaw = rule?.targetAccountIds ?? rule?.target_account_ids
   const targetAccountIds = parseJsonSafe(targetAccountIdsRaw, targetAccountIdsRaw)
-  if (Array.isArray(targetAccountIds) && targetAccountIds.length > 0) {
-    return targetAccountIds.map((id) => String(id || '').trim()).filter(Boolean)
+  if (Array.isArray(targetAccountIds)) {
+    for (const id of targetAccountIds) {
+      addAccount(id)
+    }
   }
 
-  const accountId = String(rule?.accountId ?? rule?.account_id ?? '').trim()
-  return accountId ? [accountId] : []
+  // (3) 主归属账户
+  addAccount(rule?.accountId ?? rule?.account_id)
+
+  return Array.from(ids).sort((a, b) => a.localeCompare(b))
 }
 
 function getScopedTargetIdsForAccount(rule, accountId) {
