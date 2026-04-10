@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { getStoredToken } from '../utils/authFetch.js'
 
+// 默认 /api 走 Vite 代理到本机后端；勿在 .env.local 中把 VITE_API_URL 指到线上，否则会串云
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
 const apiClient = axios.create({
