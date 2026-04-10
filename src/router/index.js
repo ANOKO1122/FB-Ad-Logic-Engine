@@ -11,6 +11,7 @@ const Logs = () => import('../views/Logs.vue')
 const SystemStatus = () => import('../views/SystemStatus.vue')
 const AdminReview = () => import('../views/AdminReview.vue')
 const AdminAccountMapping = () => import('../views/AdminAccountMapping.vue')
+const AdminOwners = () => import('../views/AdminOwners.vue')
 const AdminTemplates = () => import('../views/AdminTemplates.vue')
 
 const MainLayout = () => import('../layouts/MainLayout.vue')
@@ -34,6 +35,7 @@ const router = createRouter({
         { path: 'logs', component: Logs },
         { path: 'system', component: SystemStatus, meta: { requiresAdmin: true } },
         { path: 'admin/review', component: AdminReview, meta: { requiresAdmin: true } },
+        { path: 'admin/owners', component: AdminOwners, meta: { requiresAdmin: true } },
         { path: 'admin/account-mapping', component: AdminAccountMapping, meta: { requiresAdmin: true } },
         { path: 'admin/templates', component: AdminTemplates, meta: { requiresAdmin: true } }
       ]

@@ -28,6 +28,10 @@
             <span class="text">系统状态</span>
           </router-link>
 
+          <router-link to="/admin/owners" class="nav-item" active-class="active">
+            <span class="text">负责人管理</span>
+          </router-link>
+
           <router-link to="/admin/account-mapping" class="nav-item" active-class="active">
             <span class="text">账户设置</span>
           </router-link>
