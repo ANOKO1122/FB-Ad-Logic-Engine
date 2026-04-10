@@ -2,7 +2,7 @@
 import { Router } from 'express'
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
-import { requireAuth, requireActive } from '../middleware/authJwt.js'
+import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJwt.js'
 import { getCronStatus, manualSyncAccounts } from '../services/cronService.js'
 import { getCircuitBreakerStatus } from '../services/rateLimitService.js'
 
@@ -38,7 +38,7 @@ router.get('/automation-logs/stats/summary', requireAuth, requireActive, async (
     // 权限过滤
     let whereClause = ''
     const params = []
-    if (userRole !== 'admin') {
+    if (!isAdminLikeRole(userRole)) {
       // ✅ 先查询用户的 owner_id
       const [userRows] = await pool.execute(
         'SELECT owner_id FROM users WHERE id = ?',
@@ -129,7 +129,7 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     
     // ✅ 只有 admin 用户才能通过参数查看全部状态，非 admin 强制只看 success
     // ✅ 修复大小写问题：使用 toLowerCase() 处理参数
-    const includeAllStatus = String(include_all_status || '').toLowerCase() === 'true' && userRole === 'admin'
+    const includeAllStatus = String(include_all_status || '').toLowerCase() === 'true' && isAdminLikeRole(userRole)
     
     // 构建查询条件
     let whereClause = 'WHERE 1=1'
@@ -137,7 +137,7 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     
     // 非管理员只能看到自己负责的账户的日志
     // 需要先查询用户对应的 owner_id
-    if (userRole !== 'admin') {
+    if (!isAdminLikeRole(userRole)) {
       // 查询用户的 owner_id
       const [userRows] = await pool.execute(
         'SELECT owner_id FROM users WHERE id = ?',
@@ -281,7 +281,7 @@ router.get('/automation-logs/:id', requireAuth, requireActive, async (req, res) 
     const params = [logId]
     
     // 非管理员只能看到自己的日志
-    if (userRole !== 'admin') {
+    if (!isAdminLikeRole(userRole)) {
       // ✅ 先查询用户的 owner_id
       const [userRows] = await pool.execute(
         'SELECT owner_id FROM users WHERE id = ?',
@@ -336,7 +336,7 @@ router.get('/system/health', requireAuth, requireActive, async (req, res) => {
     const cronStatus = getCronStatus()
     const breaker = getCircuitBreakerStatus()
     
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const ownerId = req.user?.owner_id ?? null
     // 非 admin 只查自己负责人下的账户
     const accountSql = isAdmin
@@ -457,7 +457,7 @@ router.get('/system/health', requireAuth, requireActive, async (req, res) => {
 router.post('/system/sync-accounts', requireAuth, requireActive, async (req, res) => {
   try {
     // 权限检查：仅管理员可触发
-    if (req.user.role !== 'admin') {
+    if (!isAdminLikeRole(req.user.role)) {
       return res.status(403).json({ 
         success: false, 
         error: '仅管理员可触发账户同步' 
@@ -496,7 +496,7 @@ router.post('/system/sync-accounts', requireAuth, requireActive, async (req, res
 router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, res) => {
   try {
     // 权限检查：仅管理员可查看
-    if (req.user.role !== 'admin') {
+    if (!isAdminLikeRole(req.user.role)) {
       return res.status(403).json({ 
         success: false, 
         error: '仅管理员可查看规则执行摘要' 
@@ -648,7 +648,7 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
 router.get('/rule-execution-summaries/stats', requireAuth, requireActive, async (req, res) => {
   try {
     // 权限检查：仅管理员可查看
-    if (req.user.role !== 'admin') {
+    if (!isAdminLikeRole(req.user.role)) {
       return res.status(403).json({ 
         success: false, 
         error: '仅管理员可查看规则执行摘要统计' 

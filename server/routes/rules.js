@@ -2,7 +2,7 @@
 // 注意：这是新功能，使用 Drizzle；旧功能（用户管理）继续使用原生 SQL
 import { Router } from 'express'
 import logger from '../utils/logger.js'
-import { requireAuth, requireActive } from '../middleware/authJwt.js'
+import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJwt.js'
 import * as rulesService from '../services/rulesService.js'
 import { getCronStatus, executeSingleRule } from '../services/cronService.js'
 import { assertAccountAccess } from '../utils/accountAccess.js'
@@ -140,7 +140,7 @@ router.get('/templates', requireAuth, requireActive, async (req, res) => {
 router.get('/rules', requireAuth, requireActive, async (req, res) => {
   try {
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
 
     // 解析 ownerIds：仅管理员使用；空数组/未传表示不按负责人过滤
     let ownerIds = undefined
@@ -263,7 +263,7 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID' })
@@ -337,7 +337,7 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
 router.post('/rules', requireAuth, requireActive, async (req, res) => {
   try {
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const ownerId = req.user.owner_id
     
     const { 
@@ -531,7 +531,7 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const ownerId = req.user.owner_id
     const body = req.body || {}
     
@@ -729,7 +729,7 @@ router.post('/rules/dynamic-scope/refresh-account', requireAuth, requireActive, 
     }
 
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const accountIdFromBody = req.body?.accountId != null ? String(req.body.accountId).trim() : ''
     const ruleIdFromBody = req.body?.ruleId != null ? parseInt(req.body.ruleId, 10) : null
 
@@ -774,7 +774,7 @@ router.delete('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID' })
@@ -805,7 +805,7 @@ router.patch('/rules/:id/toggle', requireAuth, requireActive, async (req, res) =
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const { enabled } = req.body
     
     if (isNaN(ruleId)) {
@@ -842,7 +842,7 @@ router.post('/rules/:id/execute', requireAuth, requireActive, async (req, res) =
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID', code: 'INVALID_ID' })
     }

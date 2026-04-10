@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
-import { requireAuth, requireActive, requireAdmin } from '../middleware/authJwt.js'
+import { requireAuth, requireActive, requireAdmin, requireSuperAdmin } from '../middleware/authJwt.js'
 import { getCronStatus } from '../services/cronService.js'
 import { validateTemplateBody } from '../utils/templateValidator.js'
 
@@ -49,25 +49,111 @@ router.get('/pending-count', async (req, res) => {
   }
 })
 
+// 列表不展示 super_admin；含普通用户创建规则数（运营指标）
 router.get('/users', async (req, res) => {
   try {
     const { status } = req.query
     let sql = `
       SELECT u.id, u.username, u.role, u.status, u.owner_id, u.created_at,
-             o.owner_name
+             o.owner_name,
+             (SELECT COUNT(*) FROM rules r WHERE r.user_id = u.id) AS rules_count
       FROM users u
       LEFT JOIN owners o ON u.owner_id = o.id
+      WHERE u.role IN ('admin', 'staff')
     `
     const params = []
     if (status) {
-      sql += ' WHERE u.status = ?'
+      sql += ' AND u.status = ?'
       params.push(status)
     }
     sql += ' ORDER BY u.created_at DESC'
     const [rows] = await pool.execute(sql, params)
     res.json({ success: true, users: rows })
   } catch (err) {
+    logger.error('获取用户列表失败:', err)
     res.status(500).json({ error: '获取失败', code: 'ERROR' })
+  }
+})
+
+// PATCH /api/admin/users/:id/owner — 仅可改普通用户(staff)的负责人；admin 与 super_admin 均可
+router.patch('/users/:id/owner', async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10)
+    const { owner_id } = req.body || {}
+    if (!Number.isFinite(userId) || userId < 1) {
+      return res.status(400).json({ error: '无效的用户 ID', code: 'INVALID_ID' })
+    }
+    if (owner_id === undefined || owner_id === null) {
+      return res.status(400).json({ error: '请提供 owner_id', code: 'MISSING_PARAMS' })
+    }
+    const oid = parseInt(owner_id, 10)
+    if (!Number.isFinite(oid) || oid < 1) {
+      return res.status(400).json({ error: '无效的 owner_id', code: 'INVALID_OWNER' })
+    }
+
+    const [targets] = await pool.execute('SELECT id, username, role FROM users WHERE id = ?', [userId])
+    if (targets.length === 0) return res.status(404).json({ error: '用户不存在', code: 'NOT_FOUND' })
+    if (targets[0].role !== 'staff') {
+      return res.status(400).json({ error: '仅可为普通用户变更负责人', code: 'OWNER_ONLY_FOR_STAFF' })
+    }
+
+    const [owners] = await pool.execute('SELECT id FROM owners WHERE id = ?', [oid])
+    if (owners.length === 0) return res.status(400).json({ error: '负责人不存在', code: 'OWNER_NOT_FOUND' })
+
+    await pool.execute('UPDATE users SET owner_id = ? WHERE id = ?', [oid, userId])
+    res.json({ success: true, message: '负责人已更新' })
+  } catch (err) {
+    logger.error('更新用户负责人失败:', err)
+    res.status(500).json({ error: '操作失败', code: 'ERROR' })
+  }
+})
+
+// PATCH /api/admin/users/:id/role — 仅 super_admin；staff↔admin，禁止接口设为 super_admin、禁止降级最后一个 super
+router.patch('/users/:id/role', requireSuperAdmin, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10)
+    const { role: nextRole } = req.body || {}
+    if (!Number.isFinite(userId) || userId < 1) {
+      return res.status(400).json({ error: '无效的用户 ID', code: 'INVALID_ID' })
+    }
+    if (nextRole !== 'admin' && nextRole !== 'staff') {
+      return res.status(400).json({ error: 'role 仅允许 admin 或 staff', code: 'INVALID_ROLE' })
+    }
+
+    const [targets] = await pool.execute('SELECT id, username, role FROM users WHERE id = ?', [userId])
+    if (targets.length === 0) return res.status(404).json({ error: '用户不存在', code: 'NOT_FOUND' })
+    const t = targets[0]
+
+    if (t.role === 'super_admin') {
+      if (nextRole === 'super_admin') return res.status(400).json({ error: '不可通过接口修改超管角色', code: 'FORBIDDEN' })
+      const [cntRows] = await pool.execute(
+        `SELECT COUNT(*) AS cnt FROM users WHERE role = 'super_admin' AND status = 'active'`
+      )
+      const cnt = Number(cntRows[0]?.cnt ?? 0)
+      if (cnt <= 1) {
+        return res.status(400).json({ error: '不可降级最后一个超级管理员', code: 'LAST_SUPER_ADMIN' })
+      }
+      await pool.execute('UPDATE users SET role = ? WHERE id = ?', [nextRole, userId])
+      return res.json({ success: true, message: `已更新用户 ${t.username} 角色为 ${nextRole}` })
+    }
+
+    if (t.role === 'staff' && nextRole === 'admin') {
+      await pool.execute('UPDATE users SET role = ? WHERE id = ?', ['admin', userId])
+      return res.json({ success: true, message: `已将 ${t.username} 设为管理员` })
+    }
+    if (t.role === 'admin' && nextRole === 'staff') {
+      await pool.execute('UPDATE users SET role = ? WHERE id = ?', ['staff', userId])
+      return res.json({ success: true, message: `已将 ${t.username} 降为普通用户` })
+    }
+
+    if (t.role === nextRole) {
+      return res.json({ success: true, message: '角色未变化' })
+    }
+
+    return res.status(400).json({ error: '当前角色不允许该变更', code: 'INVALID_TRANSITION' })
+  } catch (err) {
+    logger.error('更新用户角色失败:', err)
+    res.status(500).json({ error: '操作失败', code: 'ERROR' })
   }
 })
 

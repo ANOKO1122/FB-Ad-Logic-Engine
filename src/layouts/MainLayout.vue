@@ -23,9 +23,13 @@
         <div class="divider"></div>
 
         <!-- 仅管理员可见 -->
-        <template v-if="user && user.role === 'admin'">
+        <template v-if="user && (user.role === 'admin' || user.role === 'super_admin')">
           <router-link to="/system" class="nav-item" active-class="active">
             <span class="text">系统状态</span>
+          </router-link>
+
+          <router-link to="/admin/users" class="nav-item" active-class="active">
+            <span class="text">用户管理</span>
           </router-link>
 
           <router-link to="/admin/owners" class="nav-item" active-class="active">
@@ -53,7 +57,7 @@
           <div class="avatar">{{ user.username.charAt(0).toUpperCase() }}</div>
           <div class="user-info">
             <div class="name" :title="user.username">{{ user.username }}</div>
-            <div class="role">{{ user.role === 'admin' ? '管理员' : '员工' }}</div>
+            <div class="role">{{ roleLabel(user.role) }}</div>
           </div>
         </div>
         
@@ -91,7 +95,7 @@ export default {
           const data = await res.json()
           user.value = data.user
           // 如果是管理员，获取待审核人数
-          if (user.value.role === 'admin') {
+          if (user.value.role === 'admin' || user.value.role === 'super_admin') {
             fetchPendingCount()
           }
         } else {
@@ -127,13 +131,20 @@ export default {
       }
     }
 
+    const roleLabel = (role) => {
+      if (role === 'super_admin') return '超级管理员'
+      if (role === 'admin') return '管理员'
+      return '员工'
+    }
+
     onMounted(fetchUser)
 
     return {
       user,
       pendingCount,
       handleLogout,
-      fetchPendingCount
+      fetchPendingCount,
+      roleLabel
     }
   }
 }

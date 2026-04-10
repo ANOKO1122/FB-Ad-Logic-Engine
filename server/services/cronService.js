@@ -7,6 +7,7 @@ import { db } from '../db/drizzle.js'
 import { rules, automationLogs } from '../db/schema.js'
 import { eq } from 'drizzle-orm'
 import pool from '../db/connection.js'
+import { isAdminLikeRole } from '../middleware/authJwt.js'
 import { RuleEngine, FacebookMarketingAPI } from '../index.js'
 import { 
   syncAllAccountsTodayStats,
@@ -641,7 +642,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
       const user = userRows[0]
       let hasAccess = false
-      if (user.role === 'admin') {
+      if (isAdminLikeRole(user.role)) {
         hasAccess = true
       } else {
         const [accRows] = await pool.execute(
