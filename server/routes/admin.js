@@ -9,6 +9,15 @@ const router = Router()
 
 router.use(requireAuth, requireActive, requireAdmin)
 
+/** Plan：「无」负责人固定为 owner_key = 'none'；删除业务负责人前将引用归到此 id */
+async function selectNoneOwnerIdForUpdate(connection) {
+  const [rows] = await connection.execute(
+    'SELECT id FROM owners WHERE owner_key = ? LIMIT 1 FOR UPDATE',
+    ['none']
+  )
+  return rows.length ? rows[0].id : null
+}
+
 // ===========================
 // Cron 管理端点（管理员专用）
 // ===========================
@@ -88,11 +97,19 @@ router.post('/users/:id/reject', async (req, res) => {
   }
 })
 
+// GET /api/admin/owners — 含影响量：有效广告账户数（is_active=1）、系统用户数
 router.get('/owners', async (req, res) => {
   try {
-    const [rows] = await pool.execute(`SELECT id, owner_key, owner_name, is_active FROM owners ORDER BY id`)
+    const [rows] = await pool.execute(`
+      SELECT o.id, o.owner_key, o.owner_name, o.is_active,
+        (SELECT COUNT(*) FROM account_mappings am WHERE am.owner_id = o.id AND am.is_active = 1) AS ad_account_count,
+        (SELECT COUNT(*) FROM users u WHERE u.owner_id = o.id) AS system_user_count
+      FROM owners o
+      ORDER BY o.id
+    `)
     res.json({ success: true, owners: rows })
   } catch (err) {
+    logger.error('获取负责人列表失败:', err)
     res.status(500).json({ error: '获取失败', code: 'ERROR' })
   }
 })
@@ -119,16 +136,123 @@ router.post('/owners', async (req, res) => {
       return res.status(400).json({ error: '负责人已存在', code: 'DUPLICATE' })
     }
     
-    // 插入新负责人
-    await pool.execute(
+    const [insertResult] = await pool.execute(
       'INSERT INTO owners (owner_name, owner_key, is_active) VALUES (?, ?, 1)',
       [owner_name.trim(), finalOwnerKey]
     )
-    
-    res.json({ success: true, message: `负责人 "${owner_name.trim()}" 创建成功` })
+    const newId = insertResult.insertId
+    res.json({
+      success: true,
+      message: `负责人 "${owner_name.trim()}" 创建成功`,
+      id: newId,
+      owner: { id: newId, owner_name: owner_name.trim(), owner_key: finalOwnerKey, is_active: 1 }
+    })
   } catch (err) {
     logger.error('创建负责人失败:', err)
     res.status(500).json({ error: '创建失败', code: 'ERROR', details: err?.message })
+  }
+})
+
+// GET /api/admin/owners/:id/impact — 删除前影响量（与列表计数口径一致）
+router.get('/owners/:id/impact', async (req, res) => {
+  const ownerId = parseInt(req.params.id, 10)
+  if (!Number.isFinite(ownerId) || ownerId < 1) {
+    return res.status(400).json({ error: '无效的负责人 ID', code: 'INVALID_ID' })
+  }
+  try {
+    const [owners] = await pool.execute(
+      'SELECT id, owner_key, owner_name, is_active FROM owners WHERE id = ?',
+      [ownerId]
+    )
+    if (owners.length === 0) {
+      return res.status(404).json({ error: '负责人不存在', code: 'NOT_FOUND' })
+    }
+    const [cntRows] = await pool.execute(
+      `SELECT
+        (SELECT COUNT(*) FROM account_mappings am WHERE am.owner_id = ? AND am.is_active = 1) AS ad_account_count,
+        (SELECT COUNT(*) FROM users u WHERE u.owner_id = ?) AS system_user_count`,
+      [ownerId, ownerId]
+    )
+    const row = cntRows[0]
+    res.json({
+      success: true,
+      owner: owners[0],
+      ad_account_count: Number(row.ad_account_count),
+      system_user_count: Number(row.system_user_count)
+    })
+  } catch (err) {
+    logger.error('获取负责人影响量失败:', err)
+    res.status(500).json({ error: '获取失败', code: 'ERROR' })
+  }
+})
+
+// DELETE /api/admin/owners/:id — 二次确认：body.confirm === true；删后 account_mappings / users 归「无」
+router.delete('/owners/:id', async (req, res) => {
+  const ownerId = parseInt(req.params.id, 10)
+  if (!Number.isFinite(ownerId) || ownerId < 1) {
+    return res.status(400).json({ error: '无效的负责人 ID', code: 'INVALID_ID' })
+  }
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: '请确认删除（请求体需包含 confirm: true）', code: 'CONFIRM_REQUIRED' })
+  }
+
+  let connection
+  try {
+    const [targetRows] = await pool.execute(
+      'SELECT id, owner_key, owner_name FROM owners WHERE id = ?',
+      [ownerId]
+    )
+    if (targetRows.length === 0) {
+      return res.status(404).json({ error: '负责人不存在', code: 'NOT_FOUND' })
+    }
+    if (targetRows[0].owner_key === 'none') {
+      return res.status(400).json({ error: '禁止删除「无」负责人', code: 'CANNOT_DELETE_NONE_OWNER' })
+    }
+
+    connection = await pool.getConnection()
+    await connection.beginTransaction()
+
+    const noneId = await selectNoneOwnerIdForUpdate(connection)
+    if (noneId == null) {
+      await connection.rollback()
+      return res.status(500).json({ error: '数据库缺少 owner_key=none 的负责人记录', code: 'MISSING_NONE_OWNER' })
+    }
+    if (noneId === ownerId) {
+      await connection.rollback()
+      return res.status(400).json({ error: '禁止删除「无」负责人', code: 'CANNOT_DELETE_NONE_OWNER' })
+    }
+
+    await connection.execute(
+      'UPDATE account_mappings SET owner_id = ? WHERE owner_id = ?',
+      [noneId, ownerId]
+    )
+    await connection.execute(
+      'UPDATE users SET owner_id = ? WHERE owner_id = ?',
+      [noneId, ownerId]
+    )
+    const [delResult] = await connection.execute(
+      'DELETE FROM owners WHERE id = ? AND owner_key <> ?',
+      [ownerId, 'none']
+    )
+    if (delResult.affectedRows === 0) {
+      await connection.rollback()
+      return res.status(400).json({ error: '删除失败（可能为保留项）', code: 'DELETE_BLOCKED' })
+    }
+
+    await connection.commit()
+    res.json({
+      success: true,
+      message: `已删除负责人「${targetRows[0].owner_name}」，关联账户与用户已归「无」`,
+      deleted_id: ownerId
+    })
+  } catch (err) {
+    if (connection) {
+      await connection.rollback().catch(() => {})
+    }
+    logger.error('删除负责人失败:', err)
+    res.status(500).json({ error: '删除失败', code: 'ERROR', details: err?.message })
+  } finally {
+    if (connection) connection.release()
   }
 })
 
