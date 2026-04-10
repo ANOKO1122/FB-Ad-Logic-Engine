@@ -45,7 +45,7 @@
 
     <div class="card">
       <h3>批量导入</h3>
-      <p class="hint">每行格式：act_12345678 负责人名字</p>
+      <p class="hint">每行：<code>act_数字</code> 空格 负责人（owner_key 或 owner_name，含「无」）。整批任一错误则不落库，并提示行号。</p>
       <textarea v-model="importText" class="import-area" placeholder="act_12345678 Williams
 act_87654321 Lucky"></textarea>
       <div class="actions">
@@ -113,8 +113,17 @@ export default {
           body: JSON.stringify({ mappings: payload })
         })
         const data = await resp.json()
-        if (!data.success) return alert(data.error || '导入失败')
-        alert(data.message)
+        if (!resp.ok || !data.success) {
+          const errs = Array.isArray(data.errors) ? data.errors : []
+          if (errs.length > 0) {
+            const detail = errs.map((e) => `第${e.line}行: ${e.message || e.code || ''}`).join('\n')
+            alert(`${data.error || '整批校验未通过'}\n\n${detail}`)
+          } else {
+            alert(data.error || '导入失败')
+          }
+          return
+        }
+        alert(data.message || '导入成功')
         importText.value = ''
         await loadMappings()
       } catch (e) {

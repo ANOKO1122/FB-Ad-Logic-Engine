@@ -388,6 +388,10 @@ router.post('/account-mappings/assign', async (req, res) => {
   }
 })
 
+// POST /api/admin/account-mappings/batch-import
+// M4.3：整批校验通过后一次性落库；任一错误则 400 + errors，不写库
+const FB_ACCOUNT_ID_RE = /^act_[0-9]+$/i
+
 router.post('/account-mappings/batch-import', async (req, res) => {
   try {
     const { mappings } = req.body
@@ -395,34 +399,115 @@ router.post('/account-mappings/batch-import', async (req, res) => {
       return res.status(400).json({ error: '请提供账户映射数组', code: 'MISSING_PARAMS' })
     }
 
-    let successCount = 0
-    let failCount = 0
+    const errors = []
+    const seenAccountIds = new Map()
+    const validated = []
 
-    for (const item of mappings) {
-      try {
-        const { fb_account_id, owner_key } = item
-        const [owners] = await pool.execute(
-          'SELECT id FROM owners WHERE owner_key = ? OR owner_name = ?',
-          [owner_key, owner_key]
-        )
-        if (owners.length === 0) {
-          failCount++
-          continue
-        }
-        await pool.execute(
-          `INSERT INTO account_mappings (fb_account_id, owner_id, is_active)
-           VALUES (?, ?, 1)
-           ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id)`,
-          [fb_account_id, owners[0].id]
-        )
-        successCount++
-      } catch {
-        failCount++
+    for (let i = 0; i < mappings.length; i++) {
+      const line = i + 1
+      const item = mappings[i] || {}
+      const rawId = item.fb_account_id != null ? String(item.fb_account_id).trim() : ''
+      const ownerKeyRaw = item.owner_key != null ? String(item.owner_key).trim() : ''
+
+      if (!rawId) {
+        errors.push({ line, code: 'MISSING_ACCOUNT_ID', message: '缺少广告账户 ID（fb_account_id）' })
+        continue
       }
+      if (!FB_ACCOUNT_ID_RE.test(rawId)) {
+        errors.push({
+          line,
+          code: 'INVALID_ACCOUNT_ID',
+          message: `广告账户 ID 格式无效，应为 act_ 数字形式：${rawId}`,
+          fb_account_id: rawId
+        })
+        continue
+      }
+      const fb_account_id = rawId
+      if (seenAccountIds.has(fb_account_id)) {
+        errors.push({
+          line,
+          code: 'DUPLICATE_IN_BATCH',
+          message: `本批内重复的广告账户：${fb_account_id}（首次出现在第 ${seenAccountIds.get(fb_account_id)} 行）`,
+          fb_account_id
+        })
+        continue
+      }
+      seenAccountIds.set(fb_account_id, line)
+
+      if (!ownerKeyRaw) {
+        errors.push({
+          line,
+          code: 'MISSING_OWNER_KEY',
+          message: '缺少负责人标识或名称（owner_key）',
+          fb_account_id
+        })
+        continue
+      }
+
+      const [ownerRows] = await pool.execute(
+        'SELECT id FROM owners WHERE owner_key = ? OR owner_name = ? LIMIT 2',
+        [ownerKeyRaw, ownerKeyRaw]
+      )
+      if (ownerRows.length === 0) {
+        errors.push({
+          line,
+          code: 'OWNER_NOT_FOUND',
+          message: `负责人不存在于主数据：${ownerKeyRaw}`,
+          fb_account_id,
+          owner_key: ownerKeyRaw
+        })
+        continue
+      }
+      if (ownerRows.length > 1) {
+        errors.push({
+          line,
+          code: 'OWNER_AMBIGUOUS',
+          message: `负责人匹配不唯一（请改用 owner_key）：${ownerKeyRaw}`,
+          fb_account_id,
+          owner_key: ownerKeyRaw
+        })
+        continue
+      }
+
+      validated.push({ fb_account_id, owner_id: ownerRows[0].id })
     }
 
-    res.json({ success: true, message: `导入完成：成功 ${successCount} 条，失败 ${failCount} 条`, successCount, failCount })
+    if (errors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'BATCH_VALIDATION_FAILED',
+        error: '整批校验未通过，已取消导入（未写入任何数据）',
+        errors
+      })
+    }
+
+    const connection = await pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      for (const row of validated) {
+        await connection.execute(
+          `INSERT INTO account_mappings (fb_account_id, owner_id, is_active)
+           VALUES (?, ?, 1)
+           ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id), is_active = 1`,
+          [row.fb_account_id, row.owner_id]
+        )
+      }
+      await connection.commit()
+    } catch (e) {
+      await connection.rollback()
+      logger.error('批量导入落库失败:', e)
+      return res.status(500).json({ error: '导入写入失败', code: 'IMPORT_WRITE_ERROR', details: e?.message })
+    } finally {
+      connection.release()
+    }
+
+    res.json({
+      success: true,
+      message: `导入成功，共 ${validated.length} 条账户映射已更新`,
+      count: validated.length
+    })
   } catch (err) {
+    logger.error('批量导入失败:', err)
     res.status(500).json({ error: '操作失败', code: 'ERROR' })
   }
 })
