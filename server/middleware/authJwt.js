@@ -86,10 +86,24 @@ export function requireActive(req, res, next) {
   next()
 }
 
+/** 与 plan 一致：admin 与 super_admin 均可进管理端（/api/admin/*） */
+export function isAdminLikeRole(role) {
+  return role === 'admin' || role === 'super_admin'
+}
+
 export function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: '未登录', code: 'UNAUTHORIZED' })
-  if (req.user.role !== 'admin') {
+  if (!isAdminLikeRole(req.user.role)) {
     return res.status(403).json({ error: '需要管理员权限', code: 'ADMIN_REQUIRED' })
+  }
+  next()
+}
+
+/** 仅 super_admin（升降级管理员等高危操作） */
+export function requireSuperAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: '未登录', code: 'UNAUTHORIZED' })
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ error: '需要超级管理员权限', code: 'SUPER_ADMIN_REQUIRED' })
   }
   next()
 }

@@ -14,7 +14,7 @@ import { recordRequest } from './utils/tlsErrorMonitor.js'
 import { dirname, join } from 'path'
 import { requestViaSocks5 } from './socks5.js'
 import pool from './db/connection.js'
-import { requireAuth, requireActive } from './middleware/authJwt.js'
+import { requireAuth, requireActive, isAdminLikeRole } from './middleware/authJwt.js'
 import app from './app.js'  // 导入 Express 应用对象
 import { 
   parseUsageHeader, 
@@ -777,7 +777,7 @@ class FacebookMarketingAPI {
                   const requestPromise = method === 'POST' 
                     ? axios.post(url, body, config) 
                     : axios.get(url, config)
-                  
+
                   const resp = await fetchWithTimeout(requestPromise, timeout)
                   
                   // 检查 Token 错误
@@ -836,7 +836,7 @@ class FacebookMarketingAPI {
             const requestPromise = method === 'POST' 
               ? axios.post(url, body, config) 
               : axios.get(url, config)
-            
+
             const response = await fetchWithTimeout(requestPromise, timeout)
             
             // 检查 Token 错误
@@ -921,7 +921,7 @@ class FacebookMarketingAPI {
         const requestPromise = method === 'POST' 
           ? axios.post(url, body, config) 
           : axios.get(url, config)
-        
+
         const response = await fetchWithTimeout(requestPromise, timeout)
         
         // 检查 Token 错误
@@ -2511,7 +2511,7 @@ app.get('/api/accounts', requireAuth, requireActive, async (req, res) => {
     // 检查是否强制从 FB 刷新（仅管理员可用）
     const forceRefresh = req.query.force === '1' || req.query.force === 'true'
     
-    if (forceRefresh && req.user.role === 'admin') {
+    if (forceRefresh && isAdminLikeRole(req.user.role)) {
       logger.info('🔄 管理员触发强制刷新，从 Facebook API 同步账户...')
       await syncAccountsFromFacebook()
     }
@@ -2700,7 +2700,7 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
 
     const MULTI_ACCOUNT_IDS_MAX = 20
     const MULTI_ACCOUNT_IDS_MAX_ADMIN = 50
-    const isAdmin = req.user && req.user.role === 'admin'
+    const isAdmin = req.user && isAdminLikeRole(req.user.role)
     const maxAccounts = isAdmin ? MULTI_ACCOUNT_IDS_MAX_ADMIN : MULTI_ACCOUNT_IDS_MAX
     if (allowedIds.length > maxAccounts) {
       return res.status(400).json({

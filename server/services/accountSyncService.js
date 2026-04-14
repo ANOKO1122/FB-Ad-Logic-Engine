@@ -2,6 +2,7 @@
 // 解决问题：避免每次页面刷新都调用 FB API 导致限流
 
 import pool from '../db/connection.js'
+import { isAdminLikeRole } from '../middleware/authJwt.js'
 import { FacebookMarketingAPI } from '../index.js'
 
 /**
@@ -103,7 +104,7 @@ export async function getAccountsFromDatabase(user) {
   let sql
   let params = []
   
-  if (user.role === 'admin') {
+  if (isAdminLikeRole(user.role)) {
     // 管理员：获取所有活跃账户
     sql = `
       SELECT fb_account_id AS id, fb_account_name AS name, owner_id, timezone_name

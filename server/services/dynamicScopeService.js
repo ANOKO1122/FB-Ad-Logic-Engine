@@ -626,6 +626,7 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
             changedByUserId: null,
             changedByOwnerId: null,
             ruleSnapshot: null,
+            snapshotBefore: null,
             connection
           })
         } catch (e) {
@@ -747,7 +748,8 @@ export async function refreshDynamicTargetsForRule(ruleId, options = {}) {
       source: 'dynamic_scope_refresh',
       changedByUserId: null,
       changedByOwnerId: null,
-      ruleSnapshot: null
+      ruleSnapshot: null,
+      snapshotBefore: null
     })
   } catch (e) {
     logger.warn('[rule_history] SYSTEM_REFRESH single status insert failed', { ruleId: id, err: e.message })

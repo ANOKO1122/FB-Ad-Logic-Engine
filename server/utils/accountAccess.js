@@ -8,6 +8,7 @@
  */
 
 import pool from '../db/connection.js'
+import { isAdminLikeRole } from '../middleware/authJwt.js'
 
 /**
  * 校验当前用户是否有权访问指定广告账户
@@ -21,7 +22,7 @@ export async function assertAccountAccess(req, res, accountId) {
     res.status(401).json({ error: '未登录', code: 'UNAUTHORIZED' })
     return false
   }
-  if (req.user.role === 'admin') return true
+  if (isAdminLikeRole(req.user.role)) return true
 
   const ownerId = req.user.owner_id
   if (!ownerId) {
@@ -57,7 +58,7 @@ export async function assertAccountAccess(req, res, accountId) {
  */
 export async function hasAccountAccess(req, accountId) {
   if (!req.user) return false
-  if (req.user.role === 'admin') return true
+  if (isAdminLikeRole(req.user.role)) return true
   const ownerId = req.user.owner_id
   if (!ownerId) return false
   const id = typeof accountId === 'string' ? accountId.trim() : String(accountId || '').trim()

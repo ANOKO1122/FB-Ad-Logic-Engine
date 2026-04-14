@@ -7,6 +7,7 @@ import { db } from '../db/drizzle.js'
 import { rules, automationLogs } from '../db/schema.js'
 import { eq } from 'drizzle-orm'
 import pool from '../db/connection.js'
+import { isAdminLikeRole } from '../middleware/authJwt.js'
 import { RuleEngine, FacebookMarketingAPI } from '../index.js'
 import { 
   syncAllAccountsTodayStats,
@@ -24,6 +25,7 @@ import {
   isCooldownDue,
   upsertRuleAdExecutionStateBatch
 } from './ruleExecutionStateService.js'
+import { getRuleExecutionAccountIds } from './ruleEnableGateService.js'
 
 // M4 Pre-Flight 刷新：执行前批量拉取 FB effective_status，解决 ad_snapshots 滞后导致误 POST
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -545,6 +547,21 @@ function getRuleAccountIds(rule) {
 export async function executeRulesForAccount(accountId, options = {}) {
   const { force = false, runId = null, fromScheduler = false } = options
   const enableActionBatch = process.env.ENABLE_ACTION_BATCH === '1' || process.env.ENABLE_ACTION_BATCH === 'true'
+
+  const [mappingActive] = await pool.execute(
+    `SELECT 1 FROM account_mappings WHERE fb_account_id = ? AND is_active = 1 LIMIT 1`,
+    [accountId]
+  )
+  if (mappingActive.length === 0) {
+    logger.info(`   ⏸️  [${accountId}] 账户映射未启用(is_active≠1)，跳过规则执行`)
+    return {
+      accountId,
+      matched: 0,
+      executed: 0,
+      skipped: 0,
+      errors: 0
+    }
+  }
   
   // ✅ 如果没有传入 runId，生成新的
   const currentRunId = runId || generateRunId()
@@ -569,11 +586,12 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
     }
 
-    // 1. 从数据库获取所有启用的规则
-    const enabledRules = await db
+    // 1. 从数据库获取所有启用的规则（跳过未绑定任何执行账户的半成品，与原则 A 一致）
+    const enabledRulesRaw = await db
       .select()
       .from(rules)
       .where(eq(rules.enabled, true))
+    const enabledRules = enabledRulesRaw.filter((r) => getRuleExecutionAccountIds(r).length > 0)
     
     // 调度路径（每分钟 Cron）：不做规则级冷却过滤，改用广告级冷却表
     // 非调度路径（如历史/强制）：保留规则级冷却
@@ -641,7 +659,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
       const user = userRows[0]
       let hasAccess = false
-      if (user.role === 'admin') {
+      if (isAdminLikeRole(user.role)) {
         hasAccess = true
       } else {
         const [accRows] = await pool.execute(
@@ -1181,6 +1199,32 @@ export async function executeSingleRule(rule, options = {}) {
     const perAccountSummaries = []
 
     for (const accountId of accountIds) {
+      const [amActive] = await pool.execute(
+        `SELECT 1 FROM account_mappings WHERE fb_account_id = ? AND is_active = 1 LIMIT 1`,
+        [accountId]
+      )
+      if (amActive.length === 0) {
+        perAccountSummaries.push({
+          runId,
+          ruleId: rule.id,
+          ruleName: rule.ruleName,
+          accountId,
+          userId: rule.userId,
+          ownerId,
+          matchedCount: 0,
+          executedCount: 0,
+          failedCount: 0,
+          skippedCount: 1,
+          status: 'skipped',
+          skipReason: 'account_inactive',
+          skipDetails: { fb_account_id: accountId, note: 'account_mappings.is_active=0' },
+          errorMessage: null,
+          durationMs: 0,
+          evaluatedAt: new Date()
+        })
+        continue
+      }
+
       const oneResult = await executeRulesWithLock(accountId, async (lockedAccountId) => {
         const summary = {
           runId,

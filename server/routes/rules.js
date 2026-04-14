@@ -2,7 +2,7 @@
 // 注意：这是新功能，使用 Drizzle；旧功能（用户管理）继续使用原生 SQL
 import { Router } from 'express'
 import logger from '../utils/logger.js'
-import { requireAuth, requireActive } from '../middleware/authJwt.js'
+import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJwt.js'
 import * as rulesService from '../services/rulesService.js'
 import { getCronStatus, executeSingleRule } from '../services/cronService.js'
 import { assertAccountAccess } from '../utils/accountAccess.js'
@@ -12,6 +12,8 @@ import { parseCompositeId, normalizeAccountId } from '../utils/targetIdUtils.js'
 import { validateConditionsStructure, validateTimeWindowConsistency, normalizeConditionsToV2 } from '../utils/conditionsValidator.js'
 import { validateActions } from '../utils/templateValidator.js'
 import { refreshDynamicTargetsForAccount, refreshDynamicTargetsForRule, scheduleDynamicScopeRefreshForRule, isDynamicScopeFeatureEnabled, previewDynamicScope } from '../services/dynamicScopeService.js'
+import { mergeRuleForEnableCheck, assertRuleReadyToEnable } from '../services/ruleEnableGateService.js'
+import { bootstrapTemplatesForOwnerIfEmpty } from '../services/templateBootstrapService.js'
 
 const router = Router()
 
@@ -21,7 +23,7 @@ const router = Router()
 function mapRuleErrorToResponse(error) {
   const msg = error?.message || ''
   if (msg === '规则不存在或无权访问') return { statusCode: 404, code: 'NOT_FOUND' }
-  if (/^INVALID_|^RULE_NOT_FOUND|ACCOUNT_NOT_FOUND|ACCOUNT_FORBIDDEN/.test(msg)) return { statusCode: 400, code: msg.split(' ')[0] || 'BAD_REQUEST' }
+  if (/^INVALID_|^RULE_NOT_FOUND|ACCOUNT_NOT_FOUND|ACCOUNT_FORBIDDEN|ENABLE_MISSING_ACCOUNT|FEATURE_DISABLED/.test(msg)) return { statusCode: 400, code: msg.split(' ')[0] || 'BAD_REQUEST' }
   if (msg.includes('必填') || msg.includes('必须是') || msg.includes('仅支持')) return { statusCode: 400, code: 'VALIDATION_ERROR' }
   return { statusCode: 500, code: 'ERROR' }
 }
@@ -140,7 +142,7 @@ router.get('/templates', requireAuth, requireActive, async (req, res) => {
 router.get('/rules', requireAuth, requireActive, async (req, res) => {
   try {
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
 
     // 解析 ownerIds：仅管理员使用；空数组/未传表示不按负责人过滤
     let ownerIds = undefined
@@ -156,7 +158,9 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
       limit: req.query.limit ? parseInt(req.query.limit) : undefined,
       offset: req.query.offset ? parseInt(req.query.offset) : undefined,
       isAdmin,
-      ownerIds
+      ownerIds,
+      // 非管理员：按负责人维度列出规则（与模板铺底「一负责人一套」一致）
+      viewerOwnerId: isAdmin ? undefined : req.user.owner_id
     }
 
     const userRules = await rulesService.getUserRules(userId, options)
@@ -189,6 +193,43 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
   } catch (error) {
     logger.error('获取规则列表失败:', error)
     res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /api/rules/bootstrap-from-templates
+ * 显式全量铺底：仅当当前 owner 维度下规则数为 0 时，按启用模板生成半成品（enabled=false）
+ * 原则 B：禁止在 GET /api/rules 内做写入副作用
+ */
+router.post('/rules/bootstrap-from-templates', requireAuth, requireActive, async (req, res) => {
+  try {
+    const ownerId = req.user.owner_id != null ? Number(req.user.owner_id) : null
+    if (!ownerId || !Number.isFinite(ownerId)) {
+      return res.status(400).json({ error: '当前用户未绑定负责人(owner_id)，无法执行铺底', code: 'MISSING_OWNER' })
+    }
+
+    const [ownerRows] = await pool.execute(
+      `SELECT id, owner_key, is_active FROM owners WHERE id = ? LIMIT 1`,
+      [ownerId]
+    )
+    const owner = ownerRows?.[0]
+    if (!owner || Number(owner.is_active) !== 1 || String(owner.owner_key || '') === 'none') {
+      return res.status(400).json({ error: '当前负责人不可用于模板铺底', code: 'INVALID_OWNER' })
+    }
+
+    const summary = await bootstrapTemplatesForOwnerIfEmpty({
+      ownerId,
+      actorUserId: req.user.id ?? null,
+      actorOwnerId: ownerId
+    })
+    return res.json({
+      success: true,
+      message: summary.created > 0 ? `已生成 ${summary.created} 条半成品规则` : '无新增规则（可能已存在规则或模板为空）',
+      ...summary
+    })
+  } catch (error) {
+    logger.error('模板半成品铺底失败:', error)
+    return res.status(500).json({ error: error.message || '铺底失败', code: 'ERROR' })
   }
 })
 
@@ -263,13 +304,13 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID' })
     }
     
-    const rule = await rulesService.getRuleById(ruleId, userId, isAdmin)
+    const rule = await rulesService.getRuleById(ruleId, userId, isAdmin, req.user.owner_id ?? null)
     
     if (!rule) {
       return res.status(404).json({ error: '规则不存在或无权访问' })
@@ -337,7 +378,7 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
 router.post('/rules', requireAuth, requireActive, async (req, res) => {
   try {
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const ownerId = req.user.owner_id
     
     const { 
@@ -531,7 +572,7 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const ownerId = req.user.owner_id
     const body = req.body || {}
     
@@ -695,9 +736,27 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
         code: 'INVALID_TARGET_IDS'
       })
     }
+
+    // 原则 A：合并后若 enabled=true，校验执行所需最小配置（半成品未补全不可开闸）
+    const existingForGate = await rulesService.getRuleById(ruleId, userId, isAdmin, req.user.owner_id ?? null)
+    if (!existingForGate) {
+      return res.status(404).json({ error: '规则不存在或无权访问', code: 'NOT_FOUND' })
+    }
+    const mergedForGate = mergeRuleForEnableCheck(existingForGate, updates)
+    const gate = await assertRuleReadyToEnable(mergedForGate, { isAdmin, ownerId: ownerId ?? null })
+    if (!gate.ok) {
+      return res.status(400).json({ error: gate.error, code: gate.code })
+    }
     
     // 更新规则（管理员可以更新所有规则）
-    const updatedRule = await rulesService.updateRule(ruleId, userId, updates, isAdmin, ownerId ?? undefined)
+    const updatedRule = await rulesService.updateRule(
+      ruleId,
+      userId,
+      updates,
+      isAdmin,
+      ownerId ?? undefined,
+      req.user.owner_id ?? null
+    )
 
     // TriggerB：规则保存后异步刷新动态快照（多账户规则按目标账户逐个防抖）
     if (isDynamicScopeFeatureEnabled()) {
@@ -729,14 +788,14 @@ router.post('/rules/dynamic-scope/refresh-account', requireAuth, requireActive, 
     }
 
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const accountIdFromBody = req.body?.accountId != null ? String(req.body.accountId).trim() : ''
     const ruleIdFromBody = req.body?.ruleId != null ? parseInt(req.body.ruleId, 10) : null
 
     let accountId = accountIdFromBody
     let refreshByRule = false
     if (!accountId && ruleIdFromBody && !Number.isNaN(ruleIdFromBody)) {
-      const rule = await rulesService.getRuleById(ruleIdFromBody, userId, isAdmin)
+      const rule = await rulesService.getRuleById(ruleIdFromBody, userId, isAdmin, req.user.owner_id ?? null)
       if (!rule) {
         return res.status(404).json({ error: '规则不存在或无权访问', code: 'RULE_NOT_FOUND' })
       }
@@ -774,14 +833,14 @@ router.delete('/rules/:id', requireAuth, requireActive, async (req, res) => {
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID' })
     }
     
     // 删除规则（管理员可以删除所有规则）
-    await rulesService.deleteRule(ruleId, userId, isAdmin)
+    await rulesService.deleteRule(ruleId, userId, isAdmin, req.user.owner_id ?? null)
     
     res.json({
       message: '规则删除成功'
@@ -805,7 +864,7 @@ router.patch('/rules/:id/toggle', requireAuth, requireActive, async (req, res) =
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     const { enabled } = req.body
     
     if (isNaN(ruleId)) {
@@ -815,9 +874,31 @@ router.patch('/rules/:id/toggle', requireAuth, requireActive, async (req, res) =
     if (typeof enabled !== 'boolean') {
       return res.status(400).json({ error: 'enabled 必须是布尔值' })
     }
+
+    const existingToggle = await rulesService.getRuleById(ruleId, userId, isAdmin, req.user.owner_id ?? null)
+    if (!existingToggle) {
+      return res.status(404).json({ error: '规则不存在或无权访问' })
+    }
+    if (enabled) {
+      const mergedToggle = mergeRuleForEnableCheck(existingToggle, { enabled })
+      const gateToggle = await assertRuleReadyToEnable(mergedToggle, {
+        isAdmin,
+        ownerId: req.user.owner_id ?? null
+      })
+      if (!gateToggle.ok) {
+        return res.status(400).json({ error: gateToggle.error, code: gateToggle.code })
+      }
+    }
     
     // 启用/禁用规则（管理员可以操作所有规则）
-    const updatedRule = await rulesService.toggleRule(ruleId, userId, enabled, isAdmin, req.user.owner_id ?? undefined)
+    const updatedRule = await rulesService.toggleRule(
+      ruleId,
+      userId,
+      enabled,
+      isAdmin,
+      req.user.owner_id ?? undefined,
+      req.user.owner_id ?? null
+    )
     
     res.json({
       message: `规则已${enabled ? '启用' : '禁用'}`,
@@ -842,11 +923,11 @@ router.post('/rules/:id/execute', requireAuth, requireActive, async (req, res) =
   try {
     const ruleId = parseInt(req.params.id)
     const userId = req.user.id
-    const isAdmin = req.user.role === 'admin'
+    const isAdmin = isAdminLikeRole(req.user.role)
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID', code: 'INVALID_ID' })
     }
-    const rule = await rulesService.getRuleById(ruleId, userId, isAdmin)
+    const rule = await rulesService.getRuleById(ruleId, userId, isAdmin, req.user.owner_id ?? null)
     if (!rule) {
       return res.status(404).json({ error: '规则不存在或无权访问', code: 'NOT_FOUND' })
     }

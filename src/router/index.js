@@ -10,8 +10,11 @@ const RuleManager = () => import('../views/RuleManager.vue')
 const Logs = () => import('../views/Logs.vue')
 const SystemStatus = () => import('../views/SystemStatus.vue')
 const AdminReview = () => import('../views/AdminReview.vue')
+const AdminUsers = () => import('../views/AdminUsers.vue')
 const AdminAccountMapping = () => import('../views/AdminAccountMapping.vue')
+const AdminOwners = () => import('../views/AdminOwners.vue')
 const AdminTemplates = () => import('../views/AdminTemplates.vue')
+const AdminRuleHistory = () => import('../views/AdminRuleHistory.vue')
 
 const MainLayout = () => import('../layouts/MainLayout.vue')
 
@@ -33,9 +36,12 @@ const router = createRouter({
         { path: 'rules', component: RuleManager },
         { path: 'logs', component: Logs },
         { path: 'system', component: SystemStatus, meta: { requiresAdmin: true } },
+        { path: 'admin/users', component: AdminUsers, meta: { requiresAdmin: true } },
         { path: 'admin/review', component: AdminReview, meta: { requiresAdmin: true } },
+        { path: 'admin/owners', component: AdminOwners, meta: { requiresAdmin: true } },
         { path: 'admin/account-mapping', component: AdminAccountMapping, meta: { requiresAdmin: true } },
-        { path: 'admin/templates', component: AdminTemplates, meta: { requiresAdmin: true } }
+        { path: 'admin/templates', component: AdminTemplates, meta: { requiresAdmin: true } },
+        { path: 'admin/rule-history', component: AdminRuleHistory, meta: { requiresAdmin: true } }
       ]
     },
 
@@ -73,7 +79,8 @@ router.beforeEach(async (to, from, next) => {
   if (to.meta.requiresActive && user.status !== 'active') return next('/login')
   
   const requiresAdmin = to.matched.some(record => record.meta.requiresAdmin)
-  if (requiresAdmin && user.role !== 'admin') return next('/dashboard')
+  const isAdminLike = user.role === 'admin' || user.role === 'super_admin'
+  if (requiresAdmin && !isAdminLike) return next('/dashboard')
 
   next()
 })
