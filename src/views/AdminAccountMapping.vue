@@ -23,7 +23,9 @@
               <th>账户ID</th>
               <th>账户名</th>
               <th>当前负责人</th>
+              <th>状态</th>
               <th>更换</th>
+              <th>启用/停用</th>
             </tr>
           </thead>
           <tbody>
@@ -32,10 +34,35 @@
               <td>{{ m.fb_account_name || '-' }}</td>
               <td>{{ m.owner_name }}</td>
               <td>
+                <span class="status-tag" :class="{ on: isActive(m), off: !isActive(m) }">
+                  {{ isActive(m) ? '启用' : '停用' }}
+                </span>
+              </td>
+              <td>
                 <select v-model="m.newOwnerId" @change="assign(m)" class="select small">
                   <option value="">选择负责人</option>
                   <option v-for="o in owners" :key="o.id" :value="o.id">{{ o.owner_name }}</option>
                 </select>
+              </td>
+              <td>
+                <button
+                  v-if="isActive(m)"
+                  type="button"
+                  class="btn small danger"
+                  :disabled="statusSavingId === m.fb_account_id"
+                  @click="setMappingActive(m, false)"
+                >
+                  {{ statusSavingId === m.fb_account_id ? '…' : '停用' }}
+                </button>
+                <button
+                  v-else
+                  type="button"
+                  class="btn small secondary"
+                  :disabled="statusSavingId === m.fb_account_id"
+                  @click="setMappingActive(m, true)"
+                >
+                  {{ statusSavingId === m.fb_account_id ? '…' : '启用' }}
+                </button>
               </td>
             </tr>
           </tbody>
@@ -45,7 +72,7 @@
 
     <div class="card">
       <h3>批量导入</h3>
-      <p class="hint">每行：<code>act_数字</code> 空格 负责人（owner_key 或 owner_name，含「无」）。整批任一错误则不落库，并提示行号。</p>
+      <p class="hint">每行：<code>act_数字</code> 空格 负责人（owner_key 或 owner_name，含「无」）。整批任一错误则不落库，并提示行号。已存在的账户仅更新负责人，<strong>不自动改启用/停用</strong>；新插入的账户默认为启用。</p>
       <textarea v-model="importText" class="import-area" placeholder="act_12345678 Williams
 act_87654321 Lucky"></textarea>
       <div class="actions">
@@ -67,6 +94,16 @@ export default {
     const mappings = ref([])
     const ownerFilter = ref('')
     const importText = ref('')
+    const statusSavingId = ref('')
+
+    const isActive = (m) => {
+      const v = m.is_active
+      if (v === true || v === 1) return true
+      if (v === false || v === 0) return false
+      if (typeof v === 'bigint') return v === 1n
+      return Number(v) === 1
+    }
+
     const loadOwners = async () => {
       try {
         const resp = await authFetch('/api/admin/owners')
@@ -82,6 +119,29 @@ export default {
         const data = await resp.json()
         mappings.value = (data.mappings || []).map(x => ({ ...x, newOwnerId: '' }))
       } catch {}
+    }
+
+    const setMappingActive = async (m, nextActive) => {
+      const word = nextActive ? '启用' : '停用'
+      if (!confirm(`确定${word}广告账户 ${m.fb_account_id}？\n停用后：不参与同步与规则调度，普通用户在选账户列表中不可见。`)) return
+      statusSavingId.value = m.fb_account_id
+      try {
+        const resp = await authFetch('/api/admin/account-mappings/status', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fb_account_id: m.fb_account_id, is_active: nextActive })
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (!resp.ok || !data.success) {
+          alert(data.error || '操作失败')
+          return
+        }
+        await loadMappings()
+      } catch (e) {
+        alert(e.message || String(e))
+      } finally {
+        statusSavingId.value = ''
+      }
     }
 
     const assign = async (m) => {
@@ -137,7 +197,8 @@ export default {
     })
 
     return { 
-      owners, mappings, ownerFilter, importText, 
+      owners, mappings, ownerFilter, importText, statusSavingId,
+      isActive, setMappingActive,
       loadMappings, assign, batchImport
     }
   }
@@ -239,4 +300,20 @@ export default {
 }
 
 .actions { display: flex; justify-content: flex-end; }
+
+.status-tag {
+  display: inline-block;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: var(--radius-md, 6px);
+  font-weight: 600;
+}
+.status-tag.on {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+}
+.status-tag.off {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
+}
 </style>

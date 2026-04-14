@@ -20,7 +20,7 @@ import logger from '../utils/logger.js'
  * @param {number} summary.failedCount - 执行失败数量
  * @param {number} summary.skippedCount - 跳过数量
  * @param {string} summary.status - 状态：matched/no_match/skipped/error
- * @param {string} summary.skipReason - 跳过原因：cooldown/no_permission/account_mismatch/user_not_found/no_match/error/suppressed_by_priority（M4）/muted
+ * @param {string} summary.skipReason - 跳过原因：cooldown/no_permission/account_mismatch/user_not_found/no_match/error/suppressed_by_priority（M4）/muted/account_inactive
  * @param {Object} summary.skipDetails - 跳过详情（JSON对象）
  * @param {string} summary.errorMessage - 错误信息（已脱敏）
  * @param {number} summary.durationMs - 耗时（毫秒）

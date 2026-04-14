@@ -43,6 +43,10 @@
           <router-link to="/admin/templates" class="nav-item" active-class="active">
             <span class="text">模板管理</span>
           </router-link>
+
+          <router-link to="/admin/rule-history" class="nav-item" active-class="active">
+            <span class="text">规则审计</span>
+          </router-link>
           
           <router-link to="/admin/review" class="nav-item" active-class="active">
             <span class="text">用户审核</span>

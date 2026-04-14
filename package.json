@@ -16,6 +16,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@vuepic/vue-datepicker": "^11.0.2",
     "axios": "^1.6.2",
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",

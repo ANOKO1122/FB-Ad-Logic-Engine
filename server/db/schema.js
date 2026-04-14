@@ -39,13 +39,18 @@ export const rules = mysqlTable('rules', {
   
   // 用户 ID：关联到 users 表的 owner_id（外键关系，但 Drizzle 不强制外键约束）
   userId: int('user_id').notNull(),
+
+  // 负责人冗余：DB 列 owner_id；JS 属性名 rulesOwnerId，避免与 getUserRules 中联表别名 ownerId（owners.id）混淆
+  rulesOwnerId: int('owner_id'),
   
-  // 广告账户 ID：规则作用的目标账户（限定规则只作用于此账户）
-  // ✅ 方案三：必须绑定账户（NOT NULL），防止反向索引退化
-  accountId: varchar('account_id', { length: 50 }).notNull(),
+  // 广告账户 ID：NULL 表示未绑定（半成品）；enabled=true 前由 PUT 开闸校验拦截
+  accountId: varchar('account_id', { length: 50 }),
   
   // 规则名称
   ruleName: varchar('rule_name', { length: 255 }).notNull(),
+
+  // 来源模板 slug（rule_templates.slug）；与 owner_id 组成 UNIQUE 实现铺底幂等
+  sourceTemplateSlug: varchar('source_template_slug', { length: 64 }),
   
   // 目标范围（M3 新增）
   targetLevel: varchar('target_level', { length: 20 }).default('ad'),  // 目标层级：ad/adset/campaign

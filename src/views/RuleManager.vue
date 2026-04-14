@@ -68,6 +68,10 @@
             </div>
           </Transition>
         </div>
+        <template v-if="rules.length > 0">
+          <button type="button" class="btn secondary small" @click="collapseAllRuleCards">全部折叠</button>
+          <button type="button" class="btn secondary small" @click="expandAllRuleCards">全部展开</button>
+        </template>
         <button class="btn" @click="openCreateRule">
           <span class="icon">+</span> 新建规则
         </button>
@@ -79,7 +83,21 @@
       <div class="empty-icon">⚡</div>
       <h3>暂无自动化规则</h3>
       <p>规则可以帮你 24 小时监控广告，自动止损或扩量。</p>
-      <button class="btn" @click="openCreateRule">创建第一条规则</button>
+      <div class="empty-actions">
+        <button class="btn" @click="openCreateRule">创建第一条规则</button>
+        <button
+          v-if="showBootstrapButton"
+          class="btn secondary"
+          :disabled="bootstrapLoading"
+          @click="bootstrapFromTemplates"
+        >
+          {{ bootstrapLoading ? '生成中...' : '一键生成常用模板规则' }}
+        </button>
+      </div>
+      <p v-if="showBootstrapButton" class="empty-note">将生成 disabled 的半成品规则，请补全账户与配置后再启用。</p>
+      <div v-if="bootstrapFeedback.text" class="empty-feedback" :class="bootstrapFeedback.type">
+        {{ bootstrapFeedback.text }}
+      </div>
     </div>
 
     <div v-else class="rules-grid">
@@ -90,10 +108,22 @@
         :class="{ disabled: !r.enabled }"
       >
         <div class="card-header">
-          <h3 class="rule-name">
-            {{ r.name }}
-            <span v-if="r.conditionsVersion === 2" class="badge-dnf">DNF/多组</span>
-          </h3>
+          <div class="card-header-titles">
+            <h3 class="rule-name">
+              {{ r.name }}
+              <span v-if="r.conditionsVersion === 2" class="badge-dnf">DNF/多组</span>
+            </h3>
+            <button
+              type="button"
+              class="btn-text card-expand-toggle"
+              :aria-expanded="isRuleCardExpanded(r.id)"
+              :aria-label="isRuleCardExpanded(r.id) ? '收起规则详情' : '展开规则详情'"
+              @click.stop="toggleRuleCardExpand(r.id)"
+            >
+              {{ isRuleCardExpanded(r.id) ? '收起详情' : '展开详情' }}
+              <span class="card-expand-chevron" :class="{ open: isRuleCardExpanded(r.id) }" aria-hidden="true">▼</span>
+            </button>
+          </div>
           <div class="switch-wrapper">
             <label class="switch">
               <input type="checkbox" :checked="r.enabled" @change="toggleRule(r, $event.target.checked)">
@@ -128,12 +158,18 @@
           <div class="section">
             <span class="label">IF (当满足以下条件时):</span>
             <div class="conditions-list">
-              <div v-for="(c, idx) in r.conditions" :key="idx" class="pill condition">
+              <div v-for="(c, idx) in visibleConditionsForCard(r)" :key="idx" class="pill condition">
                 <span v-if="r.conditionsVersion === 2 && c._groupIndex" class="muted">组{{ c._groupIndex }}: </span>
                 {{ metricLabel(c.metric) }} {{ opLabel(c.operator) }} {{ c.value }}
                 <span v-if="c.time_window" class="muted">({{ timeWindowLabel(c.time_window, c) }})</span>
               </div>
             </div>
+            <p
+              v-if="!isRuleCardExpanded(r.id) && extraCondGroupsCount(r) > 0"
+              class="cond-more-hint"
+            >
+              另有 {{ extraCondGroupsCount(r) }} 组条件未显示，点击「展开详情」查看全部。
+            </p>
           </div>
 
           <div class="arrow">↓</div>
@@ -717,9 +753,19 @@ export default {
     const ownerFilterOpen = ref(false)
     /** 负责人下拉容器（用于点击外部关闭） */
     const ownerDropdownRef = ref(null)
+
+    /** 规则列表卡片折叠：localStorage key 按用户隔离 */
+    const CARD_EXPAND_STORAGE_PREFIX = 'fb_rule_cards_expanded_v1:'
+    const currentUserId = ref(null)
+    /** 已展开的规则 id；未列入视为折叠（默认全部折叠） */
+    const expandedRuleIds = ref([])
+
     const running = ref(false)
     const runningRuleId = ref(null)
     const refreshingRuleId = ref(null)
+    const bootstrapLoading = ref(false)
+    const bootstrapFeedback = ref({ type: 'info', text: '' })
+    const rulesLoaded = ref(false)
     
     const levelOptions = [
       { label: '广告 (Ad)', value: 'ad' },
@@ -826,6 +872,96 @@ export default {
         .filter(o => selectedOwnerIds.value.includes(o.id))
         .map(o => o.owner_name || o.ownerName || String(o.id))
       return names.length ? names.join(', ') : '全部 (不选=全部)'
+    })
+    /** 一键铺底按钮展示口径：仅非管理员、空规则列表时展示（按当前 owner 维度） */
+    const showBootstrapButton = computed(() => rulesLoaded.value && !isAdminFromRules.value && rules.value.length === 0)
+
+    const persistExpandedRuleIds = () => {
+      const uid = currentUserId.value
+      if (uid == null || !Number.isFinite(Number(uid))) return
+      try {
+        localStorage.setItem(
+          CARD_EXPAND_STORAGE_PREFIX + String(uid),
+          JSON.stringify(expandedRuleIds.value)
+        )
+      } catch (_) {
+        /* 配额或其它 */
+      }
+    }
+
+    const hydrateExpandedRuleIds = () => {
+      const uid = currentUserId.value
+      if (uid == null || !Number.isFinite(Number(uid))) return
+      try {
+        const raw = localStorage.getItem(CARD_EXPAND_STORAGE_PREFIX + String(uid))
+        if (!raw) {
+          expandedRuleIds.value = []
+          return
+        }
+        const arr = JSON.parse(raw)
+        expandedRuleIds.value = Array.isArray(arr)
+          ? arr.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0)
+          : []
+      } catch (_) {
+        expandedRuleIds.value = []
+      }
+    }
+
+    const isRuleCardExpanded = (ruleId) => {
+      const id = Number(ruleId)
+      if (!Number.isFinite(id) || id < 1) return false
+      return expandedRuleIds.value.includes(id)
+    }
+
+    const toggleRuleCardExpand = (ruleId) => {
+      const id = Number(ruleId)
+      if (!Number.isFinite(id) || id < 1) return
+      const next = [...expandedRuleIds.value]
+      const i = next.indexOf(id)
+      if (i >= 0) next.splice(i, 1)
+      else next.push(id)
+      expandedRuleIds.value = next
+    }
+
+    const collapseAllRuleCards = () => {
+      expandedRuleIds.value = []
+    }
+
+    const expandAllRuleCards = () => {
+      expandedRuleIds.value = rules.value
+        .map((r) => Number(r.id))
+        .filter((id) => Number.isFinite(id) && id > 0)
+    }
+
+    /** 折叠态 v2 仅第一组 IF；展开或 v1 显示全部条件 */
+    const visibleConditionsForCard = (r) => {
+      const conds = r.conditions || []
+      if (isRuleCardExpanded(r.id)) return conds
+      if (r.conditionsVersion !== 2) return conds
+      return conds.filter((c) => (c._groupIndex || 1) === 1)
+    }
+
+    /** v2 除第 1 组外还有多少组（用于折叠提示） */
+    const extraCondGroupsCount = (r) => {
+      if (r.conditionsVersion !== 2 || !r.conditions?.length) return 0
+      let maxG = 1
+      for (const c of r.conditions) {
+        const g = c._groupIndex || 1
+        if (g > maxG) maxG = g
+      }
+      return Math.max(0, maxG - 1)
+    }
+
+    watch(expandedRuleIds, () => persistExpandedRuleIds(), { deep: true })
+
+    watch(rules, (list) => {
+      const idSet = new Set(
+        (list || []).map((x) => Number(x.id)).filter((n) => Number.isFinite(n) && n > 0)
+      )
+      const pruned = expandedRuleIds.value.filter((id) => idSet.has(id))
+      if (pruned.length !== expandedRuleIds.value.length) {
+        expandedRuleIds.value = pruned
+      }
     })
 
     // v2 DNF 工具函数
@@ -1086,8 +1222,42 @@ export default {
           }
         }
         rules.value = (data.rules || []).map(normalizeRule)
+        rulesLoaded.value = true
       } catch (e) {
+        rulesLoaded.value = true
         alert(`加载规则失败：${e.message}`)
+      }
+    }
+
+    /** 显式全量铺底（原则 B：仅 POST 写接口触发） */
+    const bootstrapFromTemplates = async () => {
+      if (bootstrapLoading.value) return
+      bootstrapLoading.value = true
+      bootstrapFeedback.value = { type: 'info', text: '' }
+      try {
+        const resp = await authFetch('/api/rules/bootstrap-from-templates', { method: 'POST' })
+        const data = await resp.json()
+        if (!resp.ok) throw new Error(data.error || '铺底失败')
+        await loadRules()
+        const created = Number(data.created || 0)
+        if (created > 0) {
+          bootstrapFeedback.value = {
+            type: 'success',
+            text: `已生成 ${created} 条半成品规则，请补全账户与条件后再启用。`
+          }
+        } else {
+          bootstrapFeedback.value = {
+            type: 'info',
+            text: '无新增规则（当前负责人已有规则或模板为空）。'
+          }
+        }
+      } catch (e) {
+        bootstrapFeedback.value = {
+          type: 'error',
+          text: `一键生成失败：${e.message}`
+        }
+      } finally {
+        bootstrapLoading.value = false
       }
     }
 
@@ -2461,6 +2631,23 @@ export default {
     let ownerFilterClickOutsideCleanup = null
 
     onMounted(async () => {
+      try {
+        const res = await authFetch('/api/me')
+        if (res.ok) {
+          const data = await res.json()
+          const u = data?.user
+          if (u?.id != null) {
+            const uid = Number(u.id)
+            if (Number.isFinite(uid) && uid > 0) {
+              currentUserId.value = uid
+              hydrateExpandedRuleIds()
+            }
+          }
+        }
+      } catch (_) {
+        /* 未登录或网络失败：仍可用页面，折叠状态仅内存、不按用户持久化 */
+      }
+
       await loadAccounts()
       await loadRules()
 
@@ -2492,6 +2679,8 @@ export default {
       rules, showRuleModal, editingRuleId, ruleForm, running, runningRuleId, refreshingRuleId,
       isAdminFromRules, ownersList, selectedOwnerIds,
       ownerFilterOpen, ownerFilterDisplayValue, ownerDropdownRef, clearOwnerFilter, toggleOwnerOption,
+      isRuleCardExpanded, toggleRuleCardExpand, collapseAllRuleCards, expandAllRuleCards,
+      visibleConditionsForCard, extraCondGroupsCount,
       whenLines, whenTimeWindow, whenCustomRange,
       linesToV2Groups, v2ToLines, v1ToLines,
       createDefaultWhenLine, ensureWhenLinesNonEmpty, getDefaultWhenCustomRange,
@@ -2506,6 +2695,7 @@ export default {
       formatExecutionTimeDisplay, formatIntervalDisplay, dynamicStatusLabel, dynamicStatusClass,
       ratioMetricTip,
       openCreateRule, openEditRule, saveRule, deleteRule, toggleRule, runThisRule, refreshDynamicScopeForRule,
+      showBootstrapButton, bootstrapLoading, bootstrapFromTemplates, bootstrapFeedback,
       refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection, selectAllExcludeScope, clearExcludeScopeSelection,
       showSyncButton, syncJustDoneMessage, syncConfigFromMatch,
       addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange,
@@ -2566,6 +2756,10 @@ export default {
 
 .header-actions h2 { margin: 0; font-size: 24px; color: var(--text-primary); }
 .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.actions .btn.small {
+  padding: 6px 12px;
+  font-size: 13px;
+}
 
 .owner-filter-wrap {
   position: relative;
@@ -2763,6 +2957,44 @@ export default {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  gap: 12px;
+}
+
+.card-header-titles {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.card-expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--primary-color, #2563eb);
+  padding: 0;
+}
+.card-expand-toggle:hover {
+  color: #1d4ed8;
+  text-decoration: none;
+}
+.card-expand-chevron {
+  font-size: 9px;
+  transition: transform 0.2s;
+  display: inline-block;
+}
+.card-expand-chevron.open {
+  transform: rotate(180deg);
+}
+
+.cond-more-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary, #6b7280);
+  line-height: 1.4;
 }
 
 .rule-name { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -2828,6 +3060,12 @@ input:checked + .slider:before { transform: translateX(16px); }
 /* 空状态 */
 .empty-rules { text-align: center; padding: 60px 0; color: var(--text-secondary); }
 .empty-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+.empty-actions { display: inline-flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.empty-note { margin-top: 12px; font-size: 13px; color: #6b7280; }
+.empty-feedback { margin: 12px auto 0; padding: 8px 12px; border-radius: 8px; width: fit-content; max-width: 520px; font-size: 13px; }
+.empty-feedback.success { background: #ecfdf5; border: 1px solid #6ee7b7; color: #065f46; }
+.empty-feedback.info { background: #eff6ff; border: 1px solid #93c5fd; color: #1e40af; }
+.empty-feedback.error { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
 
 /* 模态框 */
 .modal-overlay {

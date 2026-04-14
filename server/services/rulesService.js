@@ -74,8 +74,10 @@ export async function createRule(userId, ruleData, ownerId = null) {
   syncTargetByAccount(ruleData)
   const result = await db.insert(rules).values({
     userId: userId,
+    rulesOwnerId: ownerId ?? null,
     accountId: ruleData.accountId,
     ruleName: ruleData.ruleName,
+    sourceTemplateSlug: ruleData.sourceTemplateSlug ?? null,
     targetLevel: ruleData.targetLevel || 'ad',
     targetIds: ruleData.targetIds || [],
     targetAccountIds: ruleData.targetAccountIds ?? null,
@@ -112,7 +114,8 @@ export async function createRule(userId, ruleData, ownerId = null) {
       source: 'api_save',
       changedByUserId: userId,
       changedByOwnerId: ownerId ?? null,
-      ruleSnapshot: buildRuleSnapshot(rule)
+      ruleSnapshot: buildRuleSnapshot(rule),
+      snapshotBefore: null
     })
   } catch (e) {
     logger.warn('[rule_history] createRule insert history failed', { ruleId: newRuleId, err: e.message })
@@ -126,10 +129,11 @@ export async function createRule(userId, ruleData, ownerId = null) {
  * @param {object} options - 查询选项
  * @param {boolean} options.isAdmin - 是否为管理员（管理员可查看所有规则）
  * @param {number[]} [options.ownerIds] - 仅当 isAdmin 时有效；有值时只查这些负责人下的规则，空/未传表示不按负责人过滤
+ * @param {number|null} [options.viewerOwnerId] - 非管理员必填：当前登录用户所属负责人 ID，列表按「同一负责人下所有用户创建的规则」过滤
  * @returns {Promise<Array>} 规则列表（每项为扁平对象，含 ownerId、ownerName，与旧结构兼容）
  */
 export async function getUserRules(userId, options = {}) {
-  const { isAdmin, ownerIds, onlyEnabled, orderBy, limit, offset } = options
+  const { isAdmin, ownerIds, onlyEnabled, orderBy, limit, offset, viewerOwnerId } = options
 
   // 显式扁平化 select：规则表全部列 + 负责人 id/name，避免 Drizzle 默认返回嵌套 { rules, users, owners }
   const selectColumns = {
@@ -146,7 +150,11 @@ export async function getUserRules(userId, options = {}) {
 
   const filters = []
   if (!isAdmin) {
-    filters.push(eq(rules.userId, userId))
+    // 模板半成品铺底方案：同一负责人下多名运营共享规则列表（按创建者 users.owner_id 对齐）
+    if (viewerOwnerId == null || !Number.isFinite(Number(viewerOwnerId))) {
+      return []
+    }
+    filters.push(eq(users.ownerId, Number(viewerOwnerId)))
   } else if (ownerIds && ownerIds.length > 0) {
     // 管理员且传了负责人 ID：只查这些负责人下的规则
     filters.push(inArray(users.ownerId, ownerIds))
@@ -177,24 +185,28 @@ export async function getUserRules(userId, options = {}) {
  * @param {number} ruleId - 规则 ID
  * @param {number} userId - 用户 ID（用于验证权限）
  * @param {boolean} isAdmin - 是否为管理员（管理员可查看所有规则）
+ * @param {number|null} [viewerOwnerId] - 非管理员：当前用户 owner_id；与列表一致，仅允许查看同负责人下创建者所属维度内的规则
  * @returns {Promise<object|null>} 规则对象或 null
  */
-export async function getRuleById(ruleId, userId, isAdmin = false) {
-  // 构建查询条件
-  let whereCondition = eq(rules.id, ruleId)
-  
-  // 非管理员用户：只能查询自己的规则
-  if (!isAdmin) {
-    whereCondition = and(whereCondition, eq(rules.userId, userId))
+export async function getRuleById(ruleId, userId, isAdmin = false, viewerOwnerId = null) {
+  if (isAdmin) {
+    const result = await db
+      .select()
+      .from(rules)
+      .where(eq(rules.id, ruleId))
+      .limit(1)
+    return result[0] || null
   }
-  
-  // 对应 SQL: SELECT * FROM rules WHERE id = ? [AND user_id = ?]
+  if (viewerOwnerId == null || !Number.isFinite(Number(viewerOwnerId))) {
+    return null
+  }
+  const oid = Number(viewerOwnerId)
   const result = await db
-    .select()
+    .select(getTableColumns(rules))
     .from(rules)
-    .where(whereCondition)
+    .innerJoin(users, eq(rules.userId, users.id))
+    .where(and(eq(rules.id, ruleId), eq(users.ownerId, oid)))
     .limit(1)
-  
   return result[0] || null
 }
 
@@ -205,16 +217,19 @@ export async function getRuleById(ruleId, userId, isAdmin = false) {
  * @param {object} updates - 要更新的字段
  * @param {boolean} isAdmin - 是否为管理员（管理员可更新所有规则）
  * @param {number|null} [ownerId] - 负责人 ID（可选，用于 rule_history.changed_by_owner_id）
+ * @param {number|null} [viewerOwnerId] - 非管理员：当前用户 owner_id，用于鉴权（与 getRuleById 一致）
  * @returns {Promise<object>} 更新结果
  */
-export async function updateRule(ruleId, userId, updates, isAdmin = false, ownerId = null) {
-  // 构建查询条件
-  let whereCondition = eq(rules.id, ruleId)
-  
-  // 非管理员用户：只能更新自己的规则
-  if (!isAdmin) {
-    whereCondition = and(whereCondition, eq(rules.userId, userId))
+export async function updateRule(ruleId, userId, updates, isAdmin = false, ownerId = null, viewerOwnerId = null) {
+  // 鉴权在 getRuleById；此处仅按主键更新，避免与「同负责人共享规则」冲突
+  const whereCondition = eq(rules.id, ruleId)
+
+  const oldRule = await getRuleById(ruleId, userId, isAdmin, viewerOwnerId)
+  if (!oldRule) {
+    throw new Error('规则不存在或无权访问')
   }
+  const snapshotBefore = buildRuleSnapshot(oldRule)
+
   if (Object.prototype.hasOwnProperty.call(updates, 'targetIds') && updates.targetIds !== undefined) {
     syncTargetByAccount(updates)
   }
@@ -231,7 +246,7 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false, owner
   }
   
   // 返回更新后的规则（管理员可以查看所有规则）
-  const updatedRule = await getRuleById(ruleId, userId, isAdmin)
+  const updatedRule = await getRuleById(ruleId, userId, isAdmin, viewerOwnerId)
   const changeType = (Object.keys(updates).length === 1 && Object.prototype.hasOwnProperty.call(updates, 'enabled'))
     ? 'TOGGLE'
     : 'UPDATE'
@@ -243,7 +258,8 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false, owner
       source,
       changedByUserId: userId,
       changedByOwnerId: ownerId ?? null,
-      ruleSnapshot: buildRuleSnapshot(updatedRule)
+      ruleSnapshot: buildRuleSnapshot(updatedRule),
+      snapshotBefore: changeType === 'UPDATE' || changeType === 'TOGGLE' ? snapshotBefore : null
     })
   } catch (e) {
     logger.warn('[rule_history] updateRule insert history failed', { ruleId, err: e.message })
@@ -256,18 +272,21 @@ export async function updateRule(ruleId, userId, updates, isAdmin = false, owner
  * @param {number} ruleId - 规则 ID
  * @param {number} userId - 用户 ID（用于验证权限）
  * @param {boolean} isAdmin - 是否为管理员（管理员可删除所有规则）
+ * @param {number|null} [viewerOwnerId] - 非管理员：当前用户 owner_id（按创建者负责人鉴权，与列表一致）
  * @returns {Promise<boolean>} 是否删除成功
  */
-export async function deleteRule(ruleId, userId, isAdmin = false) {
+export async function deleteRule(ruleId, userId, isAdmin = false, viewerOwnerId = null) {
   const connection = await pool.getConnection()
   try {
     await connection.beginTransaction()
 
     // 1) SELECT 规则快照（同一事务内，用于写入 rule_history）
     const selectSql = isAdmin
-      ? 'SELECT * FROM rules WHERE id = ? LIMIT 1'
-      : 'SELECT * FROM rules WHERE id = ? AND user_id = ? LIMIT 1'
-    const selectParams = isAdmin ? [ruleId] : [ruleId, userId]
+      ? 'SELECT r.* FROM rules r WHERE r.id = ? LIMIT 1'
+      : `SELECT r.* FROM rules r
+         INNER JOIN users u ON r.user_id = u.id
+         WHERE r.id = ? AND u.owner_id = ? LIMIT 1`
+    const selectParams = isAdmin ? [ruleId] : [ruleId, viewerOwnerId]
     const [selectResult] = await connection.execute(selectSql, selectParams)
     const row = selectResult?.[0]
     if (!row) {
@@ -284,6 +303,7 @@ export async function deleteRule(ruleId, userId, isAdmin = false) {
       changedByUserId: userId,
       changedByOwnerId: null,
       ruleSnapshot: snapshot,
+      snapshotBefore: null,
       connection
     })
 
@@ -296,8 +316,10 @@ export async function deleteRule(ruleId, userId, isAdmin = false) {
     // 4) DELETE rules
     const deleteRuleSql = isAdmin
       ? 'DELETE FROM rules WHERE id = ? LIMIT 1'
-      : 'DELETE FROM rules WHERE id = ? AND user_id = ? LIMIT 1'
-    const deleteRuleParams = isAdmin ? [ruleId] : [ruleId, userId]
+      : `DELETE r FROM rules r
+         INNER JOIN users u ON r.user_id = u.id
+         WHERE r.id = ? AND u.owner_id = ?`
+    const deleteRuleParams = isAdmin ? [ruleId] : [ruleId, viewerOwnerId]
     const [ruleResult] = await connection.execute(deleteRuleSql, deleteRuleParams)
     if (!ruleResult || ruleResult.affectedRows === 0) {
       await connection.rollback()
@@ -323,11 +345,11 @@ export async function deleteRule(ruleId, userId, isAdmin = false) {
  * @param {boolean} enabled - 是否启用
  * @param {boolean} isAdmin - 是否为管理员（管理员可操作所有规则）
  * @param {number|null} [ownerId] - 负责人 ID（可选，用于 rule_history）
+ * @param {number|null} [viewerOwnerId] - 非管理员：当前用户 owner_id
  * @returns {Promise<object>} 更新后的规则
  */
-export async function toggleRule(ruleId, userId, enabled, isAdmin = false, ownerId = null) {
-  // 对应 SQL: UPDATE rules SET enabled = ? WHERE id = ? [AND user_id = ?]
-  return await updateRule(ruleId, userId, { enabled }, isAdmin, ownerId)
+export async function toggleRule(ruleId, userId, enabled, isAdmin = false, ownerId = null, viewerOwnerId = null) {
+  return await updateRule(ruleId, userId, { enabled }, isAdmin, ownerId, viewerOwnerId)
 }
 
 

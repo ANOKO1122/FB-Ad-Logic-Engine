@@ -14,7 +14,8 @@
       </div>
     </div>
 
-    <p v-if="!isSuperAdmin" class="tip">仅超级管理员可升降管理员角色；你可维护普通用户的负责人归属。</p>
+    <p v-if="!isSuperAdmin" class="tip">仅超级管理员可升降管理员角色。管理员与超级管理员均可删除普通用户（无关联规则时）。你可维护普通用户的负责人归属。</p>
+    <p v-else class="tip">你可升降管理员角色，并可删除无关联规则的普通用户；请谨慎操作。</p>
 
     <div v-if="loading" class="loading">加载中…</div>
 
@@ -57,21 +58,30 @@
                 <span v-else class="muted">—</span>
               </td>
               <td class="actions-cell">
-                <template v-if="isSuperAdmin && u.status === 'active'">
+                <div class="row-actions">
+                  <template v-if="isSuperAdmin && u.status === 'active'">
+                    <button
+                      v-if="u.role === 'staff'"
+                      type="button"
+                      class="btn small secondary"
+                      @click="setRole(u, 'admin')"
+                    >设为管理员</button>
+                    <button
+                      v-else-if="u.role === 'admin'"
+                      type="button"
+                      class="btn small danger"
+                      @click="setRole(u, 'staff')"
+                    >降为普通用户</button>
+                  </template>
                   <button
-                    v-if="u.role === 'staff'"
-                    type="button"
-                    class="btn small secondary"
-                    @click="setRole(u, 'admin')"
-                  >设为管理员</button>
-                  <button
-                    v-else-if="u.role === 'admin'"
+                    v-if="canDeleteStaff(u)"
                     type="button"
                     class="btn small danger"
-                    @click="setRole(u, 'staff')"
-                  >降为普通用户</button>
-                </template>
-                <span v-else class="muted">—</span>
+                    :disabled="deletingId === u.id"
+                    @click="deleteUser(u)"
+                  >{{ deletingId === u.id ? '删除中…' : '删除用户' }}</button>
+                  <span v-if="!rowHasActions(u)" class="muted">—</span>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -93,8 +103,11 @@ export default {
     const loading = ref(false)
     const statusFilter = ref('active')
     const myRole = ref('')
+    const myUserId = ref(null)
+    const deletingId = ref(null)
 
     const isSuperAdmin = computed(() => myRole.value === 'super_admin')
+    const isAdminLike = computed(() => myRole.value === 'admin' || myRole.value === 'super_admin')
 
     const roleLabel = (r) => {
       if (r === 'super_admin') return '超管'
@@ -112,8 +125,41 @@ export default {
       try {
         const r = await authFetch('/api/me')
         const d = await r.json()
-        if (d.user) myRole.value = d.user.role || ''
+        if (d.user) {
+          myRole.value = d.user.role || ''
+          myUserId.value = d.user.id != null ? Number(d.user.id) : null
+        }
       } catch {}
+    }
+
+    const canDeleteStaff = (u) => {
+      if (!isAdminLike.value || u.role !== 'staff') return false
+      if (myUserId.value != null && Number(u.id) === myUserId.value) return false
+      return true
+    }
+
+    const rowHasActions = (u) => {
+      const roleBtns = isSuperAdmin.value && u.status === 'active' && (u.role === 'staff' || u.role === 'admin')
+      return roleBtns || canDeleteStaff(u)
+    }
+
+    const deleteUser = async (u) => {
+      if (!canDeleteStaff(u)) return
+      if (!confirm(`确定永久删除普通用户「${u.username}」？不可恢复。若该用户仍有关联规则，将拒绝删除。`)) return
+      deletingId.value = u.id
+      try {
+        const r = await authFetch(`/api/admin/users/${u.id}`, { method: 'DELETE' })
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || !d.success) {
+          alert(d.error || '删除失败')
+          return
+        }
+        await load()
+      } catch (e) {
+        alert(e.message || String(e))
+      } finally {
+        deletingId.value = null
+      }
     }
 
     const loadOwners = async () => {
@@ -209,7 +255,11 @@ export default {
       rulesCount,
       load,
       onOwnerChange,
-      setRole
+      setRole,
+      canDeleteStaff,
+      rowHasActions,
+      deleteUser,
+      deletingId
     }
   }
 }
@@ -233,6 +283,12 @@ export default {
   display: flex;
   gap: 12px;
   align-items: center;
+}
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 .select {
   padding: 8px 12px;

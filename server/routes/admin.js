@@ -4,8 +4,31 @@ import pool from '../db/connection.js'
 import { requireAuth, requireActive, requireAdmin, requireSuperAdmin } from '../middleware/authJwt.js'
 import { getCronStatus } from '../services/cronService.js'
 import { validateTemplateBody } from '../utils/templateValidator.js'
+import { diffRuleSnapshots } from '../services/ruleHistoryService.js'
+import { bootstrapTemplateForAllOwnersIncremental } from '../services/templateBootstrapService.js'
 
 const router = Router()
+
+/** MySQL JSON 列可能为 string / Buffer / object */
+function parseMysqlJson(val) {
+  if (val == null) return null
+  if (typeof val === 'object' && !Buffer.isBuffer(val)) return val
+  if (Buffer.isBuffer(val)) {
+    try {
+      return JSON.parse(val.toString('utf8'))
+    } catch {
+      return null
+    }
+  }
+  if (typeof val === 'string') {
+    try {
+      return JSON.parse(val)
+    } catch {
+      return null
+    }
+  }
+  return null
+}
 
 router.use(requireAuth, requireActive, requireAdmin)
 
@@ -180,6 +203,47 @@ router.post('/users/:id/reject', async (req, res) => {
     res.json({ success: true, message: `已拒绝用户 ${users[0].username} 的注册申请` })
   } catch (err) {
     res.status(500).json({ error: '操作失败', code: 'ERROR' })
+  }
+})
+
+// DELETE /api/admin/users/:id — admin 与 super_admin 可删除普通用户(staff)；不可删自己、不可删管理员、有规则则禁止
+router.delete('/users/:id', async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10)
+    if (!Number.isFinite(userId) || userId < 1) {
+      return res.status(400).json({ error: '无效的用户 ID', code: 'INVALID_ID' })
+    }
+    if (userId === req.user.id) {
+      return res.status(400).json({ error: '不可删除当前登录账号', code: 'CANNOT_DELETE_SELF' })
+    }
+
+    const [targets] = await pool.execute(
+      'SELECT id, username, role, status FROM users WHERE id = ?',
+      [userId]
+    )
+    if (targets.length === 0) return res.status(404).json({ error: '用户不存在', code: 'NOT_FOUND' })
+    const t = targets[0]
+    if (t.role !== 'staff') {
+      return res.status(400).json({ error: '仅可删除普通用户（staff）', code: 'DELETE_ONLY_STAFF' })
+    }
+
+    const [ruleRows] = await pool.execute(
+      'SELECT COUNT(*) AS cnt FROM rules WHERE user_id = ?',
+      [userId]
+    )
+    const ruleCnt = Number(ruleRows[0]?.cnt ?? 0)
+    if (ruleCnt > 0) {
+      return res.status(400).json({
+        error: `该用户仍有关联规则（${ruleCnt} 条），请先清理规则后再删除`,
+        code: 'HAS_RULES'
+      })
+    }
+
+    await pool.execute('DELETE FROM users WHERE id = ?', [userId])
+    res.json({ success: true, message: `已删除用户「${t.username}」` })
+  } catch (err) {
+    logger.error('删除用户失败:', err)
+    res.status(500).json({ error: '删除失败', code: 'ERROR', details: err?.message })
   }
 })
 
@@ -388,6 +452,42 @@ router.post('/account-mappings/assign', async (req, res) => {
   }
 })
 
+// PATCH /api/admin/account-mappings/status — 系统内启用/停用广告账户映射（is_active；不调用 Facebook 关户/解绑）
+router.patch('/account-mappings/status', async (req, res) => {
+  try {
+    const { fb_account_id, is_active } = req.body || {}
+    const rawId = fb_account_id != null ? String(fb_account_id).trim() : ''
+    if (!rawId || !/^act_[0-9]+$/i.test(rawId)) {
+      return res.status(400).json({ error: '无效的广告账户 ID（需 act_ 数字）', code: 'INVALID_ACCOUNT_ID' })
+    }
+    const active = is_active === true || is_active === 1 || is_active === '1'
+    const inactive = is_active === false || is_active === 0 || is_active === '0'
+    if (!active && !inactive) {
+      return res.status(400).json({ error: '请提供 is_active（true/false 或 1/0）', code: 'MISSING_IS_ACTIVE' })
+    }
+    const next = active ? 1 : 0
+
+    const [maps] = await pool.execute(
+      'SELECT id, fb_account_id, is_active FROM account_mappings WHERE fb_account_id = ?',
+      [rawId]
+    )
+    if (maps.length === 0) {
+      return res.status(404).json({ error: '本地无此广告账户映射', code: 'MAPPING_NOT_FOUND' })
+    }
+
+    await pool.execute('UPDATE account_mappings SET is_active = ? WHERE fb_account_id = ?', [next, rawId])
+    res.json({
+      success: true,
+      message: next === 1 ? `已启用 ${rawId}（将参与同步与规则调度）` : `已停用 ${rawId}（不参与同步与规则调度；普通用户不可见）`,
+      fb_account_id: rawId,
+      is_active: next
+    })
+  } catch (err) {
+    logger.error('更新账户映射状态失败:', err)
+    res.status(500).json({ error: '操作失败', code: 'ERROR', details: err?.message })
+  }
+})
+
 // POST /api/admin/account-mappings/batch-import
 // M4.3：整批校验通过后一次性落库；任一错误则 400 + errors，不写库
 const FB_ACCOUNT_ID_RE = /^act_[0-9]+$/i
@@ -488,7 +588,7 @@ router.post('/account-mappings/batch-import', async (req, res) => {
         await connection.execute(
           `INSERT INTO account_mappings (fb_account_id, owner_id, is_active)
            VALUES (?, ?, 1)
-           ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id), is_active = 1`,
+           ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id)`,
           [row.fb_account_id, row.owner_id]
         )
       }
@@ -509,6 +609,158 @@ router.post('/account-mappings/batch-import', async (req, res) => {
   } catch (err) {
     logger.error('批量导入失败:', err)
     res.status(500).json({ error: '操作失败', code: 'ERROR' })
+  }
+})
+
+// ===========================
+// M4.4 人为规则审计（仅人为；排除 SYSTEM_REFRESH / 无操作用户）
+// ===========================
+
+// GET /api/admin/rule-history
+router.get('/rule-history', async (req, res) => {
+  try {
+    const ruleIdQ = req.query.rule_id != null ? parseInt(req.query.rule_id, 10) : null
+    const byUserQ = req.query.changed_by_user_id != null ? parseInt(req.query.changed_by_user_id, 10) : null
+    const changeTypeQ = req.query.change_type != null ? String(req.query.change_type).trim().toUpperCase() : null
+    const allowedTypes = ['CREATE', 'UPDATE', 'DELETE', 'TOGGLE']
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30))
+    const offset = (page - 1) * limit
+    const fromD = req.query.from && String(req.query.from).trim() ? String(req.query.from).trim() : null
+    const toD = req.query.to && String(req.query.to).trim() ? String(req.query.to).trim() : null
+
+    let where = `
+      WHERE h.change_type IN ('CREATE','UPDATE','DELETE','TOGGLE')
+        AND h.changed_by_user_id IS NOT NULL
+        AND h.source IN ('api_save', 'api_toggle')
+    `
+    const params = []
+    if (Number.isFinite(ruleIdQ) && ruleIdQ > 0) {
+      where += ' AND h.rule_id = ?'
+      params.push(ruleIdQ)
+    }
+    if (Number.isFinite(byUserQ) && byUserQ > 0) {
+      where += ' AND h.changed_by_user_id = ?'
+      params.push(byUserQ)
+    }
+    if (changeTypeQ && allowedTypes.includes(changeTypeQ)) {
+      where += ' AND h.change_type = ?'
+      params.push(changeTypeQ)
+    }
+    if (fromD) {
+      where += ' AND h.changed_at >= ?'
+      params.push(fromD)
+    }
+    if (toD) {
+      where += ' AND h.changed_at < DATE_ADD(?, INTERVAL 1 DAY)'
+      params.push(toD)
+    }
+
+    const [countRows] = await pool.execute(
+      `SELECT COUNT(*) AS total FROM rule_history h ${where}`,
+      params
+    )
+    const total = Number(countRows[0]?.total ?? 0)
+
+    // LIMIT/OFFSET 不用预处理占位符：部分 MySQL 版本对 mysqld_stmt_execute 绑定 LIMIT 会报 ER_WRONG_ARGUMENTS(1210)
+    const safeLimit = Math.min(100, Math.max(1, Math.floor(Number(limit)) || 1))
+    const safeOffset = Math.max(0, Math.floor(Number(offset)) || 0)
+
+    const listSql = `
+      SELECT h.id, h.rule_id, h.change_type, h.changed_at, h.source,
+             h.changed_by_user_id, u.username AS changed_by_username,
+             JSON_UNQUOTE(JSON_EXTRACT(h.rule_snapshot, '$.rule_name')) AS rule_name_preview
+      FROM rule_history h
+      LEFT JOIN users u ON u.id = h.changed_by_user_id
+      ${where}
+      ORDER BY h.changed_at DESC, h.id DESC
+      LIMIT ${safeLimit} OFFSET ${safeOffset}
+    `
+    const [rows] = await pool.execute(listSql, params)
+
+    res.json({
+      success: true,
+      items: rows,
+      page,
+      limit,
+      total
+    })
+  } catch (err) {
+    logger.error('rule-history 列表失败:', err)
+    res.status(500).json({ error: '获取失败', code: 'ERROR', details: err?.message })
+  }
+})
+
+// GET /api/admin/rule-history/:id — 单条详情（含字段级差异）
+router.get('/rule-history/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10)
+    if (!Number.isFinite(id) || id < 1) {
+      return res.status(400).json({ error: '无效的记录 ID', code: 'INVALID_ID' })
+    }
+    const [rows] = await pool.execute(
+      `SELECT h.*, u.username AS changed_by_username
+       FROM rule_history h
+       LEFT JOIN users u ON u.id = h.changed_by_user_id
+       WHERE h.id = ?`,
+      [id]
+    )
+    if (!rows.length) {
+      return res.status(404).json({ error: '记录不存在', code: 'NOT_FOUND' })
+    }
+    const row = rows[0]
+    const human =
+      ['CREATE', 'UPDATE', 'DELETE', 'TOGGLE'].includes(row.change_type) &&
+      row.changed_by_user_id != null &&
+      ['api_save', 'api_toggle'].includes(row.source)
+    if (!human) {
+      return res.status(404).json({ error: '该记录非人为审计范围', code: 'NOT_FOUND' })
+    }
+
+    const snapshotAfter = parseMysqlJson(row.rule_snapshot)
+    const snapshotBefore = parseMysqlJson(row.snapshot_before)
+
+    let diff
+    if (row.change_type === 'CREATE') {
+      diff = {
+        changes: [],
+        notice: '新建规则：以下为创建时的完整配置（见 snapshot_after）。'
+      }
+    } else if (row.change_type === 'DELETE') {
+      diff = {
+        changes: [],
+        notice: '规则已删除：以下为删除时保留的最终配置快照（见 snapshot_after）。'
+      }
+    } else if ((row.change_type === 'UPDATE' || row.change_type === 'TOGGLE') && !snapshotBefore) {
+      diff = {
+        changes: [],
+        notice: '该记录在启用「变更前快照」之前产生，无字段级对比；以下为当时保存后的完整配置。'
+      }
+    } else {
+      diff = diffRuleSnapshots(snapshotBefore, snapshotAfter)
+    }
+
+    res.json({
+      success: true,
+      record: {
+        id: row.id,
+        rule_id: row.rule_id,
+        change_type: row.change_type,
+        changed_at: row.changed_at,
+        source: row.source,
+        changed_by_user_id: row.changed_by_user_id,
+        changed_by_username: row.changed_by_username,
+        changed_by_owner_id: row.changed_by_owner_id
+      },
+      snapshot_before: snapshotBefore,
+      snapshot_after: snapshotAfter,
+      diff,
+      added_ids: parseMysqlJson(row.added_ids),
+      removed_ids: parseMysqlJson(row.removed_ids)
+    })
+  } catch (err) {
+    logger.error('rule-history 详情失败:', err)
+    res.status(500).json({ error: '获取失败', code: 'ERROR', details: err?.message })
   }
 })
 
@@ -591,8 +843,43 @@ router.post('/templates', async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
       [name.trim(), slugTrim, description?.trim() || null, whenLinesJson, when_time_window, whenCustomRangeJson, actionsJson, sort, userId, userId]
     )
-    const [inserted] = await pool.execute('SELECT id, name, slug, created_at FROM rule_templates WHERE slug = ?', [slugTrim])
-    res.status(201).json({ success: true, template: inserted[0], message: '模板创建成功' })
+    const [insertedRows] = await pool.execute(
+      `SELECT id, name, slug, when_lines, when_time_window, when_custom_range, actions, created_at
+       FROM rule_templates
+       WHERE slug = ? LIMIT 1`,
+      [slugTrim]
+    )
+    const inserted = insertedRows?.[0]
+
+    // 增量铺底：管理员新建模板后，异步为每个活跃 owner 尝试插入 1 条半成品（幂等跳过）
+    if (inserted) {
+      setImmediate(async () => {
+        try {
+          const summary = await bootstrapTemplateForAllOwnersIncremental({
+            templateRecord: inserted,
+            actorUserId: userId ?? null,
+            actorOwnerId: req.user?.owner_id ?? null
+          })
+          logger.info('[template-bootstrap] incremental bootstrap done', {
+            templateId: inserted.id,
+            templateSlug: inserted.slug,
+            ...summary
+          })
+        } catch (e) {
+          logger.error('[template-bootstrap] incremental bootstrap failed:', {
+            templateId: inserted.id,
+            templateSlug: inserted.slug,
+            err: e.message
+          })
+        }
+      })
+    }
+
+    res.status(201).json({
+      success: true,
+      template: inserted ? { id: inserted.id, name: inserted.name, slug: inserted.slug, created_at: inserted.created_at } : null,
+      message: '模板创建成功'
+    })
   } catch (err) {
     logger.error('创建模板失败:', err)
     res.status(500).json({ error: '创建失败', code: 'ERROR', details: err?.message })

@@ -777,7 +777,7 @@ class FacebookMarketingAPI {
                   const requestPromise = method === 'POST' 
                     ? axios.post(url, body, config) 
                     : axios.get(url, config)
-                  
+
                   const resp = await fetchWithTimeout(requestPromise, timeout)
                   
                   // 检查 Token 错误
@@ -836,7 +836,7 @@ class FacebookMarketingAPI {
             const requestPromise = method === 'POST' 
               ? axios.post(url, body, config) 
               : axios.get(url, config)
-            
+
             const response = await fetchWithTimeout(requestPromise, timeout)
             
             // 检查 Token 错误
@@ -921,7 +921,7 @@ class FacebookMarketingAPI {
         const requestPromise = method === 'POST' 
           ? axios.post(url, body, config) 
           : axios.get(url, config)
-        
+
         const response = await fetchWithTimeout(requestPromise, timeout)
         
         // 检查 Token 错误
