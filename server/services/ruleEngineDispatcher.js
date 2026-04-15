@@ -49,8 +49,12 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
       queryCount = 1
       return { targetAdIds, queryCount }
     } catch (err) {
-      // 动态快照读失败时降级到旧逻辑，避免阻塞规则执行
-      logger.warn(`   [Dispatcher] 规则 ${rule.id} 读取动态快照失败，回退旧逻辑:`, err.message)
+      // 动态快照读失败：不得回退到「全账户广告」，否则会把圈外广告纳入评估（与 use_dynamic_scope 语义冲突）
+      logger.warn(
+        `   [Dispatcher] 规则 ${rule.id} 读取动态快照失败，本规则本轮跳过评估（fail-closed）:`,
+        err.message
+      )
+      return { targetAdIds: [], queryCount: 0 }
     }
   }
 
@@ -221,6 +225,17 @@ export function evaluateRuleWithCache(ruleEngine, rule, loadResult) {
   if (cacheKey == null) return []
   const fullData = loadResult.cache.get(cacheKey) || []
   const targetIds = loadResult.targetAdIdsByRuleId.get(rule.id) || []
+  const useDyn = Boolean(rule.useDynamicScope ?? rule.use_dynamic_scope)
+  // 动态筛选：目标仅以 rule_matched_objects 为准。快照为空时不得用「本批 union」全量数据评估，
+  // 否则同账户多规则一轮扫描时会把其它规则圈内的广告误纳入本条规则（名称条件被绕过）。
+  if (useDyn && targetIds.length === 0) {
+    if (fullData.length > 0) {
+      logger.warn(
+        `   [Dispatcher] 规则 ${rule.id} use_dynamic_scope=1 但快照目标为空，跳过本规则评估（避免误用 union=${fullData.length} 条），见 DYNAMIC_SCOPE_EMPTY_SKIP_UNION`
+      )
+    }
+    return ruleEngine.evaluateRuleWithData(rule, [])
+  }
   const filterSet = targetIds.length > 0 ? new Set(targetIds) : null
   const ruleDataArray = filterSet
     ? fullData.filter(row => filterSet.has(String(row?.ad_id || '')))

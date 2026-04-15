@@ -20,3 +20,19 @@ node server/scripts/upsert-account-mapping.js
 
  mysql -h 127.0.0.1 -P 3306 -u root -p fb_ad_brain
 这是进入云端数据库的命令
+
+
+可直接执行的数据库步骤（先查再改）
+A. 先查某个用户的绑定关系
+SELECT u.id, u.username, u.status, aim.provider, aim.provider_user_id, aim.dingtalk_userid
+FROM users u
+LEFT JOIN auth_identity_mappings aim ON aim.user_id = u.id AND aim.provider='dingtalk'
+WHERE u.username = '目标用户名';
+B. 软封禁（阻止登录）
+UPDATE users
+SET status='banned', updated_at=NOW()
+WHERE username='目标用户名';
+C. 硬解绑（删除钉钉映射）
+DELETE FROM auth_identity_mappings
+WHERE provider='dingtalk'
+  AND user_id = (SELECT id FROM users WHERE username='目标用户名' LIMIT 1);
