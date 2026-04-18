@@ -1,5 +1,5 @@
 // 快速检查 token 是否过期
-const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjI1LCJpYXQiOjE3Njk1ODk1MTAsImV4cCI6MTc3MDE5NDMxMH0.2wFTvuwSGH6NhSGzufxZxEnmP0P-4MNxEEFLwAEFpfM"
+const token = ""
 
 // 解码 payload（中间部分）
 const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString())
