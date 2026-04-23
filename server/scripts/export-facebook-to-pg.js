@@ -290,6 +290,8 @@ async function sleep(ms) {
 
 async function main() {
   const argv = parseArgs(process.argv.slice(2))
+  let mysqlPool = null
+  let pgPool = null
 
   let statDates = []
 
@@ -306,14 +308,24 @@ async function main() {
 
   console.log(`[export-pg] 将同步 stat_date 列表: ${statDates.join(', ')}`)
 
-  const { default: mysqlPool } = await import('../db/connection.js')
-  const pgPool = createPgPool()
+  const mysqlModule = await import('../db/connection.js')
+  mysqlPool = mysqlModule.default
+  pgPool = createPgPool()
 
   try {
     const summary = await runSync(mysqlPool, pgPool, statDates, argv.batchSize)
     console.log('[export-pg] 完成', JSON.stringify(summary, null, 2))
   } finally {
-    await pgPool.end()
+    const closeTasks = []
+    if (mysqlPool?.end) {
+      closeTasks.push(mysqlPool.end())
+    }
+    if (pgPool?.end) {
+      closeTasks.push(pgPool.end())
+    }
+    if (closeTasks.length > 0) {
+      await Promise.allSettled(closeTasks)
+    }
   }
 }
 
