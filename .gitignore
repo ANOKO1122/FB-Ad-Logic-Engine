@@ -11,4 +11,5 @@ logs/
 .idea/
 
 .env.auth
+.env.pg
 

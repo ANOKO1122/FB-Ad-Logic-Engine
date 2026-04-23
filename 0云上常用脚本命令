@@ -36,3 +36,48 @@ C. 硬解绑（删除钉钉映射）
 DELETE FROM auth_identity_mappings
 WHERE provider='dingtalk'
   AND user_id = (SELECT id FROM users WHERE username='目标用户名' LIMIT 1);
+
+
+
+进入PG数据库的方法：
+cd /root/work/FB-Ad-Logic-Engine
+set -a
+. ./.env.pg
+set +a
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE"
+
+PGPASSWORD='你的密码' psql -h pgm-bp1wh770x766jc896o.pg.rds.aliyuncs.com -p 5432 -U xiangqianxi06 -d shoplazza
+
+
+这个脚本的设计思路是“外壳调度 + 复用现有导出器”：
+外壳负责参数校验、加载 .env.pg、flock 防重入、日志输出
+真正的数据导出仍走你现有的 server/scripts/export-facebook-to-pg.js
+所以你以后想回填几天就传几天，避免再维护第二套同步逻辑
+你现在执行这几步就行：
+cd /root/work/FB-Ad-Logic-Engine
+chmod +x scripts/export-facebook-to-pg-backfill.sh
+./scripts/export-facebook-to-pg-backfill.sh 3
+如果你想回填 7 天：
+./scripts/export-facebook-to-pg-backfill.sh 7
+
+行后怎么验证
+先在你同事的 PG 里查回填结果，例如回填近 3 天：
+SELECT stat_date, COUNT(*) AS rows_cnt, ROUND(SUM(spend), 2) AS total_spend
+FROM facebook_ads_daily_export
+WHERE stat_date >= current_date - 3
+GROUP BY stat_date
+ORDER BY stat_date DESC;
+如果你这次主要是补 2026-04-19、2026-04-20、2026-04-21，也可以更精确地查：
+SELECT stat_date, COUNT(*) AS rows_cnt, ROUND(SUM(spend), 2) AS total_spend
+FROM facebook_ads_daily_export
+WHERE stat_date IN ('2026-04-19', '2026-04-20', '2026-04-21')
+GROUP BY stat_date
+ORDER BY stat_date;
+补充说明
+如果你不是想“近 N 天”，而是只补某一个固定日期，直接用底层脚本更合适：
+cd /root/work/FB-Ad-Logic-Engine
+set -a
+. ./.env.pg
+set +a
+node server/scripts/export-facebook-to-pg.js --date=2026-04-20
+我没有替你实际执行命令。你先跑 ./scripts/export-facebook-to-pg-backfill.sh 3，把终端输出或者 PG 查询结果贴给我，我再帮你判断这次是否补齐成功。
