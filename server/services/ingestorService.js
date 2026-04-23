@@ -10,6 +10,8 @@ import pool from '../db/connection.js'
 import { eq, and, gte } from 'drizzle-orm'
 import { DateTime } from 'luxon'
 import pLimit from 'p-limit'
+import { isTimeoutError, withTimeout } from '../utils/withTimeout.js'
+import { HEARTBEAT_RESULT_CODE } from './heartbeatStatusContract.js'
 import { 
   parseUsageHeader, 
   sleepBasedOnUsage,
@@ -286,8 +288,12 @@ function calculateBackoffDelay(attempt) {
  * @param {number} ownerId
  * @param {string|null} timezoneName
  * @param {import('../index.js').FacebookMarketingAPI|null} [facebookApi] - 可选，传入时复用（如心跳内同轮做 Piggyback 用同一实例）
+ * @param {{ signal?: AbortSignal|null }} [options]
  */
-export async function syncAccountTodayStats(accountId, ownerId, timezoneName = null, facebookApi = null) {
+export async function syncAccountTodayStats(accountId, ownerId, timezoneName = null, facebookApi = null, options = {}) {
+  const signal = options?.signal || null
+
+  throwIfSignalAborted(signal, `账户 ${accountId} 的今日同步在开始前已被取消`)
   // 记录账户调用时间（账户级别限流保护）
   recordAccountCall(accountId)
 
@@ -320,7 +326,7 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
       // 如果数据库中没有时区，才去API查询
       logger.info(`📡 数据库中没有时区配置，从 Facebook API 获取账户 ${accountId} 的时区...`)
       try {
-    const apiTimezone = await facebookApi.getAccountTimezone(accountId)
+    const apiTimezone = await facebookApi.getAccountTimezone(accountId, { signal })
         if (apiTimezone && apiTimezone !== 'UTC') {
     logger.info(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
           // 更新数据库
@@ -340,6 +346,9 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
           logger.info(`⚠️  API返回时区为UTC或失败，使用默认值: ${timezoneName}`)
         }
       } catch (error) {
+        if (isAbortLikeError(error)) {
+          throw error
+        }
         // API查询失败，不更新数据库，使用传入的时区或默认UTC
         logger.warn(`⚠️  获取账户 ${accountId} 时区失败，使用数据库时区或默认UTC:`, error.message)
         timezoneName = timezoneName || 'UTC'
@@ -362,12 +371,14 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
     try {
       // 直接从 API 查询 insights（不指定 ad_id），Facebook 会返回账户下所有广告的 insights
       // 优先在 FB 端通过 filtering 做 spend>0 源头过滤（可通过 DISABLE_SPEND_FILTERING 回退到纯本地过滤）
+      throwIfSignalAborted(signal, `账户 ${accountId} 在拉取 Today Insights 前已被取消`)
       insights = await facebookApi.getAdInsights(accountId, {
         preset: 'today'
       }, {
         level: 'ad',
         useAccountAttributionSetting: true,
-        spendGreaterThanZero: true
+        spendGreaterThanZero: true,
+        signal
       })
       
       // 本地仍保留 spend>0 过滤作为兜底，防止 filtering 失效或被关闭时写入 0 花费快照
@@ -377,6 +388,7 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
       })
       
       if (insights.length === 0) {
+        throwIfSignalAborted(signal, `账户 ${accountId} 在无 Today 数据返回前已被取消`)
         logger.info(`⚠️  账户 ${accountId} 没有 spend>0 的广告（API 查询结果），跳过同步`)
         return {
           success: true,
@@ -397,7 +409,8 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
 
       if (activeAdIds.length > 0) {
         logger.info(`📋 批量解析活跃广告元数据（${activeAdIds.length} 个，同轮仅此一次 resolve）...`)
-        const allAdsWithStructure = await facebookApi.resolveObjectsByIds(activeAdIds, { fields: STRUCTURE_FIELDS })
+        throwIfSignalAborted(signal, `账户 ${accountId} 在解析广告元数据前已被取消`)
+        const allAdsWithStructure = await facebookApi.resolveObjectsByIds(activeAdIds, { fields: STRUCTURE_FIELDS, signal })
         allAdsWithStructure.forEach(ad => {
           const adId = String(ad.id || '')
           if (!adId) return
@@ -427,8 +440,12 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
         }
       })
       // 写入时兜底：若仍有 campaign_id/adset_id 为空，从 structure_ads 补齐（不增加 FB 调用）
+      throwIfSignalAborted(signal, `账户 ${accountId} 在写库前已被取消`)
       await fillCampaignAdsetFromStructure(accountId, insights)
     } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw error
+      }
       logger.error(`❌ API 嗅探失败: ${error.message}`)
       return {
         success: false,
@@ -443,6 +460,7 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
     // 第3步：数据落盘（AdsPolar 队列策略）
     // 不直接写数据库，而是推入写入队列，由串行写入器统一处理
     // 这样可以彻底避免死锁问题
+    throwIfSignalAborted(signal, `账户 ${accountId} 在快照入队前已被取消`)
     logger.info(`📤 推入写入队列，共 ${insights.length} 条记录（全部为 spend>0）...`)
     
     enqueueWrite('SNAPSHOT', insights, {
@@ -480,9 +498,11 @@ export async function syncAccountTodayStats(accountId, ownerId, timezoneName = n
  * @param {FacebookMarketingAPI} facebookApi - Facebook API 客户端
  * @param {string} sinceDate - 开始日期（YYYY-MM-DD，账户时区）
  * @param {string} untilDate - 结束日期（YYYY-MM-DD，账户时区）
+ * @param {{ signal?: AbortSignal|null }} [options]
  * @returns {Promise<Array>} 按日数据数组，每个元素包含 date 字段
  */
-async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, untilDate) {
+async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, untilDate, options = {}) {
+  const signal = options?.signal || null
   logger.info(`📅 按日拉取数据: ${sinceDate} ~ ${untilDate}，共 ${adIds.length} 个广告`)
   
   if (!adIds || adIds.length === 0) {
@@ -500,6 +520,7 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
   
   // 遍历每个批次
   for (let i = 0; i < adIdChunks.length; i++) {
+    throwIfSignalAborted(signal, `账户 ${accountId} 在按日批次 ${i + 1} 前已被取消`)
     const chunk = adIdChunks[i]
     logger.info(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
     
@@ -520,7 +541,8 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
       
       const response = await facebookApi.makeRequest(batchUrl, batchParams, 'POST', null, { 
         returnHeaders: true,
-        timeout: 45000 
+        timeout: 45000,
+        signal
       })
       
       const responseData = (response && typeof response === 'object' && 'data' in response) 
@@ -539,8 +561,10 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
       const usageHeader = responseHeaders['x-business-use-case-usage'] || responseHeaders['x-business-use-case-usage'.toLowerCase()]
       if (usageHeader) {
         const usageInfo = parseUsageHeader(usageHeader)
+        throwIfSignalAborted(signal, `账户 ${accountId} 在按日批次休眠前已被取消`)
         await sleepBasedOnUsage(usageInfo)
       } else if (i < adIdChunks.length - 1) {
+        throwIfSignalAborted(signal, `账户 ${accountId} 在按日批次间隔前已被取消`)
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
       
@@ -577,6 +601,9 @@ async function fetchInsightsByDay(accountId, adIds, facebookApi, sinceDate, unti
         }
       })
     } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw error
+      }
       logger.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
       continue
     }
@@ -711,13 +738,16 @@ async function updateDailyStatsFromInsights(dailyInsights, accountId, ownerId, t
  * @param {Array<string>} adIds - 所有广告ID列表（已废弃，不再使用，保留参数以兼容旧代码）
  * @param {string} timezoneName - 账户时区
  * @param {number} daysBack - 回溯天数（默认 7 天）
+ * @param {{ signal?: AbortSignal|null }} [options]
  * @returns {Promise<Array<string>>} 筛选后的广告ID列表（只包含 spend>0 的广告）
  */
-async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
+async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7, options = {}) {
+  const signal = options?.signal || null
   // 【AdsPolar策略】不再依赖传入的 adIds，直接从数据库查询活跃广告
   // 这样可以避免先调用 /ads 接口拉取所有广告（包括废弃的）
   
   try {
+    throwIfSignalAborted(signal, `账户 ${accountId} 在筛选活跃广告前已被取消`)
     // 计算日期范围（账户时区）
     const now = DateTime.now().setZone(timezoneName)
     const sinceDate = now.minus({ days: daysBack }).toFormat('yyyy-MM-dd')
@@ -744,6 +774,7 @@ async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
       ) AS active_ads
     `, [accountId, sinceDate, untilDate, accountId, sinceDate, untilDate])
     
+    throwIfSignalAborted(signal, `账户 ${accountId} 在筛选活跃广告后已被取消`)
     const activeAdIds = rows.map(row => String(row.ad_id))
     
     // 【AdsPolar策略】严格模式：只返回活跃广告，无论数量多少
@@ -758,6 +789,9 @@ async function filterActiveAds(accountId, adIds, timezoneName, daysBack = 7) {
       return []
     }
   } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw error
+    }
     // 查询失败时，为了安全起见，返回空列表（不拉取任何广告）
     // 避免因为查询失败而拉取所有广告，导致 API 配额浪费
     logger.warn(`⚠️  筛选活跃广告失败，返回空列表（安全策略）:`, error.message)
@@ -849,10 +883,13 @@ export async function refreshAccountTimezoneHistory(accountId, timezoneName = nu
  * @param {string} timezoneName - 账户时区（如 'Asia/Shanghai'，优先使用数据库中的时区）
  * @param {number} daysBack - 回溯天数（默认 7 天）
  * @param {boolean} optimizeQuota - 是否优化配额（已废弃，现在总是启用，保留参数以兼容旧代码）
+ * @param {{ signal?: AbortSignal|null }} [options]
  * @returns {Promise<Object>} 同步结果 { success: boolean, todayCount: number, dailyStatsCount: number, sessionId: string }
  */
-export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName = 'UTC', daysBack = 7, optimizeQuota = false) {
+export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName = 'UTC', daysBack = 7, optimizeQuota = false, options = {}) {
+  const signal = options?.signal || null
   logger.info(`🔄 开始同步账户 ${accountId} 的滑动窗口数据（修复归因延迟）...`)
+  throwIfSignalAborted(signal, `账户 ${accountId} 的滑动窗口同步在开始前已被取消`)
   
   // 检查 Token 熔断器状态
   const breakerStatus = getCircuitBreakerStatus()
@@ -879,7 +916,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
       // 如果数据库中没有时区，才去API查询
       logger.info(`📡 数据库中没有时区配置，从 Facebook API 获取账户 ${accountId} 的时区...`)
       try {
-    const apiTimezone = await facebookApi.getAccountTimezone(accountId)
+    const apiTimezone = await facebookApi.getAccountTimezone(accountId, { signal })
         if (apiTimezone && apiTimezone !== 'UTC') {
     logger.info(`✅ 账户 ${accountId} 时区（从 API 获取）: ${apiTimezone}`)
           // 更新数据库
@@ -899,6 +936,9 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
           logger.info(`⚠️  API返回时区为UTC或失败，使用默认值: ${timezoneName}`)
         }
       } catch (error) {
+        if (isAbortLikeError(error)) {
+          throw error
+        }
         // API查询失败，不更新数据库，使用传入的时区或默认UTC
         logger.warn(`⚠️  获取账户 ${accountId} 时区失败，使用数据库时区或默认UTC:`, error.message)
         timezoneName = timezoneName || 'UTC'
@@ -911,9 +951,10 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     
     // 4. 【AdsPolar策略：Insights First】直接从数据库查询活跃广告ID，不先调用 /ads 接口
     logger.info(`📋 从数据库查询活跃广告ID（近 ${daysBack} 天内有 spend>0）...`)
-    let targetAdIds = await filterActiveAds(accountId, [], timezoneName, daysBack)
+    let targetAdIds = await filterActiveAds(accountId, [], timezoneName, daysBack, { signal })
     
       if (targetAdIds.length === 0) {
+        throwIfSignalAborted(signal, `账户 ${accountId} 在无活跃广告返回前已被取消`)
         logger.info(`⚠️  没有找到活跃广告，跳过滑动窗口同步`)
         return {
           success: true,
@@ -928,8 +969,10 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     // 6. 获取广告状态（优化：只获取目标广告的状态，使用批量查询 API）
     logger.info(`📋 获取账户 ${accountId} 的目标广告状态（批量查询，${targetAdIds.length} 个）...`)
     // 使用 resolveObjectsByIds 批量查询，避免拉取所有广告（包括废弃的）
+    throwIfSignalAborted(signal, `账户 ${accountId} 在解析滑动窗口广告状态前已被取消`)
     const adsWithStatus = await facebookApi.resolveObjectsByIds(targetAdIds, {
-      fields: 'id,name,effective_status,status,configured_status'
+      fields: 'id,name,effective_status,status,configured_status',
+      signal
     })
     const statusMap = new Map()
     adsWithStatus.forEach(ad => {
@@ -942,7 +985,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     
     // 7. 同步 Today 数据 → 写入 ad_snapshots（实时快照）
     logger.info(`📅 同步 Today 数据 → ad_snapshots...`)
-    const todayInsights = await fetchInsightsInBatches(accountId, targetAdIds, facebookApi, 'today')
+    const todayInsights = await fetchInsightsInBatches(accountId, targetAdIds, facebookApi, 'today', { signal })
     
     // 过滤：只保留 spend > 0 的广告（性能优化）
     const filteredTodayInsights = todayInsights.filter(insight => {
@@ -965,6 +1008,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     })
     
     // 写入 ad_snapshots（只存 today 数据）
+    throwIfSignalAborted(signal, `账户 ${accountId} 在写入 Today 快照前已被取消`)
     const todayCount = await saveSnapshotsToDb(filteredTodayInsights, accountId, ownerId, syncSessionId, syncedAt, timezoneName)
     logger.info(`✅ Today 数据已写入 ad_snapshots，共 ${todayCount} 条记录`)
     
@@ -979,7 +1023,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     logger.info(`📅 日期范围: ${sinceDate} ~ ${untilDate} (账户时区: ${timezoneName})`)
     
     // 拉取按日数据（使用筛选后的广告列表）
-    const dailyInsights = await fetchInsightsByDay(accountId, targetAdIds, facebookApi, sinceDate, untilDate)
+    const dailyInsights = await fetchInsightsByDay(accountId, targetAdIds, facebookApi, sinceDate, untilDate, { signal })
     
     // 过滤：只保留 spend > 0 的按日数据（性能优化）
     const filteredDailyInsights = dailyInsights.filter(insight => {
@@ -988,6 +1032,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     })
     
     if (filteredDailyInsights.length === 0) {
+      throwIfSignalAborted(signal, `账户 ${accountId} 在无按日数据返回前已被取消`)
       logger.info(`⚠️  没有拉取到 spend > 0 的按日数据，跳过更新 daily_stats`)
       return {
         success: true,
@@ -1000,8 +1045,10 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     logger.info(`📊 按日数据过滤结果: ${dailyInsights.length} → ${filteredDailyInsights.length} (只保留 spend > 0)`)
     
     // 更新 daily_stats（按日修复迟到归因）
+    throwIfSignalAborted(signal, `账户 ${accountId} 在更新 daily_stats 前已被取消`)
     const dailyStatsCount = await updateDailyStatsFromInsights(filteredDailyInsights, accountId, ownerId, timezoneName)
     
+    throwIfSignalAborted(signal, `账户 ${accountId} 在滑动窗口完成前已被取消`)
     logger.info(`✅ 账户 ${accountId} 滑动窗口同步完成`)
     logger.info(`   - Today 数据: ${todayCount} 条（ad_snapshots）`)
     logger.info(`   - 按日数据: ${dailyStatsCount} 条（daily_stats）`)
@@ -1451,9 +1498,11 @@ function chunkArray(array, size) {
  * @param {Array<string>} adIds - 广告ID列表
  * @param {FacebookMarketingAPI} facebookApi - Facebook API 客户端实例
  * @param {string} datePreset - 时间范围预设（'today' | 'last_7d'），默认 'today'
+ * @param {{ signal?: AbortSignal|null }} [options]
  * @returns {Promise<Array>} 广告洞察数据列表
  */
-async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset = 'today') {
+async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset = 'today', options = {}) {
+  const signal = options?.signal || null
   logger.info(`📦 开始批量拉取账户 ${accountId} 的广告数据（${datePreset}），共 ${adIds.length} 个广告`)
   
   // 如果没有广告，直接返回空数组
@@ -1482,6 +1531,7 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
 
   // 遍历每一组，发送 Batch API 请求
   for (let i = 0; i < adIdChunks.length; i++) {
+    throwIfSignalAborted(signal, `账户 ${accountId} 在批量 Insights 第 ${i + 1} 批前已被取消`)
     const chunk = adIdChunks[i]
     logger.info(`📦 处理第 ${i + 1}/${adIdChunks.length} 批，共 ${chunk.length} 个广告`)
     
@@ -1510,7 +1560,8 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
       // 使用 returnHeaders 选项获取响应头，用于频率控制
       const response = await facebookApi.makeRequest(batchUrl, batchParams, 'POST', null, { 
         returnHeaders: true,
-        timeout: 45000 
+        timeout: 45000,
+        signal
       })
       
       // 提取数据和响应头
@@ -1535,10 +1586,12 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
         const usageInfo = parseUsageHeader(usageHeader)
         // 注意：这里在批次之间休眠，而不是在每次请求后休眠
         // 因为 Batch API 是一次请求包含多个子请求
+        throwIfSignalAborted(signal, `账户 ${accountId} 在批量 Insights 休眠前已被取消`)
         await sleepBasedOnUsage(usageInfo)
       } else if (i < adIdChunks.length - 1) {
         // 如果没有响应头，使用默认休眠时间（保守策略）
         logger.info(`⏸️  未获取到使用率信息，使用默认休眠时间: 1000ms`)
+        throwIfSignalAborted(signal, `账户 ${accountId} 在批量 Insights 间隔前已被取消`)
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
       
@@ -1636,6 +1689,9 @@ async function fetchInsightsInBatches(accountId, adIds, facebookApi, datePreset 
       // 注意：动态休眠已在上面处理（基于响应头），这里不再需要固定休眠
       
     } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw error
+      }
       logger.error(`❌ 第 ${i + 1} 批请求失败:`, error.message)
       // 继续处理下一批，不中断整个流程
       continue
@@ -2521,13 +2577,19 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
   logger.info(`⏰ 当前服务器时间: ${new Date().toISOString()}`)
   
   try {
-    // 1. 从 account_mappings 表获取所有账户列表
+    // 1. 从 account_mappings 表获取所有账户列表（每 fb_account_id 一行，避免重复 mapping）
     // ⚠️ 注意：account_mappings 表的字段名是 fb_account_id，不是 account_id
     const [accounts] = await pool.query(`
-      SELECT DISTINCT fb_account_id as account_id, owner_id, COALESCE(timezone_name, 'UTC') as timezone_name
-      FROM account_mappings 
-      WHERE is_active = 1
-      ORDER BY fb_account_id
+      SELECT m.fb_account_id AS account_id, m.owner_id, COALESCE(m.timezone_name, 'UTC') AS timezone_name
+      FROM account_mappings m
+      INNER JOIN (
+        SELECT fb_account_id, MIN(id) AS min_id
+        FROM account_mappings
+        WHERE is_active = 1
+        GROUP BY fb_account_id
+      ) u ON m.fb_account_id = u.fb_account_id AND m.id = u.min_id
+      WHERE m.is_active = 1
+      ORDER BY m.fb_account_id
     `)
     
     if (!accounts || accounts.length === 0) {
@@ -2771,11 +2833,644 @@ export async function archiveAllAccountsDailyStats(targetDate = null, forceAll =
 // AdsPolar 优化：统一心跳防重入锁
 let heartbeatRunning = false
 const HEARTBEAT_LOCK_NAME = 'fb_ad_brain:unified_heartbeat'
+const DEFAULT_HEARTBEAT_ACCOUNT_TIMEOUT_MS = 8 * 60 * 1000
+const DEFAULT_HEARTBEAT_ABORT_GRACE_MS = 3000
+const DEFAULT_HEARTBEAT_WATCHDOG_TIMEOUT_MS = 8 * 60 * 1000
+const DEFAULT_HEARTBEAT_WATCHDOG_INTERVAL_MS = 15000
+let heartbeatStartedAt = null
+let heartbeatLastProgressAt = null
+let heartbeatLastProgressStage = null
+let heartbeatLastProgressAccountId = null
+let heartbeatWatchdogTimer = null
+let heartbeatWatchdogTriggered = false
+
+/**
+ * 读取统一心跳单账户超时时间。
+ * 默认值刻意小于 15 分钟 Cron 周期，避免某个账户无限挂起时把整轮心跳拖到下一轮。
+ *
+ * @returns {number}
+ */
+function getHeartbeatAccountTimeoutMs() {
+  const raw = Number(process.env.HEARTBEAT_ACCOUNT_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_ACCOUNT_TIMEOUT_MS
+}
+
+/**
+ * 超时后的撤场宽限期。
+ * 这段时间不是继续“放任任务跑”，而是给 abort 后的底层链路一个收尾机会。
+ *
+ * @returns {number}
+ */
+function getHeartbeatAbortGraceMs() {
+  const raw = Number(process.env.HEARTBEAT_ABORT_GRACE_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_ABORT_GRACE_MS
+}
+
+/**
+ * watchdog 判定“长时间无进展”的阈值。
+ * 这里看的是整轮心跳有没有继续往前推进，而不是单个账户的业务成败。
+ *
+ * @returns {number}
+ */
+function getHeartbeatWatchdogTimeoutMs() {
+  const raw = Number(process.env.HEARTBEAT_WATCHDOG_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_WATCHDOG_TIMEOUT_MS
+}
+
+/**
+ * watchdog 轮询间隔。
+ * 间隔不需要太短，重点是发现“假活着”而不是做高频监控。
+ *
+ * @returns {number}
+ */
+function getHeartbeatWatchdogIntervalMs() {
+  const raw = Number(process.env.HEARTBEAT_WATCHDOG_INTERVAL_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_WATCHDOG_INTERVAL_MS
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function createAbortError(message = '任务已中断') {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  error.code = 'ABORT_ERR'
+  return error
+}
+
+function isAbortLikeError(error) {
+  return error?.name === 'AbortError' ||
+    error?.name === 'CanceledError' ||
+    error?.code === 'ABORT_ERR' ||
+    error?.code === 'ERR_CANCELED'
+}
+
+function throwIfSignalAborted(signal, message) {
+  if (signal?.aborted) {
+    const reasonMessage = signal.reason?.message || signal.reason || message || '任务已中断'
+    throw createAbortError(String(reasonMessage))
+  }
+}
+
+function markHeartbeatProgress(stage, accountId = null) {
+  heartbeatLastProgressAt = Date.now()
+  heartbeatLastProgressStage = stage
+  heartbeatLastProgressAccountId = accountId || null
+}
+
+function resetHeartbeatProgressState() {
+  heartbeatStartedAt = null
+  heartbeatLastProgressAt = null
+  heartbeatLastProgressStage = null
+  heartbeatLastProgressAccountId = null
+  heartbeatWatchdogTriggered = false
+}
+
+function clearHeartbeatWatchdog() {
+  if (heartbeatWatchdogTimer) {
+    clearInterval(heartbeatWatchdogTimer)
+    heartbeatWatchdogTimer = null
+  }
+}
+
+function startHeartbeatWatchdog(timeoutMs, intervalMs) {
+  clearHeartbeatWatchdog()
+
+  heartbeatWatchdogTimer = setInterval(() => {
+    if (!heartbeatRunning || heartbeatWatchdogTriggered) {
+      return
+    }
+
+    const lastProgressAt = heartbeatLastProgressAt || heartbeatStartedAt
+    if (!lastProgressAt) {
+      return
+    }
+
+    const idleMs = Date.now() - lastProgressAt
+    if (idleMs < timeoutMs) {
+      return
+    }
+
+    heartbeatWatchdogTriggered = true
+    logger.error(
+      `❌ [HeartbeatWatchdog] 检测到统一心跳长时间无进展，准备退出进程自愈: ` +
+      `idleMs=${idleMs}, timeoutMs=${timeoutMs}, stage=${heartbeatLastProgressStage || 'unknown'}, ` +
+      `account=${heartbeatLastProgressAccountId || 'n/a'}, startedAt=${heartbeatStartedAt ? new Date(heartbeatStartedAt).toISOString() : 'n/a'}`
+    )
+    process.exit(1)
+  }, intervalMs)
+}
+
+/**
+ * 提前把账户上下文抽出来，避免 Promise reject 后丢失“是哪个账户失败”的关键信息。
+ *
+ * @param {Object} account
+ * @returns {{ accountId: string, ownerId: number|null, timezoneName: string }}
+ */
+function createHeartbeatTaskContext(account) {
+  return {
+    accountId: String(account?.account_id || account?.accountId || ''),
+    ownerId: account?.owner_id ?? account?.ownerId ?? null,
+    timezoneName: account?.timezone_name || account?.timezoneName || 'UTC'
+  }
+}
+
+function trimHeartbeatErrorMessage(message) {
+  if (message === undefined || message === null) return null
+  const text = String(message).trim()
+  if (!text) return null
+  return text.length <= 500 ? text : text.slice(0, 500)
+}
+
+function resolveHeartbeatResultCode(result) {
+  if (result?.resultCode) {
+    return result.resultCode
+  }
+  if (result?.synced) {
+    return result?.dataUpdated
+      ? HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA
+      : HEARTBEAT_RESULT_CODE.SUCCESS_NO_DATA
+  }
+  return HEARTBEAT_RESULT_CODE.FAILED
+}
+
+async function markHeartbeatAttemptStarted(context, attemptedAt = new Date()) {
+  if (!context?.accountId) {
+    return attemptedAt
+  }
+
+  try {
+    await pool.execute(
+      `INSERT INTO structure_sync_status
+        (account_id, last_heartbeat_attempt_at, updated_at)
+       VALUES
+        (?, ?, NOW())
+       ON DUPLICATE KEY UPDATE
+        last_heartbeat_attempt_at = VALUES(last_heartbeat_attempt_at),
+        updated_at = NOW()`,
+      [context.accountId, attemptedAt]
+    )
+  } catch (error) {
+    // 中文注释：心跳状态写库属于“观测补充层”，不能反过来把主同步链路打断。
+    // 这里选择记录告警并继续，让数据同步优先完成，后续再通过日志排查状态写入问题。
+    logger.warn(`⚠️  写入心跳尝试时间失败（account=${context.accountId}）: ${error.message}`)
+  }
+
+  return attemptedAt
+}
+
+async function persistHeartbeatAccountStatuses(results, stageLabel) {
+  for (const result of results || []) {
+    const accountId = String(result?.accountId || '')
+    if (!accountId) {
+      continue
+    }
+
+    const resultCode = resolveHeartbeatResultCode(result)
+    const errorMessage = trimHeartbeatErrorMessage(result?.errorMessage || result?.syncError?.message || null)
+    const durationMs = Number.isFinite(result?.durationMs) ? Math.max(0, Math.round(result.durationMs)) : null
+    const attemptedAt = result?.attemptedAt instanceof Date ? result.attemptedAt : null
+    const successAt = resultCode === HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA || resultCode === HEARTBEAT_RESULT_CODE.SUCCESS_NO_DATA
+      ? new Date()
+      : null
+    const dataUpdatedAt = resultCode === HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA
+      ? new Date()
+      : null
+
+    try {
+      await pool.execute(
+        `INSERT INTO structure_sync_status
+          (
+            account_id,
+            last_heartbeat_attempt_at,
+            last_heartbeat_success_at,
+            last_heartbeat_data_update_at,
+            last_heartbeat_result_code,
+            last_heartbeat_error_message,
+            last_heartbeat_duration_ms,
+            updated_at
+          )
+         VALUES
+          (?, ?, ?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+          last_heartbeat_attempt_at = COALESCE(VALUES(last_heartbeat_attempt_at), last_heartbeat_attempt_at),
+          last_heartbeat_success_at = COALESCE(VALUES(last_heartbeat_success_at), last_heartbeat_success_at),
+          last_heartbeat_data_update_at = COALESCE(VALUES(last_heartbeat_data_update_at), last_heartbeat_data_update_at),
+          last_heartbeat_result_code = VALUES(last_heartbeat_result_code),
+          last_heartbeat_error_message = VALUES(last_heartbeat_error_message),
+          last_heartbeat_duration_ms = VALUES(last_heartbeat_duration_ms),
+          updated_at = NOW()`,
+        [
+          accountId,
+          attemptedAt,
+          successAt,
+          dataUpdatedAt,
+          resultCode,
+          errorMessage,
+          durationMs
+        ]
+      )
+    } catch (error) {
+      logger.warn(`⚠️  持久化心跳账户状态失败（stage=${stageLabel}, account=${accountId}）: ${error.message}`)
+    }
+  }
+}
+
+/**
+ * 把 allSettled 的 reject 结果统一还原成账户结果对象。
+ * 这样后面的统计、重试和 finally 都还能沿用原来的结果数组思路，不会因为单个 reject 直接中断整轮。
+ *
+ * @param {{ accountId: string, ownerId: number|null, timezoneName: string }} context
+ * @param {unknown} error
+ * @param {string} stageLabel
+ * @returns {Object}
+ */
+function createHeartbeatFailureResult(context, error, stageLabel) {
+  const message = error?.message || String(error || '未知错误')
+  const retryable = (isTimeoutError(error) || isAbortLikeError(error)) ? false : isRetryableError(error)
+
+  logger.error(`❌ [统一心跳收口] ${stageLabel}失败: account=${context.accountId || 'unknown'}, reason=${message}`)
+
+  return {
+    synced: false,
+    dataUpdated: false,
+    archived: false,
+    finalized: false,
+    accountId: context.accountId,
+    ownerId: context.ownerId,
+    timezoneName: context.timezoneName,
+    activeAdIds: [],
+    resultCode: HEARTBEAT_RESULT_CODE.FAILED,
+    errorMessage: message,
+    durationMs: null,
+    syncError: {
+      message,
+      isRetryable: retryable
+    }
+  }
+}
+
+/**
+ * 统一处理 allSettled 结果，把 fulfilled / rejected 都映射成同一种账户结果结构。
+ *
+ * @param {Array<{ context: { accountId: string, ownerId: number|null, timezoneName: string } }>} taskDescriptors
+ * @param {PromiseSettledResult<any>[]} settledResults
+ * @param {string} stageLabel
+ * @returns {Object[]}
+ */
+async function normalizeHeartbeatSettledResults(taskDescriptors, settledResults, stageLabel) {
+  const results = []
+  const undrainedTasks = []
+
+  for (let index = 0; index < settledResults.length; index++) {
+    const settled = settledResults[index]
+    if (settled.status === 'fulfilled') {
+      results.push(settled.value)
+      continue
+    }
+
+    const taskDescriptor = taskDescriptors[index]
+    if (isTimeoutError(settled.reason) && typeof taskDescriptor?.ensureDrained === 'function') {
+      const drained = await taskDescriptor.ensureDrained()
+      if (!drained) {
+        undrainedTasks.push({
+          context: taskDescriptor.context,
+          error: settled.reason
+        })
+      }
+    }
+
+    results.push(createHeartbeatFailureResult(taskDescriptor.context, settled.reason, stageLabel))
+  }
+
+  return { results, undrainedTasks }
+}
+
+function createHeartbeatUndrainedError(stageLabel, undrainedTasks, abortGraceMs) {
+  const accounts = undrainedTasks
+    .map(task => task?.context?.accountId)
+    .filter(Boolean)
+    .join(', ')
+  return new Error(`${stageLabel} 存在超时后仍未撤场的账户任务（grace=${abortGraceMs}ms, accounts=${accounts || 'unknown'}）`)
+}
+
+function createAbortableHeartbeatTask(context, timeoutMs, abortGraceMs, label, scheduler, taskFactory, options = {}) {
+  const controller = new AbortController()
+  let settled = false
+  let executionPromise = Promise.resolve()
+
+  return {
+    context,
+    promise: scheduler(() => {
+      executionPromise = Promise.resolve()
+        .then(() => taskFactory({ signal: controller.signal }))
+        .finally(() => {
+          settled = true
+          options?.onSettled?.(context)
+        })
+
+      return withTimeout(
+        () => executionPromise,
+        timeoutMs,
+        label,
+        {
+          onTimeout: () => {
+            // 中文注释：超时时不能只在统计层记失败，还要主动通知底层链路“停止施工”。
+            controller.abort(createAbortError(`${label} 已触发超时中断`))
+          }
+        }
+      )
+    }),
+    async ensureDrained() {
+      if (settled) {
+        return true
+      }
+
+      // 中文注释：这里给一个很短的 drain 窗口，观察 abort 后底层 promise 是否真的收尾。
+      // 如果宽限期后还没结束，就说明这条链路不是“慢”，而是“停不下来”，要升级为进程级失败。
+      await Promise.race([
+        executionPromise.then(() => true).catch(() => true),
+        sleep(abortGraceMs)
+      ])
+      return settled
+    }
+  }
+}
+
+/**
+ * 处理统一心跳里的单个账户。
+ * 这里保持“一个账户一个结果对象”的边界清晰，外层才能安全地做超时包装与 allSettled 收口。
+ *
+ * @param {{ account_id?: string, owner_id?: number, timezone_name?: string }} account
+ * @returns {Promise<Object>}
+ */
+async function processHeartbeatAccount(account, options = {}) {
+  const { accountId, ownerId, timezoneName } = createHeartbeatTaskContext(account)
+  const signal = options?.signal || null
+  const accountStartedAt = Date.now()
+
+  throwIfSignalAborted(signal, `账户 ${accountId} 在开始前已被取消`)
+
+  if (!accountId || !ownerId) {
+    const attemptedAt = accountId ? await markHeartbeatAttemptStarted({ accountId, ownerId, timezoneName }) : null
+    const skipReason = `账户配置无效：account_id=${accountId || 'empty'}, owner_id=${ownerId ?? 'null'}`
+    logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
+    // #region agent log
+    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'skip account no owner',data:{hypothesisId:'H1',accountId,hasOwner:!!ownerId,ownerIdType:ownerId===0?'zero':typeof ownerId},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
+    return {
+      synced: false,
+      dataUpdated: false,
+      archived: false,
+      finalized: false,
+      accountId,
+      ownerId,
+      timezoneName,
+      activeAdIds: [],
+      attemptedAt,
+      resultCode: HEARTBEAT_RESULT_CODE.SKIPPED_INVALID_ACCOUNT,
+      errorMessage: skipReason,
+      durationMs: Date.now() - accountStartedAt,
+      syncError: null
+    }
+  }
+
+  try {
+    // 2.1 根据账户时区决定本轮使用的 time_range
+    const now = DateTime.now()
+    const localTime = now.setZone(timezoneName)
+    const hour = localTime.hour
+
+    // 决定同步范围：根据当前时间选择合适的时间窗口
+    // 策略：白天（6-18点）同步 Today，夜间同步历史数据
+    let timeRange = 'today'
+    let daysBack = 0
+
+    if (hour >= 6 && hour < 18) {
+      // 白天：主要同步 Today，偶尔回补最近 3 天
+      timeRange = 'today'
+      daysBack = 0
+      // 每小时的第 0 分钟回补 last_3d
+      if (localTime.minute === 0) {
+        daysBack = 3
+      }
+    } else {
+      // 夜间：回补历史数据
+      if (hour >= 0 && hour < 6) {
+        // 凌晨：回补 last_7d
+        timeRange = 'last_7d'
+        daysBack = 7
+      } else {
+        // 晚上：回补 last_14d
+        timeRange = 'last_14d'
+        daysBack = 14
+      }
+    }
+
+    logger.info(`\n[账户 ${accountId}] 时区: ${timezoneName}, 本地时间: ${localTime.toFormat('yyyy-MM-dd HH:mm:ss')}`)
+    logger.info(`  同步范围: ${timeRange} (daysBack=${daysBack})`)
+
+    // 2.2 执行数据同步（AdsPolar 优化：检测实际数据变化）
+    let synced = false
+    let dataUpdated = false
+    let syncError = null
+    let syncResult = null
+    const attemptedAt = await markHeartbeatAttemptStarted({ accountId, ownerId, timezoneName })
+
+    try {
+      if (daysBack === 0) {
+        // 同轮复用 facebookApi，供 Piggyback 只补缺口、不再对 activeAdIds 调 resolve
+        const accessToken = process.env.FACEBOOK_ACCESS_TOKEN
+        const facebookApi = accessToken ? new FacebookMarketingAPI(accessToken) : null
+        syncResult = await syncAccountTodayStats(accountId, ownerId, timezoneName, facebookApi, { signal })
+        dataUpdated = syncResult && syncResult.success && syncResult.syncedCount > 0
+        if (dataUpdated) {
+          logger.info(`   ✅ [${accountId}] 有数据更新: ${syncResult.syncedCount} 条`)
+        } else if (syncResult?.success) {
+          logger.info(`   📋 [${accountId}] 同步完成但无数据更新（今日 spend>0 广告数=0，未写入 ad_snapshots）`)
+        }
+        if (syncResult?.success) {
+          logger.info(`   📊 [${accountId}] 拉取 spend>0=${syncResult.syncedCount ?? 0}, 写入 ad_snapshots=${syncResult.syncedCount ?? 0}`)
+        }
+        // Piggyback：用本轮已拿到的 structurePayload 补齐 structure_ads（best-effort，同轮 resolve 只一次）
+        if (syncResult?.activeAdIds?.length && facebookApi && !signal?.aborted) {
+          try {
+            await piggybackStructureFromToday(accountId, syncResult.activeAdIds, syncResult.structurePayload || {}, facebookApi)
+          } catch (pbErr) {
+            logger.warn(`   ⚠️ [${accountId}] Piggyback 跳过:`, pbErr.message)
+          }
+        }
+      } else {
+        // 同步滑动窗口数据（启用配额优化，只拉取活跃广告）
+        syncResult = await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true, { signal })
+        // 判断是否有实际数据更新（todayCount > 0 或 dailyStatsCount > 0）
+        dataUpdated = syncResult && syncResult.success && (syncResult.todayCount > 0 || syncResult.dailyStatsCount > 0)
+        if (dataUpdated) {
+          logger.info(`   ✅ [${accountId}] 有数据更新: Today=${syncResult.todayCount || 0}, Daily=${syncResult.dailyStatsCount || 0}`)
+        } else if (syncResult?.success) {
+          logger.info(`   📋 [${accountId}] 同步完成但无数据更新（Today=${syncResult.todayCount ?? 0}, Daily=${syncResult.dailyStatsCount ?? 0}，未写入 ad_snapshots）`)
+        }
+        if (syncResult?.success) {
+          logger.info(`   📊 [${accountId}] 写入 ad_snapshots=${syncResult.todayCount ?? 0}, 写入 daily_stats=${syncResult.dailyStatsCount ?? 0}`)
+        }
+      }
+
+      if (syncResult?.success) {
+        synced = true
+      } else {
+        const businessFailureMessage = syncResult?.error || syncResult?.message || '业务同步返回 success=false'
+        syncError = new Error(businessFailureMessage)
+        logger.error(`   ❌ 数据同步返回失败: ${businessFailureMessage}`)
+      }
+    } catch (error) {
+      syncError = error
+      logger.error(`   ❌ 数据同步失败: ${error.message}`)
+    }
+
+    throwIfSignalAborted(signal, `账户 ${accountId} 在归档前已被取消`)
+    // 2.3 执行双窗口归档检查
+    const archiveResult = await checkAndExecuteArchive(accountId, ownerId, timezoneName, localTime)
+
+    return {
+      synced,
+      dataUpdated,
+      archived: archiveResult.archived,
+      finalized: archiveResult.finalized,
+      accountId,
+      ownerId,
+      timezoneName,
+      activeAdIds: (daysBack === 0 && syncResult?.activeAdIds?.length) ? syncResult.activeAdIds : [],
+      attemptedAt,
+      resultCode: synced
+        ? (dataUpdated ? HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA : HEARTBEAT_RESULT_CODE.SUCCESS_NO_DATA)
+        : HEARTBEAT_RESULT_CODE.FAILED,
+      errorMessage: syncError ? syncError.message : null,
+      durationMs: Date.now() - accountStartedAt,
+      syncError: syncError ? { message: syncError.message, isRetryable: isRetryableError(syncError) } : null
+    }
+  } catch (error) {
+    logger.error(`   ❌ 账户 ${accountId} 处理失败:`, error.message)
+    return {
+      synced: false,
+      dataUpdated: false,
+      archived: false,
+      finalized: false,
+      accountId,
+      ownerId,
+      timezoneName,
+      activeAdIds: [],
+      resultCode: HEARTBEAT_RESULT_CODE.FAILED,
+      errorMessage: error.message,
+      durationMs: Date.now() - accountStartedAt,
+      syncError: { message: error.message, isRetryable: isRetryableError(error) }
+    }
+  }
+}
+
+/**
+ * 处理统一心跳的单账户重试。
+ * 把重试逻辑也单独抽出来，是为了让重试分支和首轮分支都能复用同一套“超时 + 收口”模式。
+ *
+ * @param {{ accountId: string, ownerId: number|null, timezoneName?: string }} failedAccount
+ * @param {number} attempt
+ * @param {number} index
+ * @param {number} total
+ * @returns {Promise<Object>}
+ */
+async function retryHeartbeatAccountSync(failedAccount, attempt, index, total, options = {}) {
+  const accountId = failedAccount.accountId
+  const ownerId = failedAccount.ownerId
+  const timezoneName = failedAccount.timezoneName || 'UTC'
+  const signal = options?.signal || null
+  const retryStartedAt = Date.now()
+
+  throwIfSignalAborted(signal, `重试账户 ${accountId} 在开始前已被取消`)
+
+  // 记录账户调用时间（账户级别限流保护）
+  recordAccountCall(accountId)
+
+  try {
+    logger.info(`\n[重试 ${attempt}/${RETRY_MAX_ATTEMPTS} - ${index + 1}/${total}] 重试账户 ${accountId}...`)
+    const attemptedAt = await markHeartbeatAttemptStarted({ accountId, ownerId, timezoneName })
+
+    // 重新决定同步范围（使用相同的逻辑）
+    const now = DateTime.now()
+    const localTime = now.setZone(timezoneName)
+    const hour = localTime.hour
+    let daysBack = 0
+    let dataUpdated = false
+    let syncResult = null
+
+    if (hour >= 6 && hour < 18) {
+      daysBack = 0
+      if (localTime.minute === 0) {
+        daysBack = 3
+      }
+    } else {
+      if (hour >= 0 && hour < 6) {
+        daysBack = 7
+      } else {
+        daysBack = 14
+      }
+    }
+
+    if (daysBack === 0) {
+      syncResult = await syncAccountTodayStats(accountId, ownerId, timezoneName, null, { signal })
+      dataUpdated = Boolean(syncResult?.success && syncResult?.syncedCount > 0)
+    } else {
+      syncResult = await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true, { signal })
+      dataUpdated = Boolean(syncResult?.success && ((syncResult?.todayCount > 0) || (syncResult?.dailyStatsCount > 0)))
+    }
+
+    if (!syncResult?.success) {
+      throw new Error(syncResult?.error || syncResult?.message || '重试同步返回 success=false')
+    }
+
+    logger.info(`✅ 账户 ${accountId} 重试成功`)
+    return {
+      synced: true,
+      dataUpdated,
+      archived: false,
+      finalized: false,
+      accountId,
+      ownerId,
+      timezoneName,
+      attemptedAt,
+      resultCode: dataUpdated
+        ? HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA
+        : HEARTBEAT_RESULT_CODE.SUCCESS_NO_DATA,
+      errorMessage: null,
+      durationMs: Date.now() - retryStartedAt,
+      syncError: null
+    }
+  } catch (error) {
+    const isStillRetryable = isTimeoutError(error) ? false : isRetryableError(error)
+    logger.error(`❌ 账户 ${accountId} 第 ${attempt} 次重试失败: ${error.message} ${isStillRetryable ? '[仍可重试]' : '[不可重试]'}`)
+    return {
+      synced: false,
+      dataUpdated: false,
+      archived: false,
+      finalized: false,
+      accountId,
+      ownerId,
+      timezoneName,
+      resultCode: HEARTBEAT_RESULT_CODE.FAILED,
+      errorMessage: error.message,
+      durationMs: Date.now() - retryStartedAt,
+      syncError: { message: error.message, isRetryable: isStillRetryable },
+      isStillRetryable
+    }
+  }
+}
 
 export async function unifiedHeartbeatSync() {
   // AdsPolar 优化：防重入检查（防止多实例或长时间执行导致重叠）
   if (heartbeatRunning) {
     logger.info('⏸️  统一心跳正在执行中，跳过本次任务（防重入）')
+    // #region agent log
+    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'heartbeat skipped',data:{hypothesisId:'H2',reason:'already_running'},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
     return {
       success: true,
       totalAccounts: 0,
@@ -2798,6 +3493,9 @@ export async function unifiedHeartbeatSync() {
     
     if (!lockAcquired) {
       logger.info('⏸️  统一心跳锁已被占用（可能其他实例正在执行），跳过本次任务')
+      // #region agent log
+      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'heartbeat skipped',data:{hypothesisId:'H2',reason:'global_lock_busy'},timestamp:Date.now()})}).catch(()=>{})
+      // #endregion
       // 立即释放连接（未获取锁时）
       if (lockConnection) {
         lockConnection.release()
@@ -2813,6 +3511,9 @@ export async function unifiedHeartbeatSync() {
         skipReason: 'lock_busy'
       }
     }
+    // #region agent log
+    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'global heartbeat lock acquired',data:{hypothesisId:'H2',lockName:HEARTBEAT_LOCK_NAME},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
     // 注意：获取锁后，不能立即释放连接，必须等到释放锁后再释放连接
   } catch (lockError) {
     logger.warn('⚠️  获取统一心跳锁失败，使用进程内标志位:', lockError.message)
@@ -2825,19 +3526,34 @@ export async function unifiedHeartbeatSync() {
 
   heartbeatRunning = true
   const startTime = Date.now()
+  const heartbeatAccountTimeoutMs = getHeartbeatAccountTimeoutMs()
+  const heartbeatAbortGraceMs = getHeartbeatAbortGraceMs()
+  const heartbeatWatchdogTimeoutMs = getHeartbeatWatchdogTimeoutMs()
+  const heartbeatWatchdogIntervalMs = getHeartbeatWatchdogIntervalMs()
+  let fatalHeartbeatExitError = null
   
   try {
+    heartbeatStartedAt = Date.now()
+    markHeartbeatProgress('heartbeat_started')
+    startHeartbeatWatchdog(heartbeatWatchdogTimeoutMs, heartbeatWatchdogIntervalMs)
+
     logger.info('')
     logger.info('='.repeat(50))
     logger.info('💓 统一心跳同步任务（每 15 分钟）')
     logger.info('⏰ 执行时间:', new Date().toLocaleString('zh-CN'))
     logger.info('='.repeat(50))
-    // 1. 获取所有活跃账户
+    // 1. 获取所有活跃账户（每个 fb_account_id 仅一行，避免同一账户多行 mapping 导致并发任务抢同一把归档锁）
     const [accounts] = await pool.query(`
-      SELECT DISTINCT fb_account_id as account_id, owner_id, COALESCE(timezone_name, 'UTC') as timezone_name
-      FROM account_mappings 
-      WHERE is_active = 1
-      ORDER BY fb_account_id
+      SELECT m.fb_account_id AS account_id, m.owner_id, COALESCE(m.timezone_name, 'UTC') AS timezone_name
+      FROM account_mappings m
+      INNER JOIN (
+        SELECT fb_account_id, MIN(id) AS min_id
+        FROM account_mappings
+        WHERE is_active = 1
+        GROUP BY fb_account_id
+      ) u ON m.fb_account_id = u.fb_account_id AND m.id = u.min_id
+      WHERE m.is_active = 1
+      ORDER BY m.fb_account_id
     `)
     
     if (!accounts || accounts.length === 0) {
@@ -2851,6 +3567,10 @@ export async function unifiedHeartbeatSync() {
     }
     
     logger.info(`📋 找到 ${accounts.length} 个活跃账户`)
+    markHeartbeatProgress('accounts_loaded')
+    // #region agent log
+    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'accounts loaded for heartbeat',data:{hypothesisId:'H2',totalAccounts:accounts.length},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
     logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
     // Track2 Fast Sync 开关与白名单（用于决定哪些账户可依赖 Track2，不再跑伪增量）
@@ -2875,136 +3595,36 @@ export async function unifiedHeartbeatSync() {
     let finalizedAccounts = 0
     
     // 使用 p-limit 控制并发度
-    const accountTasks = accounts.map(account => 
-      accountTaskLimiter(async () => {
-        const accountId = String(account.account_id || '')
-        const ownerId = account.owner_id || account.ownerId
-        const timezoneName = account.timezone_name || 'UTC'
-        
-        if (!accountId || !ownerId) {
-          logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
-          return { synced: false, archived: false, finalized: false }
-        }
-        
-        try {
-          // 2.1 根据账户时区决定本轮使用的 time_range
-          const now = DateTime.now()
-          const localTime = now.setZone(timezoneName)
-          const hour = localTime.hour
-          
-          // 决定同步范围：根据当前时间选择合适的时间窗口
-          // 策略：白天（6-18点）同步 Today，夜间同步历史数据
-          let timeRange = 'today'
-          let daysBack = 0
-          
-          if (hour >= 6 && hour < 18) {
-            // 白天：主要同步 Today，偶尔回补最近 3 天
-            timeRange = 'today'
-            daysBack = 0
-            // 每小时的第 0 分钟回补 last_3d
-            if (localTime.minute === 0) {
-              daysBack = 3
-            }
-          } else {
-            // 夜间：回补历史数据
-            if (hour >= 0 && hour < 6) {
-              // 凌晨：回补 last_7d
-              timeRange = 'last_7d'
-              daysBack = 7
-            } else {
-              // 晚上：回补 last_14d
-              timeRange = 'last_14d'
-              daysBack = 14
-            }
-          }
-          
-          logger.info(`\n[账户 ${accountId}] 时区: ${timezoneName}, 本地时间: ${localTime.toFormat('yyyy-MM-dd HH:mm:ss')}`)
-          logger.info(`  同步范围: ${timeRange} (daysBack=${daysBack})`)
-          
-          // 2.2 执行数据同步（AdsPolar 优化：检测实际数据变化）
-          let synced = false
-          let dataUpdated = false  // 是否有实际数据更新
-          let syncError = null
-          let syncResult = null
-          try {
-            if (daysBack === 0) {
-              // 同轮复用 facebookApi，供 Piggyback 只补缺口、不再对 activeAdIds 调 resolve
-              const accessToken = process.env.FACEBOOK_ACCESS_TOKEN
-              const facebookApi = accessToken ? new FacebookMarketingAPI(accessToken) : null
-              syncResult = await syncAccountTodayStats(accountId, ownerId, timezoneName, facebookApi)
-              dataUpdated = syncResult && syncResult.success && syncResult.syncedCount > 0
-              if (dataUpdated) {
-                logger.info(`   ✅ [${accountId}] 有数据更新: ${syncResult.syncedCount} 条`)
-              } else if (syncResult?.success) {
-                logger.info(`   📋 [${accountId}] 同步完成但无数据更新（今日 spend>0 广告数=0，未写入 ad_snapshots）`)
-              }
-              if (syncResult?.success) {
-                logger.info(`   📊 [${accountId}] 拉取 spend>0=${syncResult.syncedCount ?? 0}, 写入 ad_snapshots=${syncResult.syncedCount ?? 0}`)
-              }
-              // Piggyback：用本轮已拿到的 structurePayload 补齐 structure_ads（best-effort，同轮 resolve 只一次）
-              if (syncResult?.activeAdIds?.length && facebookApi) {
-                try {
-                  await piggybackStructureFromToday(accountId, syncResult.activeAdIds, syncResult.structurePayload || {}, facebookApi)
-                } catch (pbErr) {
-                  logger.warn(`   ⚠️ [${accountId}] Piggyback 跳过:`, pbErr.message)
-                }
-              }
-            } else {
-              // 同步滑动窗口数据（启用配额优化，只拉取活跃广告）
-              syncResult = await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true)
-              // 判断是否有实际数据更新（todayCount > 0 或 dailyStatsCount > 0）
-              dataUpdated = syncResult && syncResult.success && (syncResult.todayCount > 0 || syncResult.dailyStatsCount > 0)
-              if (dataUpdated) {
-                logger.info(`   ✅ [${accountId}] 有数据更新: Today=${syncResult.todayCount || 0}, Daily=${syncResult.dailyStatsCount || 0}`)
-              } else if (syncResult?.success) {
-                logger.info(`   📋 [${accountId}] 同步完成但无数据更新（Today=${syncResult.todayCount ?? 0}, Daily=${syncResult.dailyStatsCount ?? 0}，未写入 ad_snapshots）`)
-              }
-              if (syncResult?.success) {
-                logger.info(`   📊 [${accountId}] 写入 ad_snapshots=${syncResult.todayCount ?? 0}, 写入 daily_stats=${syncResult.dailyStatsCount ?? 0}`)
-              }
-            }
-            synced = true
-          } catch (error) {
-            syncError = error
-            logger.error(`   ❌ 数据同步失败: ${error.message}`)
-          }
-          
-          // 2.3 执行双窗口归档检查
-          const archiveResult = await checkAndExecuteArchive(accountId, ownerId, timezoneName, localTime)
-          
-          // 规则执行不再由心跳顺带触发，改由「每分钟 Cron」统一驱动（见 cronService 调度）
-          // 依据：docs/执行频率与执行时间 — 适配方案（执行频率语义 + 移除 Smart Mute）.md §4.1
-          
-          return {
-            synced,
-            dataUpdated,
-            archived: archiveResult.archived,
-            finalized: archiveResult.finalized,
-            accountId,
-            ownerId,
-            timezoneName,
-            activeAdIds: (daysBack === 0 && syncResult?.activeAdIds?.length) ? syncResult.activeAdIds : [],
-            syncError: syncError ? { message: syncError.message, isRetryable: isRetryableError(syncError) } : null
-          }
-        } catch (error) {
-          logger.error(`   ❌ 账户 ${accountId} 处理失败:`, error.message)
-          return {
-            synced: false,
-            dataUpdated: false,
-            archived: false,
-            finalized: false,
-            accountId,
-            ownerId,
-            timezoneName,
-            activeAdIds: [],
-            syncError: { message: error.message, isRetryable: isRetryableError(error) }
+    const accountTasks = accounts.map((account) => {
+      const context = createHeartbeatTaskContext(account)
+      return createAbortableHeartbeatTask(
+        context,
+        heartbeatAccountTimeoutMs,
+        heartbeatAbortGraceMs,
+        `统一心跳账户 ${context.accountId || 'unknown'}`,
+        accountTaskLimiter,
+        ({ signal }) => processHeartbeatAccount(account, { signal }),
+        {
+          onSettled: (settledContext) => {
+            // 中文注释：watchdog 关心的是“这一轮有没有继续往前走”，
+            // 所以无论账户成功还是失败，只要这个账户真正收尾，就应刷新进展时间。
+            markHeartbeatProgress('account_settled', settledContext.accountId)
           }
         }
-      })
-    )
-    
-    // 等待所有账户任务完成
-    const results = await Promise.all(accountTasks)
+      )
+    })
+
+    // 中文注释：这里改用 allSettled，而不是 Promise.all。
+    // 原因是心跳任务的目标是“整轮收口”，不是要求每个账户都成功；单账户失败要记账，但不能阻塞 finally 释放锁。
+    const settledResults = await Promise.allSettled(accountTasks.map((task) => task.promise))
+    const normalizedInitialResults = await normalizeHeartbeatSettledResults(accountTasks, settledResults, '首轮账户任务')
+    const results = normalizedInitialResults.results
+    await persistHeartbeatAccountStatuses(results, 'initial')
+    markHeartbeatProgress('initial_accounts_collected')
+    if (normalizedInitialResults.undrainedTasks.length > 0) {
+      fatalHeartbeatExitError = createHeartbeatUndrainedError('首轮账户任务', normalizedInitialResults.undrainedTasks, heartbeatAbortGraceMs)
+      throw fatalHeartbeatExitError
+    }
 
     // 心跳后置阶段：伪增量（仅对非 Track2 账户跑；Track2 账户由 Track1+Track2+Piggyback 承担结构职责）
     const allValidAccounts = results.filter((r) => r?.accountId)
@@ -3014,14 +3634,17 @@ export async function unifiedHeartbeatSync() {
     logger.info(
       `[伪增量] 本轮账户统计: total=${allValidAccounts.length}, track2=${track2Accounts.length}, pseudo=${accountsForPseudo.length}`
     )
+    markHeartbeatProgress('post_initial_classification')
 
     if (accountsForPseudo.length > 0 && process.env.FACEBOOK_ACCESS_TOKEN) {
       const facebookApi = new FacebookMarketingAPI(process.env.FACEBOOK_ACCESS_TOKEN)
       for (const r of accountsForPseudo) {
         try {
           await runPseudoIncrementForAccount(r.accountId, r.activeAdIds || [], facebookApi)
+          markHeartbeatProgress('pseudo_increment_account', r.accountId)
         } catch (err) {
           logger.warn(`[伪增量] account=${r.accountId} 跳过:`, err.message)
+          markHeartbeatProgress('pseudo_increment_account_skipped', r.accountId)
         }
       }
     }
@@ -3038,6 +3661,7 @@ export async function unifiedHeartbeatSync() {
     
     if (failedSyncAccounts.length > 0) {
       logger.info(`\n🔄 检测到 ${failedSyncAccounts.length} 个因API限流失败的账户，准备重试（最多重试 ${RETRY_MAX_ATTEMPTS} 次）...`)
+      markHeartbeatProgress('retry_accounts_detected')
       
       // 多次重试循环（指数退避）
       let remainingAccounts = [...failedSyncAccounts]
@@ -3048,9 +3672,11 @@ export async function unifiedHeartbeatSync() {
         const delay = calculateBackoffDelay(attempt)
         logger.info(`\n🔄 第 ${attempt} 次重试（共 ${remainingAccounts.length} 个账户）...`)
         logger.info(`⏳ 等待 ${delay / 1000} 秒后重试（指数退避）...`)
+        markHeartbeatProgress(`retry_attempt_${attempt}_scheduled`)
         
         // 延迟重试（指数退避）
         await new Promise(resolve => setTimeout(resolve, delay))
+        markHeartbeatProgress(`retry_attempt_${attempt}_started`)
         
         // 过滤掉仍在冷却期内的账户
         const accountsToRetry = remainingAccounts.filter(account => {
@@ -3069,70 +3695,45 @@ export async function unifiedHeartbeatSync() {
         }
         
         // 并发重试失败的账户
-        const retryTasks = accountsToRetry.map((failedAccount, index) => 
-          accountTaskLimiter(async () => {
-            const accountId = failedAccount.accountId
-            const ownerId = failedAccount.ownerId
-            const timezoneName = failedAccount.timezoneName || 'UTC'
-            
-            // 记录账户调用时间（账户级别限流保护）
-            recordAccountCall(accountId)
-            
-            try {
-              logger.info(`\n[重试 ${attempt}/${RETRY_MAX_ATTEMPTS} - ${index + 1}/${accountsToRetry.length}] 重试账户 ${accountId}...`)
-              
-              // 重新决定同步范围（使用相同的逻辑）
-              const now = DateTime.now()
-              const localTime = now.setZone(timezoneName)
-              const hour = localTime.hour
-              let daysBack = 0
-              
-              if (hour >= 6 && hour < 18) {
-                daysBack = 0
-                if (localTime.minute === 0) {
-                  daysBack = 3
-                }
-              } else {
-                if (hour >= 0 && hour < 6) {
-                  daysBack = 7
-                } else {
-                  daysBack = 14
-                }
-              }
-              
-              // 重试同步
-              if (daysBack === 0) {
-                await syncAccountTodayStats(accountId, ownerId, timezoneName)
-              } else {
-                await syncAccountSlidingWindow(accountId, ownerId, timezoneName, daysBack, true)
-              }
-              
-              logger.info(`✅ 账户 ${accountId} 重试成功`)
-              return { synced: true, archived: false, finalized: false }
-            } catch (error) {
-              const isStillRetryable = isRetryableError(error)
-              logger.error(`❌ 账户 ${accountId} 第 ${attempt} 次重试失败: ${error.message} ${isStillRetryable ? '[仍可重试]' : '[不可重试]'}`)
-              return { 
-                synced: false, 
-                archived: false, 
-                finalized: false,
-                accountId,
-                ownerId,
-                timezoneName,
-                isStillRetryable
+        const retryTasks = accountsToRetry.map((failedAccount, index) => {
+          const context = createHeartbeatTaskContext(failedAccount)
+          return createAbortableHeartbeatTask(
+            context,
+            heartbeatAccountTimeoutMs,
+            heartbeatAbortGraceMs,
+            `统一心跳重试账户 ${context.accountId || 'unknown'}`,
+            accountTaskLimiter,
+            ({ signal }) => retryHeartbeatAccountSync(failedAccount, attempt, index, accountsToRetry.length, { signal }),
+            {
+              onSettled: (settledContext) => {
+                markHeartbeatProgress(`retry_attempt_${attempt}_account_settled`, settledContext.accountId)
               }
             }
-          })
-        )
-        
-        const retryResults = await Promise.all(retryTasks)
+          )
+        })
+
+        const retrySettledResults = await Promise.allSettled(retryTasks.map((task) => task.promise))
+        const normalizedRetryResults = await normalizeHeartbeatSettledResults(retryTasks, retrySettledResults, `第 ${attempt} 次重试任务`)
+        const retryResults = normalizedRetryResults.results
+        await persistHeartbeatAccountStatuses(retryResults, `retry_${attempt}`)
+        markHeartbeatProgress(`retry_attempt_${attempt}_collected`)
+        if (normalizedRetryResults.undrainedTasks.length > 0) {
+          fatalHeartbeatExitError = createHeartbeatUndrainedError(`第 ${attempt} 次重试任务`, normalizedRetryResults.undrainedTasks, heartbeatAbortGraceMs)
+          throw fatalHeartbeatExitError
+        }
         
         // 更新统计：用重试结果更新原结果
         retryResults.forEach((retryResult) => {
           const originalIndex = results.findIndex(r => r.accountId === retryResult.accountId)
-          if (originalIndex >= 0 && retryResult.synced) {
-            results[originalIndex].synced = true
-            syncedAccounts++
+          if (originalIndex >= 0) {
+            const originalResult = results[originalIndex]
+            results[originalIndex] = {
+              ...originalResult,
+              ...retryResult,
+              archived: originalResult.archived || retryResult.archived,
+              finalized: originalResult.finalized || retryResult.finalized,
+              activeAdIds: retryResult.activeAdIds?.length ? retryResult.activeAdIds : (originalResult.activeAdIds || [])
+            }
           }
         })
         
@@ -3171,6 +3772,9 @@ export async function unifiedHeartbeatSync() {
     
     // 收集有实际数据更新的账户ID列表（AdsPolar 优化：真正的"零空转"）
     // 只有同步成功且确实有数据更新的账户才触发规则执行
+    syncedAccounts = results.filter(r => r.synced).length
+    archivedAccounts = results.filter(r => r.archived).length
+    finalizedAccounts = results.filter(r => r.finalized).length
     const syncedAccountIds = results
       .filter(r => r.synced && r.dataUpdated && r.accountId)
       .map(r => String(r.accountId))
@@ -3181,6 +3785,7 @@ export async function unifiedHeartbeatSync() {
     if (totalSynced > 0) {
       logger.info(`📊 数据更新统计: 同步成功=${totalSynced}, 有数据更新=${totalDataUpdated}`)
     }
+    markHeartbeatProgress('before_summary')
     
     const duration = Date.now() - startTime
     logger.info('\n' + '='.repeat(50))
@@ -3207,6 +3812,9 @@ export async function unifiedHeartbeatSync() {
     logger.error('❌ 统一心跳同步失败:', error.message)
     throw error
   } finally {
+    clearHeartbeatWatchdog()
+    resetHeartbeatProgressState()
+
     // 释放进程内标志位
     heartbeatRunning = false
     
@@ -3228,6 +3836,11 @@ export async function unifiedHeartbeatSync() {
       lockConnection.release()
       lockConnection = null
     }
+
+    if (fatalHeartbeatExitError) {
+      logger.error('❌ 统一心跳检测到超时后任务未撤场，准备退出进程交给 systemd 自愈:', fatalHeartbeatExitError.message)
+      process.exit(1)
+    }
   }
 }
 
@@ -3244,6 +3857,9 @@ async function checkAndExecuteArchive(accountId, ownerId, timezoneName, localTim
   const hour = localTime.hour
   const yesterday = localTime.minus({ days: 1 })
   const targetDateStr = yesterday.toFormat('yyyy-MM-dd')
+  // #region agent log
+  fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:checkAndExecuteArchive',message:'archive check',data:{hypothesisId:'H3',accountId,hour,targetDateStr,timezoneName},timestamp:Date.now()})}).catch(()=>{})
+  // #endregion
   
   let archived = false
   let finalized = false
@@ -3328,6 +3944,9 @@ async function executeArchive(accountId, ownerId, timezoneName, targetDateStr, t
     
     if (!lockAcquired) {
       logger.info(`   ⏸️  锁已被占用，跳过（可能其他实例正在归档）`)
+      // #region agent log
+      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:executeArchive',message:'archive row lock busy',data:{hypothesisId:'H4',accountId,targetDateStr,targetStatus},timestamp:Date.now()})}).catch(()=>{})
+      // #endregion
       return { success: false, skipped: true, reason: 'lock_busy' }
     }
     
@@ -3351,6 +3970,9 @@ async function executeArchive(accountId, ownerId, timezoneName, targetDateStr, t
            last_error = NULL`,
         [accountId, targetDateStr, targetStatus]
       )
+      // #region agent log
+      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:executeArchive',message:'daily_archive_status upserted',data:{hypothesisId:'H5',accountId,targetDateStr,targetStatus,archivedCount},timestamp:Date.now()})}).catch(()=>{})
+      // #endregion
       
       logger.info(`   ✅ 归档完成，共 ${archivedCount} 条记录，状态: ${targetStatus}`)
       

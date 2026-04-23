@@ -65,7 +65,10 @@
                 <th>账户名称</th>
                 <th>账户 ID</th>
                 <th>时区</th>
-                <th>最后同步</th>
+                <th>最近尝试</th>
+                <th>最近成功</th>
+                <th>最近数据更新</th>
+                <th>最近结果</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -75,11 +78,43 @@
                 <td class="mono">{{ account.account_id }}</td>
                 <td>{{ account.timezone }}</td>
                 <td>
-                  <span v-if="account.last_sync_time">
-                    {{ formatDateTime(account.last_sync_time) }}
-                    <span class="muted">({{ formatTimeAgo(account.last_sync_time) }})</span>
+                  <span v-if="account.last_heartbeat_attempt_at">
+                    {{ formatDateTime(account.last_heartbeat_attempt_at) }}
+                    <span class="muted">({{ formatTimeAgo(account.last_heartbeat_attempt_at) }})</span>
                   </span>
-                  <span v-else class="muted">未同步</span>
+                  <span v-else class="muted">从未尝试</span>
+                </td>
+                <td>
+                  <span v-if="account.last_heartbeat_success_at">
+                    {{ formatDateTime(account.last_heartbeat_success_at) }}
+                    <span class="muted">({{ formatTimeAgo(account.last_heartbeat_success_at) }})</span>
+                  </span>
+                  <span v-else class="muted">暂无成功记录</span>
+                </td>
+                <td>
+                  <span v-if="account.last_heartbeat_data_update_at">
+                    {{ formatDateTime(account.last_heartbeat_data_update_at) }}
+                    <span class="muted">({{ formatTimeAgo(account.last_heartbeat_data_update_at) }})</span>
+                  </span>
+                  <span v-else class="muted">暂无数据更新</span>
+                </td>
+                <td>
+                  <div class="result-summary">
+                    <div>{{ getHeartbeatResultText(account.last_heartbeat_result_code) }}</div>
+                    <div
+                      v-if="account.last_heartbeat_error_message"
+                      class="muted result-detail"
+                      :title="account.last_heartbeat_error_message"
+                    >
+                      {{ truncateText(account.last_heartbeat_error_message, 120) }}
+                    </div>
+                    <div
+                      v-else-if="account.last_heartbeat_duration_ms != null"
+                      class="muted result-detail"
+                    >
+                      耗时 {{ formatDurationMs(account.last_heartbeat_duration_ms) }}
+                    </div>
+                  </div>
                 </td>
                 <td>
                   <span class="sync-status" :class="account.status">
@@ -318,11 +353,35 @@ export default {
     const getSyncStatusText = (status) => {
       const map = {
         healthy: '正常',
+        healthy_no_data: '正常（无数据）',
         stale: '滞后',
         error: '异常',
         unknown: '未知'
       }
       return map[status] || '未知'
+    }
+
+    const getHeartbeatResultText = (resultCode) => {
+      const map = {
+        SUCCESS_WITH_DATA: '成功（有数据）',
+        SUCCESS_NO_DATA: '成功（无数据）',
+        FAILED: '同步失败',
+        SKIPPED_INVALID_ACCOUNT: '已跳过（账户配置无效）'
+      }
+      return map[resultCode] || '暂无结果'
+    }
+
+    const formatDurationMs = (durationMs) => {
+      if (durationMs == null || Number.isNaN(Number(durationMs))) return '-'
+      const value = Number(durationMs)
+      if (value < 1000) return `${value}ms`
+      return `${(value / 1000).toFixed(1)}s`
+    }
+
+    const truncateText = (text, maxLength = 120) => {
+      const content = String(text || '').trim()
+      if (!content) return ''
+      return content.length <= maxLength ? content : `${content.slice(0, maxLength)}...`
     }
 
     onMounted(() => {
@@ -342,7 +401,8 @@ export default {
       healthData, cronStatus, recentAlerts,
       loadAll,
       formatDateTime, formatTimeAgo,
-      getSystemStatusClass, getSystemStatusText, getSyncStatusText
+      getSystemStatusClass, getSystemStatusText, getSyncStatusText,
+      getHeartbeatResultText, formatDurationMs, truncateText
     }
   }
 }
@@ -538,11 +598,24 @@ export default {
 
 .sync-status.healthy { color: var(--secondary-color); }
 .sync-status.healthy .dot { background: var(--secondary-color); }
+.sync-status.healthy_no_data { color: #2b6cb0; }
+.sync-status.healthy_no_data .dot { background: #2b6cb0; }
 .sync-status.stale { color: var(--warning-color); }
 .sync-status.stale .dot { background: var(--warning-color); }
 .sync-status.error { color: var(--danger-color); }
 .sync-status.error .dot { background: var(--danger-color); }
 .sync-status.unknown { color: var(--text-secondary); }
+
+.result-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.result-detail {
+  max-width: 280px;
+  word-break: break-word;
+}
 
 /* Cron 任务列表 */
 .cron-info {

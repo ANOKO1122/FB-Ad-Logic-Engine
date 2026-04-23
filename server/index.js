@@ -116,6 +116,55 @@ function buildSpendFiltering () {
   return DEFAULT_SPEND_FILTERING
 }
 
+function createAbortError(message = '请求已取消') {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  error.code = 'ABORT_ERR'
+  return error
+}
+
+function isAbortLikeError(error) {
+  return error?.name === 'AbortError' ||
+    error?.name === 'CanceledError' ||
+    error?.code === 'ABORT_ERR' ||
+    error?.code === 'ERR_CANCELED'
+}
+
+function throwIfAborted(signal, message = '请求已取消') {
+  if (signal?.aborted) {
+    const reasonMessage = signal.reason?.message || signal.reason || message
+    throw createAbortError(String(reasonMessage))
+  }
+}
+
+function createTimeoutAwareSignal(signal, timeoutMs) {
+  if (!signal) {
+    return AbortSignal.timeout(timeoutMs)
+  }
+
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+  }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => {
+    controller.abort(createAbortError(`请求超时（${timeoutMs}ms）`))
+  }, timeoutMs)
+
+  const abortFromExternal = () => {
+    clearTimeout(timeoutId)
+    controller.abort(signal.reason || createAbortError('请求已取消'))
+  }
+
+  if (signal.aborted) {
+    abortFromExternal()
+  } else {
+    signal.addEventListener('abort', abortFromExternal, { once: true })
+  }
+
+  return controller.signal
+}
+
 let fbQueueSeq = 0
 let fbRunningCount = 0
 const fbPendingQueue = []
@@ -550,7 +599,7 @@ class FacebookMarketingAPI {
    * Graph 支持：GET /?ids=id1,id2&fields=...
    * 当 fields 含 adset_id,campaign_id,updated_time 时会一并映射到返回对象（供结构镜像表使用）。
    */
-  async resolveObjectsByIds(ids, { fields = 'id,name,effective_status,status,configured_status', requestPriority = 'track2', requestLabel = 'resolve_objects' } = {}) {
+  async resolveObjectsByIds(ids, { fields = 'id,name,effective_status,status,configured_status', requestPriority = 'track2', requestLabel = 'resolve_objects', signal = null } = {}) {
     const list = (Array.isArray(ids) ? ids : String(ids || '').split(','))
       .map(s => String(s || '').trim())
       .filter(Boolean)
@@ -570,7 +619,8 @@ class FacebookMarketingAPI {
       }
       const data = await this.makeRequest(url, params, 'GET', null, {
         requestPriority,
-        requestLabel
+        requestLabel,
+        signal
       })
       if (data.error) throw new Error(`Facebook API Error: ${data.error.message}`)
 
@@ -667,7 +717,7 @@ class FacebookMarketingAPI {
    * const timezone = await facebookApi.getAccountTimezone('act_123')
    * // 返回: 'Asia/Shanghai'
    */
-  async getAccountTimezone(accountId) {
+  async getAccountTimezone(accountId, options = {}) {
     try {
       // 第1-3行：构造请求 URL 和参数
       // Facebook Graph API：/{account_id}?fields=timezone_name
@@ -683,7 +733,8 @@ class FacebookMarketingAPI {
       // 第4-5行：发送请求
       const data = await this.makeRequest(url, params, 'GET', null, {
         requestPriority: 'today',
-        requestLabel: 'account_timezone'
+        requestLabel: 'account_timezone',
+        signal: options?.signal || null
       })
       
       // 第6-7行：检查错误
@@ -717,12 +768,14 @@ class FacebookMarketingAPI {
       timeout = 45000,
       requestPriority = 'track2',
       requestLabel = 'fb_request',
-      queueTimeoutMs = FB_GLOBAL_QUEUE_TIMEOUT_MS
+      queueTimeoutMs = FB_GLOBAL_QUEUE_TIMEOUT_MS,
+      signal = null
     } = options
 
     return enqueueFacebookRequest(
       { priority: requestPriority, label: requestLabel, queueTimeoutMs },
       async () => {
+        throwIfAborted(signal, `${requestLabel} 在发起前已被取消`)
         const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy
         
         // 检查 Token 熔断器状态（使用静态导入，避免动态导入导致的问题）
@@ -772,7 +825,7 @@ class FacebookMarketingAPI {
                 try {
                   logger.info(`🔄 尝试使用socks-proxy-agent: ${socksUrl}`)
                   const agent = new SocksProxyAgent(socksUrl, { timeout: timeout })
-                  const config = { params, httpsAgent: agent, httpAgent: agent, timeout: timeout }
+                  const config = { params, httpsAgent: agent, httpAgent: agent, timeout: timeout, signal }
                   
                   const requestPromise = method === 'POST' 
                     ? axios.post(url, body, config) 
@@ -799,6 +852,7 @@ class FacebookMarketingAPI {
                   logger.info('✅ socks-proxy-agent 请求成功')
                   return returnHeaders ? { data: resp.data, headers: resp.headers } : resp.data
                 } catch (socksError) {
+                  if (isAbortLikeError(socksError)) throw socksError
                   // 检查是否是 Token 错误
                   checkTokenError(socksError)
                   logger.warn('⚠️ socks-proxy-agent 也失败:', socksError.message)
@@ -808,9 +862,11 @@ class FacebookMarketingAPI {
             } else if (scheme === 'http') {
               // HTTP 代理：CONNECT 隧道（仅 http://；https:// 代理由方法3 HttpsProxyAgent 处理）
               try {
+                throwIfAborted(signal, `${requestLabel} 在 HTTP 代理前已被取消`)
                 logger.info('🔄 使用HTTP代理（CONNECT隧道）...')
                 return await this.requestViaHttpProxy(url, params, `http://${info.host}:${info.port}`, method, body)
               } catch (proxyError) {
+                if (isAbortLikeError(proxyError)) throw proxyError
                 logger.warn('⚠️ HTTP代理隧道失败:', proxyError.message)
               }
             }
@@ -830,7 +886,8 @@ class FacebookMarketingAPI {
               params,
               httpsAgent: agent,
               httpAgent: agent,
-              timeout: timeout
+              timeout: timeout,
+              signal
             }
             
             const requestPromise = method === 'POST' 
@@ -857,6 +914,7 @@ class FacebookMarketingAPI {
             
             return returnHeaders ? { data: response.data, headers: response.headers } : response.data
           } catch (httpError) {
+            if (isAbortLikeError(httpError)) throw httpError
             logger.warn('⚠️ HTTP代理agent失败:', httpError.message)
           }
         }
@@ -871,7 +929,7 @@ class FacebookMarketingAPI {
             const fetchOptions = {
               method: method,
               headers: { 'Accept': 'application/json' },
-              signal: AbortSignal.timeout(timeout)
+              signal: createTimeoutAwareSignal(signal, timeout)
             }
             if (method === 'POST' && body) {
               fetchOptions.headers['Content-Type'] = 'application/json'
@@ -907,6 +965,7 @@ class FacebookMarketingAPI {
             
             return returnHeaders ? { data, headers: Object.fromEntries(response.headers.entries()) } : data
           } catch (fetchError) {
+            if (isAbortLikeError(fetchError)) throw fetchError
             logger.warn('⚠️ 原生fetch失败:', fetchError.message)
           }
         }
@@ -915,7 +974,8 @@ class FacebookMarketingAPI {
         logger.info('🔄 尝试使用axios（依赖系统代理）...')
         const config = {
           params,
-          timeout: timeout
+          timeout: timeout,
+          signal
         }
         
         const requestPromise = method === 'POST' 
@@ -1309,7 +1369,8 @@ class FacebookMarketingAPI {
         try {
           data = await this.makeRequest(currentUrl, currentParams, 'GET', null, {
             requestPriority: 'today',
-            requestLabel: 'get_ad_insights'
+            requestLabel: 'get_ad_insights',
+            signal: options?.signal || null
           })
         } catch (e) {
           if (this.isInvalidFieldError(e) && currentParams.fields === fullFields) {

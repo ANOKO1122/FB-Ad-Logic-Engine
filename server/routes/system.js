@@ -5,6 +5,7 @@ import pool from '../db/connection.js'
 import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJwt.js'
 import { getCronStatus, manualSyncAccounts } from '../services/cronService.js'
 import { getCircuitBreakerStatus } from '../services/rateLimitService.js'
+import { HEARTBEAT_RESULT_CODE } from '../services/heartbeatStatusContract.js'
 
 const router = Router()
 
@@ -19,6 +20,61 @@ function toUTCISO(val) {
   if (s.endsWith('Z')) return s
   const normalized = s.includes('T') ? s : s.replace(' ', 'T')
   return normalized.includes('.') ? `${normalized}Z` : `${normalized}.000Z`
+}
+
+function getMinutesSince(dateValue, now) {
+  if (!dateValue) return null
+  const parsed = new Date(dateValue)
+  if (Number.isNaN(parsed.getTime())) return null
+  return Math.round((now - parsed) / (1000 * 60))
+}
+
+function mapHeartbeatHealthStatus(row, now) {
+  const minutesSinceAttempt = getMinutesSince(row.last_heartbeat_attempt_at, now)
+  const resultCode = row.last_heartbeat_result_code || null
+
+  if (!row.last_heartbeat_attempt_at) {
+    return {
+      status: 'unknown',
+      minutesSinceAttempt: null
+    }
+  }
+
+  // 中文注释：这里先看“最后结果码”，再看“距离最近尝试过去了多久”。
+  // 原因是业务心跳的语义已经写进 structure_sync_status，页面应该基于“事实状态”判断，
+  // 不能再退回到“热表里有没有数据”的猜测逻辑。
+  if (resultCode === HEARTBEAT_RESULT_CODE.FAILED || resultCode === HEARTBEAT_RESULT_CODE.SKIPPED_INVALID_ACCOUNT) {
+    return {
+      status: 'error',
+      minutesSinceAttempt
+    }
+  }
+
+  if (minutesSinceAttempt != null && minutesSinceAttempt > 60) {
+    return {
+      status: 'stale',
+      minutesSinceAttempt
+    }
+  }
+
+  if (resultCode === HEARTBEAT_RESULT_CODE.SUCCESS_WITH_DATA) {
+    return {
+      status: 'healthy',
+      minutesSinceAttempt
+    }
+  }
+
+  if (resultCode === HEARTBEAT_RESULT_CODE.SUCCESS_NO_DATA) {
+    return {
+      status: 'healthy_no_data',
+      minutesSinceAttempt
+    }
+  }
+
+  return {
+    status: 'unknown',
+    minutesSinceAttempt
+  }
 }
 
 // ===========================
@@ -345,9 +401,14 @@ router.get('/system/health', requireAuth, requireActive, async (req, res) => {
         am.fb_account_id AS account_id,
         am.fb_account_name AS account_name,
         am.timezone_name,
-        MAX(ad.synced_at) AS last_sync_time
+        MAX(ss.last_heartbeat_attempt_at) AS last_heartbeat_attempt_at,
+        MAX(ss.last_heartbeat_success_at) AS last_heartbeat_success_at,
+        MAX(ss.last_heartbeat_data_update_at) AS last_heartbeat_data_update_at,
+        MAX(ss.last_heartbeat_result_code) AS last_heartbeat_result_code,
+        MAX(ss.last_heartbeat_error_message) AS last_heartbeat_error_message,
+        MAX(ss.last_heartbeat_duration_ms) AS last_heartbeat_duration_ms
       FROM account_mappings am
-      LEFT JOIN ad_snapshots ad ON am.fb_account_id = ad.account_id
+      LEFT JOIN structure_sync_status ss ON am.fb_account_id = ss.account_id
       WHERE am.is_active = 1
       GROUP BY am.fb_account_id, am.fb_account_name, am.timezone_name
       ORDER BY am.fb_account_name
@@ -357,9 +418,14 @@ router.get('/system/health', requireAuth, requireActive, async (req, res) => {
         am.fb_account_id AS account_id,
         am.fb_account_name AS account_name,
         am.timezone_name,
-        MAX(ad.synced_at) AS last_sync_time
+        MAX(ss.last_heartbeat_attempt_at) AS last_heartbeat_attempt_at,
+        MAX(ss.last_heartbeat_success_at) AS last_heartbeat_success_at,
+        MAX(ss.last_heartbeat_data_update_at) AS last_heartbeat_data_update_at,
+        MAX(ss.last_heartbeat_result_code) AS last_heartbeat_result_code,
+        MAX(ss.last_heartbeat_error_message) AS last_heartbeat_error_message,
+        MAX(ss.last_heartbeat_duration_ms) AS last_heartbeat_duration_ms
       FROM account_mappings am
-      LEFT JOIN ad_snapshots ad ON am.fb_account_id = ad.account_id
+      LEFT JOIN structure_sync_status ss ON am.fb_account_id = ss.account_id
       WHERE am.is_active = 1 AND am.owner_id = ?
       GROUP BY am.fb_account_id, am.fb_account_name, am.timezone_name
       ORDER BY am.fb_account_name
@@ -371,28 +437,21 @@ router.get('/system/health', requireAuth, requireActive, async (req, res) => {
     // 处理同步状态
     const now = new Date()
     const accountSyncStatus = rows.map(row => {
-      let status = 'unknown'
-      let minutesSinceSync = null
-      
-      if (row.last_sync_time) {
-        const lastSync = new Date(row.last_sync_time)
-        minutesSinceSync = Math.round((now - lastSync) / (1000 * 60))
-        
-        if (minutesSinceSync <= 15) {
-          status = 'healthy'
-        } else if (minutesSinceSync <= 60) {
-          status = 'stale'
-        } else {
-          status = 'error'
-        }
-      }
-      
+      const { status, minutesSinceAttempt } = mapHeartbeatHealthStatus(row, now)
+
       return {
         account_id: row.account_id,
         account_name: row.account_name || row.account_id,
         timezone: row.timezone_name || 'UTC',
-        last_sync_time: row.last_sync_time,
-        minutes_since_sync: minutesSinceSync,
+        last_heartbeat_attempt_at: toUTCISO(row.last_heartbeat_attempt_at),
+        last_heartbeat_success_at: toUTCISO(row.last_heartbeat_success_at),
+        last_heartbeat_data_update_at: toUTCISO(row.last_heartbeat_data_update_at),
+        last_heartbeat_result_code: row.last_heartbeat_result_code || null,
+        last_heartbeat_error_message: row.last_heartbeat_error_message || null,
+        last_heartbeat_duration_ms: row.last_heartbeat_duration_ms != null
+          ? Number(row.last_heartbeat_duration_ms)
+          : null,
+        minutes_since_attempt: minutesSinceAttempt,
         status
       }
     })
