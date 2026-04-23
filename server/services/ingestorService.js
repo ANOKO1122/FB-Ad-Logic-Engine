@@ -28,6 +28,57 @@ import { piggybackStructureFromToday, runPseudoIncrementForAccount } from './str
 // 注意：如果出现 429 限流错误，可再降到 4；若代理稳定，可提高到 8
 const CONCURRENT_LIMIT = 6
 const accountTaskLimiter = pLimit(CONCURRENT_LIMIT)
+const AGENT_EVENT_DEFAULT_TIMEOUT_MS = 1500
+
+function isAgentEventEnabled() {
+  const raw = String(process.env.AGENT_EVENT_ENABLED || '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+function getAgentEventUrl() {
+  return String(process.env.AGENT_EVENT_URL || '').trim()
+}
+
+/**
+ * 统一收口本地调试事件上报。
+ * 设计原则：默认关闭、best-effort、不 await，不允许调试链路反向阻塞统一心跳/归档主流程。
+ *
+ * @param {{ location: string, message: string, data?: Record<string, unknown>, timestamp?: number }} payload
+ */
+function reportAgentEvent(payload) {
+  if (!isAgentEventEnabled()) {
+    return
+  }
+
+  const url = getAgentEventUrl()
+  if (!url) {
+    return
+  }
+
+  const timeoutMsRaw = Number(process.env.AGENT_EVENT_TIMEOUT_MS)
+  const timeoutMs = Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0
+    ? timeoutMsRaw
+    : AGENT_EVENT_DEFAULT_TIMEOUT_MS
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => {
+    controller.abort()
+  }, timeoutMs)
+
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...payload,
+      timestamp: payload?.timestamp ?? Date.now()
+    }),
+    signal: controller.signal
+  })
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(timeoutId)
+    })
+}
 
 // ============================================
 // 写入时兜底：从 structure_ads 补齐 campaign_id / adset_id
@@ -3217,7 +3268,7 @@ async function processHeartbeatAccount(account, options = {}) {
     const skipReason = `账户配置无效：account_id=${accountId || 'empty'}, owner_id=${ownerId ?? 'null'}`
     logger.warn(`⚠️  跳过无效账户: account_id=${accountId}, owner_id=${ownerId}`)
     // #region agent log
-    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'skip account no owner',data:{hypothesisId:'H1',accountId,hasOwner:!!ownerId,ownerIdType:ownerId===0?'zero':typeof ownerId},timestamp:Date.now()})}).catch(()=>{})
+    reportAgentEvent({ location: 'ingestorService.js:unifiedHeartbeatSync', message: 'skip account no owner', data: { hypothesisId: 'H1', accountId, hasOwner: !!ownerId, ownerIdType: ownerId === 0 ? 'zero' : typeof ownerId } })
     // #endregion
     return {
       synced: false,
@@ -3469,7 +3520,7 @@ export async function unifiedHeartbeatSync() {
   if (heartbeatRunning) {
     logger.info('⏸️  统一心跳正在执行中，跳过本次任务（防重入）')
     // #region agent log
-    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'heartbeat skipped',data:{hypothesisId:'H2',reason:'already_running'},timestamp:Date.now()})}).catch(()=>{})
+    reportAgentEvent({ location: 'ingestorService.js:unifiedHeartbeatSync', message: 'heartbeat skipped', data: { hypothesisId: 'H2', reason: 'already_running' } })
     // #endregion
     return {
       success: true,
@@ -3494,7 +3545,7 @@ export async function unifiedHeartbeatSync() {
     if (!lockAcquired) {
       logger.info('⏸️  统一心跳锁已被占用（可能其他实例正在执行），跳过本次任务')
       // #region agent log
-      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'heartbeat skipped',data:{hypothesisId:'H2',reason:'global_lock_busy'},timestamp:Date.now()})}).catch(()=>{})
+      reportAgentEvent({ location: 'ingestorService.js:unifiedHeartbeatSync', message: 'heartbeat skipped', data: { hypothesisId: 'H2', reason: 'global_lock_busy' } })
       // #endregion
       // 立即释放连接（未获取锁时）
       if (lockConnection) {
@@ -3512,7 +3563,7 @@ export async function unifiedHeartbeatSync() {
       }
     }
     // #region agent log
-    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'global heartbeat lock acquired',data:{hypothesisId:'H2',lockName:HEARTBEAT_LOCK_NAME},timestamp:Date.now()})}).catch(()=>{})
+    reportAgentEvent({ location: 'ingestorService.js:unifiedHeartbeatSync', message: 'global heartbeat lock acquired', data: { hypothesisId: 'H2', lockName: HEARTBEAT_LOCK_NAME } })
     // #endregion
     // 注意：获取锁后，不能立即释放连接，必须等到释放锁后再释放连接
   } catch (lockError) {
@@ -3569,7 +3620,7 @@ export async function unifiedHeartbeatSync() {
     logger.info(`📋 找到 ${accounts.length} 个活跃账户`)
     markHeartbeatProgress('accounts_loaded')
     // #region agent log
-    fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:unifiedHeartbeatSync',message:'accounts loaded for heartbeat',data:{hypothesisId:'H2',totalAccounts:accounts.length},timestamp:Date.now()})}).catch(()=>{})
+    reportAgentEvent({ location: 'ingestorService.js:unifiedHeartbeatSync', message: 'accounts loaded for heartbeat', data: { hypothesisId: 'H2', totalAccounts: accounts.length } })
     // #endregion
     logger.info(`🚀 使用受控并发模式（并发度 = ${CONCURRENT_LIMIT}）`)
     
@@ -3858,7 +3909,7 @@ async function checkAndExecuteArchive(accountId, ownerId, timezoneName, localTim
   const yesterday = localTime.minus({ days: 1 })
   const targetDateStr = yesterday.toFormat('yyyy-MM-dd')
   // #region agent log
-  fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:checkAndExecuteArchive',message:'archive check',data:{hypothesisId:'H3',accountId,hour,targetDateStr,timezoneName},timestamp:Date.now()})}).catch(()=>{})
+  reportAgentEvent({ location: 'ingestorService.js:checkAndExecuteArchive', message: 'archive check', data: { hypothesisId: 'H3', accountId, hour, targetDateStr, timezoneName } })
   // #endregion
   
   let archived = false
@@ -3945,7 +3996,7 @@ async function executeArchive(accountId, ownerId, timezoneName, targetDateStr, t
     if (!lockAcquired) {
       logger.info(`   ⏸️  锁已被占用，跳过（可能其他实例正在归档）`)
       // #region agent log
-      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:executeArchive',message:'archive row lock busy',data:{hypothesisId:'H4',accountId,targetDateStr,targetStatus},timestamp:Date.now()})}).catch(()=>{})
+      reportAgentEvent({ location: 'ingestorService.js:executeArchive', message: 'archive row lock busy', data: { hypothesisId: 'H4', accountId, targetDateStr, targetStatus } })
       // #endregion
       return { success: false, skipped: true, reason: 'lock_busy' }
     }
@@ -3971,7 +4022,7 @@ async function executeArchive(accountId, ownerId, timezoneName, targetDateStr, t
         [accountId, targetDateStr, targetStatus]
       )
       // #region agent log
-      fetch('http://localhost:7243/ingest/f4e89cc6-afa3-467d-94f6-9c94250491b9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ingestorService.js:executeArchive',message:'daily_archive_status upserted',data:{hypothesisId:'H5',accountId,targetDateStr,targetStatus,archivedCount},timestamp:Date.now()})}).catch(()=>{})
+      reportAgentEvent({ location: 'ingestorService.js:executeArchive', message: 'daily_archive_status upserted', data: { hypothesisId: 'H5', accountId, targetDateStr, targetStatus, archivedCount } })
       // #endregion
       
       logger.info(`   ✅ 归档完成，共 ${archivedCount} 条记录，状态: ${targetStatus}`)
