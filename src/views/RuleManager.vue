@@ -300,9 +300,15 @@
             </div>
 
             <!-- 监控范围条件（可选）：按条件自动勾选下方列表中的对象 -->
-            <div class="form-group scope-condition-block">
+            <div
+              class="form-group scope-condition-block"
+              :class="{ 'scope-condition-block-disabled': isScopeConditionsDisabled }"
+            >
               <label>监控范围条件（可选）</label>
               <div class="hint scope-condition-hint">根据下方条件自动勾选匹配的对象；不填则需手动勾选。</div>
+              <div v-if="isScopeConditionsDisabled" class="hint scope-condition-disabled-tip">
+                未开启动态筛选时，监控范围条件不生效。请开启动态筛选或手动勾选目标对象。
+              </div>
               <div class="conditions-container scope-condition-rows">
                 <div
                   v-for="(row, idx) in scopeConditionRows"
@@ -311,12 +317,21 @@
                 >
                   <span v-if="idx > 0" class="join-label">AND</span>
                   <span v-else class="join-placeholder"></span>
-                  <select v-model="row.field" class="select scope-field-select" @change="onScopeConditionFieldChange(row)">
+                  <select
+                    v-model="row.field"
+                    class="select scope-field-select"
+                    :disabled="isScopeConditionsDisabled"
+                    @change="onScopeConditionFieldChange(row)"
+                  >
                     <option value="name">名称</option>
                     <option value="status">状态</option>
                     <option value="created_within">创建时间段</option>
                   </select>
-                  <select v-model="row.operator" class="select scope-operator-select" :disabled="row.field === 'created_within'">
+                  <select
+                    v-model="row.operator"
+                    class="select scope-operator-select"
+                    :disabled="isScopeConditionsDisabled || row.field === 'created_within'"
+                  >
                     <template v-if="row.field === 'name'">
                       <option value="include">包含</option>
                       <option value="exclude">不包含</option>
@@ -335,14 +350,16 @@
                       type="text"
                       class="input-text scope-value-input"
                       placeholder="请输入名称 (例: 优化师_项目)"
-                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                      :disabled="isScopeConditionsDisabled"
+                      :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
                     />
                   </template>
                   <template v-else-if="row.field === 'created_within'">
                     <select
                       v-model="row.value"
                       class="select scope-value-select"
-                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                      :disabled="isScopeConditionsDisabled"
+                      :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
                     >
                       <option value="">请选择</option>
                       <option value="24">近 24 小时内</option>
@@ -358,14 +375,16 @@
                       max="720"
                       class="input-text scope-value-input scope-custom-hours"
                       placeholder="请输入小时数 (1–720)"
-                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                      :disabled="isScopeConditionsDisabled"
+                      :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
                     />
                   </template>
                   <template v-else>
                     <select
                       v-model="row.value"
                       class="select scope-value-select"
-                      :class="{ 'input-error': scopeConditionRowError(row) }"
+                      :disabled="isScopeConditionsDisabled"
+                      :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
                     >
                       <option value="">请选择</option>
                       <option value="active_only">所有投放中</option>
@@ -378,16 +397,18 @@
                     type="button"
                     class="btn-icon danger"
                     title="删除"
+                    :disabled="isScopeConditionsDisabled"
                     @click="removeScopeConditionRow(idx)"
                   >×</button>
-                  <div v-if="scopeConditionRowError(row)" class="scope-row-error">{{ scopeConditionRowError(row) }}</div>
+                  <div v-if="!isScopeConditionsDisabled && scopeConditionRowError(row)" class="scope-row-error">{{ scopeConditionRowError(row) }}</div>
                 </div>
-                <a
+                <button
                   v-if="scopeConditionRows.length < SCOPE_CONDITION_MAX_ROWS"
-                  href="javascript:void(0)"
-                  class="link-add-scope"
-                  @click.prevent="addScopeConditionRow"
-                >添加监控范围 ({{ scopeConditionRows.length }}/{{ SCOPE_CONDITION_MAX_ROWS }})</a>
+                  type="button"
+                  class="link-add-scope link-add-scope-button"
+                  :disabled="isScopeConditionsDisabled"
+                  @click="addScopeConditionRow"
+                >添加监控范围 ({{ scopeConditionRows.length }}/{{ SCOPE_CONDITION_MAX_ROWS }})</button>
                 <span v-else class="hint">已达 {{ SCOPE_CONDITION_MAX_ROWS }} 条上限</span>
                 <div v-if="scopeApplyMessage" class="scope-apply-row">
                   <span class="scope-apply-message">{{ scopeApplyMessage }}</span>
@@ -1453,6 +1474,7 @@ export default {
       ruleForm.value.matchedCount != null &&
       ruleForm.value.matchedCount !== (ruleForm.value.targetIds?.length ?? 0)
     )
+    const isScopeConditionsDisabled = computed(() => ruleForm.value.useDynamicScope !== true)
 
     const missingSelectedCount = computed(() => {
       return ruleForm.value.targetIds.filter(id => !scopeLoadedIdSet.value.has(String(id))).length
@@ -1647,6 +1669,9 @@ export default {
         invalidIds: Array.isArray(r.invalid_ids) ? r.invalid_ids : []
       }))
       scopeConditionRows.value = buildScopeRowsFromFilters(r.scopeFilters || r.scope_filters || null)
+      if (ruleForm.value.useDynamicScope !== true) {
+        clearScopeConditions()
+      }
       const normalizedCount = normalizeBudgetGuardsByAction(ruleForm.value.actions)
       if (normalizedCount > 0) {
         console.info(`[规则编辑] 已自动归一化 ${normalizedCount} 个预算护栏字段（动作与上下限口径对齐）`)
@@ -1830,7 +1855,9 @@ export default {
         timezoneName: ruleForm.value.timezoneName,
         isSimulation: ruleForm.value.isSimulation,
         useDynamicScope: !!ruleForm.value.useDynamicScope,
-        scopeFilters: buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel),
+        scopeFilters: ruleForm.value.useDynamicScope
+          ? buildScopeFiltersFromRows(scopeConditionRows.value, ruleForm.value.targetLevel)
+          : null,
         excludeIds: buildExcludeIdsPayload(ruleForm.value.excludeTargetIds, ruleForm.value.targetLevel),
         maxDynamicMatches: Math.floor(maxDynamicMatches),
         executionIntervalMinutes: ruleForm.value.executionIntervalPreset === 'custom'
@@ -2276,16 +2303,19 @@ export default {
     }
 
     const addScopeConditionRow = () => {
+      if (isScopeConditionsDisabled.value) return
       if (scopeConditionRows.value.length >= SCOPE_CONDITION_MAX_ROWS) return
       scopeConditionRows.value.push(createDefaultScopeConditionRow())
     }
     const removeScopeConditionRow = (idx) => {
+      if (isScopeConditionsDisabled.value) return
       scopeConditionRows.value.splice(idx, 1)
       if (scopeConditionRows.value.length === 0) {
         scopeConditionRows.value = [createDefaultScopeConditionRow()]
       }
     }
     const onScopeConditionFieldChange = (row) => {
+      if (isScopeConditionsDisabled.value) return
       if (row.field === 'name') {
         row.operator = 'include'
         row.value = ''
@@ -2492,7 +2522,7 @@ export default {
       }
     }
 
-    // 监控范围条件 / 已选账户 / 目标层级 任一变更：① 无「名称 包含」有值时清空搜索栏；② 有完整行且已选账户时 2 秒防抖后自动应用
+    // 监控范围条件 / 已选账户 / 目标层级 任一变更：无「名称 包含」有值时清空搜索栏
     let scopeAutoApplyTimer = null
     watch(
       [scopeConditionRows, selectedAccountIds, () => ruleForm.value.targetLevel],
@@ -2501,15 +2531,8 @@ export default {
           r => r.field === 'name' && r.operator === 'include' && String(r.value || '').trim()
         )
         if (!hasNameIncludeValue) scopeSearch.value = ''
-        const completed = scopeConditionRows.value.filter(row => !scopeConditionRowError(row))
         if (scopeAutoApplyTimer) clearTimeout(scopeAutoApplyTimer)
         scopeAutoApplyTimer = null
-        if (completed.length > 0 && selectedAccountIds.value.length > 0 && !ruleForm.value.useDynamicScope) {
-          scopeAutoApplyTimer = setTimeout(() => {
-            scopeAutoApplyTimer = null
-            applyScopeConditions()
-          }, 2000)
-        }
       },
       { deep: true }
     )
@@ -2562,6 +2585,24 @@ export default {
         }, 3000)
       },
       { deep: true }
+    )
+
+    const clearScopeConditions = () => {
+      scopeConditionRows.value = [createDefaultScopeConditionRow()]
+      scopeApplyMessage.value = ''
+      scopeStatusFilter.value = ''
+      scopeStatusExcludeFilter.value = ''
+      scopeNameExclude.value = ''
+      scopeCreatedWithinHours.value = null
+    }
+
+    watch(
+      () => ruleForm.value.useDynamicScope,
+      (next, prev) => {
+        if (prev === true && next === false) {
+          clearScopeConditions()
+        }
+      }
     )
 
     watch(showRuleModal, (v) => {
@@ -2699,7 +2740,7 @@ export default {
       refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection, selectAllExcludeScope, clearExcludeScopeSelection,
       showSyncButton, syncJustDoneMessage, syncConfigFromMatch,
       addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange,
-      scopeConditionRows, SCOPE_CONDITION_MAX_ROWS, addScopeConditionRow, removeScopeConditionRow, onScopeConditionFieldChange,
+      scopeConditionRows, SCOPE_CONDITION_MAX_ROWS, addScopeConditionRow, removeScopeConditionRow, onScopeConditionFieldChange, isScopeConditionsDisabled,
       scopeConditionRowError, scopeApplyMessage,
       executionTimeAllDay, executionTimeStart, executionTimeEnd, INTERVAL_PRESETS
     }
@@ -3154,13 +3195,35 @@ input:checked + .slider:before { transform: translateX(16px); }
 .join-placeholder { flex: 0 0 60px; display: inline-block; }
 .join-label { flex: 0 0 60px; font-size: 13px; color: var(--primary-color); font-weight: 500; }
 .scope-condition-block { margin-top: 8px; }
+.scope-condition-block.scope-condition-block-disabled {
+  opacity: 0.72;
+  background: #f9fafb;
+  border: 1px dashed #d1d5db;
+  border-radius: 8px;
+  padding: 10px;
+}
 .scope-condition-hint { margin-bottom: 8px; }
+.scope-condition-disabled-tip {
+  margin-bottom: 8px;
+  color: #6b7280;
+}
 .scope-condition-rows .scope-condition-row { flex-wrap: wrap; }
 .scope-condition-row .scope-value-input { min-width: 180px; flex: 1; }
 .scope-condition-row .scope-value-select { min-width: 160px; }
 .scope-row-error { flex: 0 0 100%; width: 100%; margin-top: 4px; margin-left: 68px; font-size: 12px; color: var(--danger-color); }
 .link-add-scope { color: var(--primary-color); font-size: 13px; text-decoration: none; }
 .link-add-scope:hover { text-decoration: underline; }
+.link-add-scope-button {
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.link-add-scope-button:disabled {
+  color: #9ca3af;
+  cursor: not-allowed;
+  text-decoration: none;
+}
 .scope-apply-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .scope-apply-message { font-size: 12px; color: var(--text-secondary); }
 .sync-just-done-hint { font-size: 12px; color: var(--primary-color); margin-top: 6px; }

@@ -42,6 +42,12 @@ function parseDynamicScopePayload(body = {}) {
   }
 }
 
+function hasEffectiveScopeFilters(scopeFilters) {
+  if (!scopeFilters || typeof scopeFilters !== 'object') return false
+  const conditions = Array.isArray(scopeFilters.conditions) ? scopeFilters.conditions : []
+  return conditions.some((item) => item && typeof item === 'object')
+}
+
 function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
   const errors = []
   const updates = {}
@@ -85,7 +91,10 @@ function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
   }
   if (dynamicPayload.scopeFilters !== undefined) {
     const sf = dynamicPayload.scopeFilters
-    if (!sf || typeof sf !== 'object') {
+    // 显式传 null 视为「清空监控范围条件」，用于关闭动态筛选时归零。
+    if (sf === null) {
+      updates.scopeFilters = null
+    } else if (!sf || typeof sf !== 'object') {
       errors.push('scopeFilters 必须是对象')
     } else {
       const level = String(sf.level || fallbackTargetLevel || 'ad').trim().toLowerCase()
@@ -94,6 +103,14 @@ function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
       }
       const conditions = Array.isArray(sf.conditions) ? sf.conditions : []
       updates.scopeFilters = { level, conditions }
+    }
+  }
+  if (dynamicPayload.useDynamicScope === false && hasEffectiveScopeFilters(updates.scopeFilters)) {
+    return {
+      valid: false,
+      error: '动态筛选关闭时不可设置监控范围条件',
+      code: 'DYNAMIC_SCOPE_DISABLED_SCOPE_FILTERS_FORBIDDEN',
+      updates
     }
   }
   return { valid: errors.length === 0, error: errors[0], updates }
@@ -521,7 +538,7 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
     })
     const dynamicCheck = validateDynamicScopePayload(dynamicPayload, targetLevel)
     if (!dynamicCheck.valid) {
-      return res.status(400).json({ error: dynamicCheck.error, code: 'INVALID_DYNAMIC_SCOPE' })
+      return res.status(400).json({ error: dynamicCheck.error, code: dynamicCheck.code || 'INVALID_DYNAMIC_SCOPE' })
     }
 
     const newRule = await rulesService.createRule(userId, {
@@ -579,6 +596,7 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     if (isNaN(ruleId)) {
       return res.status(400).json({ error: '无效的规则 ID' })
     }
+
     
     // 验证 updates 不为空
     if (Object.keys(body).length === 0) {
@@ -619,9 +637,10 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     const dynamicPayload = parseDynamicScopePayload(body)
     const dynamicCheck = validateDynamicScopePayload(dynamicPayload, updates.targetLevel || body.targetLevel || 'ad')
     if (!dynamicCheck.valid) {
-      return res.status(400).json({ error: dynamicCheck.error, code: 'INVALID_DYNAMIC_SCOPE' })
+      return res.status(400).json({ error: dynamicCheck.error, code: dynamicCheck.code || 'INVALID_DYNAMIC_SCOPE' })
     }
     Object.assign(updates, dynamicCheck.updates)
+
 
     if (updates.targetAccountIds && updates.targetAccountIds.length > 0 && !isAdmin) {
       for (const aid of updates.targetAccountIds) {
@@ -741,6 +760,16 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
     const existingForGate = await rulesService.getRuleById(ruleId, userId, isAdmin, req.user.owner_id ?? null)
     if (!existingForGate) {
       return res.status(404).json({ error: '规则不存在或无权访问', code: 'NOT_FOUND' })
+    }
+    const currentUseDynamicScope = Number(existingForGate.useDynamicScope ?? existingForGate.use_dynamic_scope) === 1
+    const mergedUseDynamicScope = Object.prototype.hasOwnProperty.call(updates, 'useDynamicScope')
+      ? !!updates.useDynamicScope
+      : currentUseDynamicScope
+    if (mergedUseDynamicScope === false && hasEffectiveScopeFilters(updates.scopeFilters)) {
+      return res.status(400).json({
+        error: '动态筛选关闭时不可设置监控范围条件',
+        code: 'DYNAMIC_SCOPE_DISABLED_SCOPE_FILTERS_FORBIDDEN'
+      })
     }
     const mergedForGate = mergeRuleForEnableCheck(existingForGate, updates)
     const gate = await assertRuleReadyToEnable(mergedForGate, { isAdmin, ownerId: ownerId ?? null })
