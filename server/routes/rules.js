@@ -169,6 +169,9 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
       if (ownerIds.length === 0) ownerIds = undefined
     }
 
+    // 解析 includeNoOwner：仅管理员有效，筛出 users.owner_id IS NULL 的规则（管理员创建、未分配负责人的规则）
+    const includeNoOwner = isAdmin && req.query.includeNoOwner === '1'
+
     const options = {
       onlyEnabled: req.query.onlyEnabled === 'true',
       orderBy: req.query.orderBy || 'createdAt',
@@ -176,6 +179,7 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
       offset: req.query.offset ? parseInt(req.query.offset) : undefined,
       isAdmin,
       ownerIds,
+      includeNoOwner,
       // 非管理员：按负责人维度列出规则（与模板铺底「一负责人一套」一致）
       viewerOwnerId: isAdmin ? undefined : req.user.owner_id
     }
@@ -310,6 +314,203 @@ router.post('/rules/preview-dynamic-scope', requireAuth, requireActive, async (r
     return res.json(result)
   } catch (err) {
     next(err)
+  }
+})
+
+/**
+ * POST /api/rules/batch/add-accounts
+ * 批量追加广告账户到指定规则
+ * 请求体：{ ruleIds: number[], accountIds: string[] }
+ * 合同：best-effort（逐规则编排，单条失败不回滚），固定返回 200
+ */
+router.post('/rules/batch/add-accounts', requireAuth, requireActive, async (req, res) => {
+  const FRESHNESS_THRESHOLD_MS = 30 * 60 * 1000 // 30 分钟
+  const userId = req.user.id
+  const isAdmin = isAdminLikeRole(req.user.role)
+  const ownerId = req.user.owner_id
+  const viewerOwnerId = isAdmin ? null : (req.user.owner_id ?? null)
+
+  try {
+    const { ruleIds, accountIds } = req.body || {}
+
+    // --- Step 1: 参数校验 ---
+    if (!Array.isArray(ruleIds) || ruleIds.length === 0) {
+      return res.status(400).json({ error: 'ruleIds 必须为非空数组', code: 'INVALID_RULE_IDS' })
+    }
+    if (!Array.isArray(accountIds) || accountIds.length === 0) {
+      return res.status(400).json({ error: 'accountIds 必须为非空数组', code: 'INVALID_ACCOUNT_IDS' })
+    }
+
+    const ruleIdSet = [...new Set(ruleIds.map(id => Number(id)).filter(Number.isFinite))]
+    if (ruleIdSet.length === 0) {
+      return res.status(400).json({ error: 'ruleIds 中无有效数值', code: 'INVALID_RULE_IDS' })
+    }
+    const accountIdSet = [...new Set(accountIds.map(id => String(id || '').trim()).filter(Boolean))]
+    if (accountIdSet.length === 0) {
+      return res.status(400).json({ error: 'accountIds 中无有效账户', code: 'INVALID_ACCOUNT_IDS' })
+    }
+
+    // --- Step 2: 预校验每个 accountId 的访问权限 ---
+    for (const accountId of accountIdSet) {
+      let rows
+      if (isAdmin) {
+        [rows] = await pool.execute(
+          `SELECT 1 FROM account_mappings WHERE fb_account_id = ? AND is_active = 1 LIMIT 1`,
+          [accountId]
+        )
+      } else {
+        if (!ownerId) {
+          return res.status(403).json({ error: `无权访问广告账户 ${accountId}`, code: 'ACCOUNT_FORBIDDEN' })
+        }
+        [rows] = await pool.execute(
+          `SELECT 1 FROM account_mappings WHERE fb_account_id = ? AND owner_id = ? AND is_active = 1 LIMIT 1`,
+          [accountId, ownerId]
+        )
+      }
+      if (rows.length === 0) {
+        return res.status(403).json({ error: `无权访问广告账户 ${accountId}`, code: 'ACCOUNT_FORBIDDEN' })
+      }
+    }
+
+    // --- Step 3: 读取每个账户的结构数据新鲜度 ---
+    const freshnessMap = new Map() // key=accountId, value='fresh'|'stale'|'missing'
+    if (accountIdSet.length > 0) {
+      const placeholders = accountIdSet.map(() => '?').join(',')
+      const [statusRows] = await pool.execute(
+        `SELECT account_id, last_heartbeat_data_update_at FROM structure_sync_status WHERE account_id IN (${placeholders})`,
+        accountIdSet
+      )
+      const statusByAccount = new Map()
+      for (const row of statusRows || []) {
+        statusByAccount.set(String(row.account_id), row.last_heartbeat_data_update_at)
+      }
+      const now = Date.now()
+      for (const accountId of accountIdSet) {
+        const ts = statusByAccount.get(accountId)
+        if (!ts) {
+          freshnessMap.set(accountId, 'missing')
+        } else {
+          freshnessMap.set(accountId, (now - new Date(ts).getTime()) <= FRESHNESS_THRESHOLD_MS ? 'fresh' : 'stale')
+        }
+      }
+    }
+
+    // --- Step 4: 逐规则编排 ---
+    const results = []
+    let updatedCount = 0
+    let unchangedCount = 0
+    let failedCount = 0
+    let pendingDataRules = 0
+
+    for (const ruleId of ruleIdSet) {
+      try {
+        // 4a: 读取规则（鉴权通过 getRuleById）
+        const rule = await rulesService.getRuleById(ruleId, userId, isAdmin, viewerOwnerId)
+        if (!rule) {
+          results.push({
+            ruleId,
+            status: 'not_found',
+            added: 0,
+            skipped: accountIdSet.length,
+            pendingDataAccounts: [],
+            code: 'NOT_FOUND'
+          })
+          failedCount++
+          continue
+        }
+
+        // 4b: 计算现有账户集合（从 targetAccountIds + accountId）
+        const rawTargetAccountIds = rule.targetAccountIds ?? rule.target_account_ids
+        const oldAccountIds = new Set(
+          Array.isArray(rawTargetAccountIds)
+            ? rawTargetAccountIds.map(a => String(a).trim()).filter(Boolean)
+            : []
+        )
+        // 兜底：若 targetAccountIds 为空，主账户 accountId 也算在作用范围内
+        if (rule.accountId) oldAccountIds.add(String(rule.accountId).trim())
+
+        // 4c: 合并新账户
+        const pendingDataAccounts = []
+        let added = 0
+        for (const accountId of accountIdSet) {
+          if (oldAccountIds.has(accountId)) continue
+          oldAccountIds.add(accountId)
+          added++
+          // 判断该账户结构数据是否新鲜
+          const freshness = freshnessMap.get(accountId) || 'missing'
+          if (freshness !== 'fresh') {
+            pendingDataAccounts.push(accountId)
+          }
+        }
+        const mergedAccounts = [...oldAccountIds]
+
+        if (added === 0) {
+          // 全部已存在，无需更新
+          results.push({
+            ruleId,
+            status: 'unchanged',
+            added: 0,
+            skipped: accountIdSet.length,
+            pendingDataAccounts,
+            code: pendingDataAccounts.length > 0 ? 'PENDING_DATA' : 'OK'
+          })
+          unchangedCount++
+          continue
+        }
+
+        // 4d: 更新 targetAccountIds
+        const updates = { targetAccountIds: mergedAccounts }
+        // 兜底：若规则主账户缺失，用合并后首项补上
+        if (!rule.accountId || String(rule.accountId).trim() === '') {
+          updates.accountId = mergedAccounts[0]
+        }
+
+        await rulesService.updateRule(ruleId, userId, updates, isAdmin, ownerId ?? undefined, viewerOwnerId)
+
+        // 4e: 动态规则 → 本地异步 refresh（仅结构数据新鲜时）
+        if (Number(rule.useDynamicScope ?? rule.use_dynamic_scope) === 1 && pendingDataAccounts.length === 0) {
+          await scheduleDynamicScopeRefreshForRule(ruleId, { trigger: 'batch_add_accounts' })
+        }
+
+        results.push({
+          ruleId,
+          status: 'updated',
+          added,
+          skipped: accountIdSet.length - added,
+          pendingDataAccounts,
+          code: pendingDataAccounts.length > 0 ? 'PENDING_DATA' : 'OK'
+        })
+        if (pendingDataAccounts.length > 0) pendingDataRules++
+        updatedCount++
+      } catch (err) {
+        logger.error(`[batch/add-accounts] 规则 ${ruleId} 处理失败:`, err)
+        results.push({
+          ruleId,
+          status: 'failed',
+          added: 0,
+          skipped: accountIdSet.length,
+          pendingDataAccounts: [],
+          code: err.message || 'ERROR'
+        })
+        failedCount++
+      }
+    }
+
+    // --- 汇总返回 ---
+    res.json({
+      message: '批量添加完成',
+      summary: {
+        requested: ruleIdSet.length,
+        updated: updatedCount,
+        unchanged: unchangedCount,
+        failed: failedCount,
+        pendingDataRules
+      },
+      results
+    })
+  } catch (error) {
+    logger.error('[batch/add-accounts] 接口异常:', error)
+    res.status(500).json({ error: error.message || '批量添加失败', code: 'ERROR' })
   }
 })
 
