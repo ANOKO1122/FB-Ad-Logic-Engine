@@ -52,6 +52,18 @@
                 清除筛选 (全选)
               </div>
               <div
+                class="owner-filter-option"
+                :class="{ selected: includeNoOwner }"
+                role="option"
+                :aria-selected="includeNoOwner"
+                @click.stop="toggleNoOwnerOption"
+              >
+                <span class="owner-filter-checkbox" :class="{ selected: includeNoOwner }">
+                  <span v-show="includeNoOwner" class="owner-filter-check">✓</span>
+                </span>
+                <span class="owner-filter-option-label">无（管理员创建）</span>
+              </div>
+              <div
                 v-for="o in ownersList"
                 :key="o.id"
                 class="owner-filter-option"
@@ -71,6 +83,21 @@
         <template v-if="rules.length > 0">
           <button type="button" class="btn secondary small" @click="collapseAllRuleCards">全部折叠</button>
           <button type="button" class="btn secondary small" @click="expandAllRuleCards">全部展开</button>
+        </template>
+        <template v-if="!bulkMode && rules.length > 0">
+          <button type="button" class="btn secondary" @click="enterBulkMode">
+            <span class="icon">☐</span> 批量添加账户
+          </button>
+        </template>
+        <template v-if="bulkMode">
+          <span class="bulk-counter">已选 {{ selectedCount }} 条</span>
+          <button type="button" class="btn secondary small" @click="toggleSelectAllRules">
+            {{ selectedCount === rules.length ? '取消全选' : '全选' }}
+          </button>
+          <button type="button" class="btn secondary small" @click="exitBulkMode">取消选择</button>
+          <button type="button" class="btn" :disabled="selectedCount === 0" @click="openBatchModal">
+            <span class="icon">+</span> 为已选规则添加账户
+          </button>
         </template>
         <button class="btn" @click="openCreateRule">
           <span class="icon">+</span> 新建规则
@@ -106,8 +133,14 @@
         :key="r.id" 
         class="rule-card"
         :class="{ disabled: !r.enabled }"
+        @click="onCardClick(r, $event)"
       >
         <div class="card-header">
+          <label v-if="bulkMode" class="rule-select-checkbox" :class="{ checked: selectedRuleIds.includes(r.id) }" @click.stop="toggleRuleSelection(r.id)">
+            <span class="rule-select-box" :class="{ checked: selectedRuleIds.includes(r.id) }">
+              <span v-show="selectedRuleIds.includes(r.id)" class="rule-select-check">✓</span>
+            </span>
+          </label>
           <div class="card-header-titles">
             <h3 class="rule-name">
               {{ r.name }}
@@ -740,6 +773,71 @@
         </div>
       </div>
     </div>
+
+    <!-- 批量添加账户弹窗 -->
+    <div v-if="showBatchModal" class="modal-overlay" @click="closeBatchModal">
+      <div class="modal-content" @click.stop>
+        <div class="modal-header">
+          <h3>批量添加账户</h3>
+          <button class="close-btn" @click="closeBatchModal">×</button>
+        </div>
+        <div class="modal-body">
+          <p class="batch-hint">
+            已选 <strong>{{ selectedCount }}</strong> 条规则，选择要追加的广告账户。不会替换已有账户。
+          </p>
+
+          <div v-if="batchAccounts.length > 0" class="batch-accounts-grid">
+            <label
+              v-for="acc in batchAccounts"
+              :key="acc.id"
+              class="batch-account-item"
+              :class="{ checked: batchAccountIds.includes(acc.id) }"
+              @click.stop="toggleBatchAccount(acc.id)"
+            >
+              <span class="batch-account-checkbox" :class="{ checked: batchAccountIds.includes(acc.id) }">
+                <span v-show="batchAccountIds.includes(acc.id)">✓</span>
+              </span>
+              <span class="batch-account-name">{{ acc.name }}</span>
+              <span class="batch-account-id">{{ acc.id }}</span>
+            </label>
+          </div>
+          <div v-else-if="!batchError" class="batch-empty">加载账户列表中...</div>
+
+          <div v-if="batchAccounts.length > 0" class="batch-select-actions">
+            <button type="button" class="btn-text" @click="selectAllBatchAccounts">全选</button>
+            <button type="button" class="btn-text" @click="clearBatchAccounts">清空</button>
+          </div>
+
+          <!-- 结果展示 -->
+          <div v-if="batchResult" class="batch-result">
+            <div class="batch-result-title" :class="batchResult.summary.failed > 0 ? 'warn' : 'ok'">
+              {{ batchResult.summary.failed > 0 ? '⚠️ 部分完成' : '✅ 批量添加完成' }}
+            </div>
+            <div class="batch-summary">
+              <span class="batch-stat">请求 <strong>{{ batchResult.summary.requested }}</strong> 条</span>
+              <span class="batch-stat batch-stat-ok">新增 <strong>{{ batchResult.summary.updated }}</strong> 条</span>
+              <span class="batch-stat">未变 <strong>{{ batchResult.summary.unchanged }}</strong> 条</span>
+              <span v-if="batchResult.summary.failed > 0" class="batch-stat batch-stat-err">失败 <strong>{{ batchResult.summary.failed }}</strong> 条</span>
+              <span v-if="batchResult.summary.pendingDataRules > 0" class="batch-stat batch-stat-pending">
+                待结构同步后生效 <strong>{{ batchResult.summary.pendingDataRules }}</strong> 条
+              </span>
+            </div>
+          </div>
+          <div v-if="batchError" class="alert error">{{ batchError }}</div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn secondary" @click="closeBatchModal">取消</button>
+          <button
+            type="button"
+            class="btn"
+            :disabled="batchAccountIds.length === 0 || batchSaving"
+            @click="submitBatchAddAccounts"
+          >
+            {{ batchSaving ? '提交中...' : '确认追加' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -770,10 +868,140 @@ export default {
     const ownersList = ref([])
     /** 选中的负责人 ID 列表，空表示「全部负责人」 */
     const selectedOwnerIds = ref([])
+    /** 是否同时筛选「负责人无」的管理员规则（users.owner_id IS NULL） */
+    const includeNoOwner = ref(false)
     /** 负责人筛选下拉是否展开 */
     const ownerFilterOpen = ref(false)
     /** 负责人下拉容器（用于点击外部关闭） */
     const ownerDropdownRef = ref(null)
+
+    /** 批量模式：是否处于手动多选规则卡片状态 */
+    const bulkMode = ref(false)
+    /** 批量模式：已勾选的规则 ID 列表 */
+    const selectedRuleIds = ref([])
+    /** 批量模式选中计数 */
+    const selectedCount = computed(() => selectedRuleIds.value.length)
+
+    /** 批量添加账户弹窗 */
+    const showBatchModal = ref(false)
+    /** 批量弹窗内可选账户列表 */
+    const batchAccounts = ref([])
+    /** 批量弹窗内已选账户 ID */
+    const batchAccountIds = ref([])
+    /** 批量提交中 */
+    const batchSaving = ref(false)
+    /** 批量提交结果 */
+    const batchResult = ref(null)
+    /** 批量提交错误 */
+    const batchError = ref('')
+
+    /** 进入批量多选模式 */
+    const enterBulkMode = () => {
+      selectedRuleIds.value = []
+      bulkMode.value = true
+    }
+
+    /** 退出批量多选模式，清空所有选中状态 */
+    const exitBulkMode = () => {
+      bulkMode.value = false
+      selectedRuleIds.value = []
+    }
+
+    /** 切换某条规则的选中状态 */
+    const toggleRuleSelection = (ruleId) => {
+      const idx = selectedRuleIds.value.indexOf(ruleId)
+      if (idx >= 0) {
+        selectedRuleIds.value.splice(idx, 1)
+      } else {
+        selectedRuleIds.value.push(ruleId)
+      }
+    }
+
+    /** 全选 / 取消全选：已全部选中时清空，否则选入当前列表所有规则 */
+    const toggleSelectAllRules = () => {
+      if (selectedCount.value === rules.value.length) {
+        selectedRuleIds.value = []
+      } else {
+        selectedRuleIds.value = rules.value.map(r => r.id)
+      }
+    }
+
+    /** 批量模式下点击整张卡片切换选中；排除按钮/开关/输入框等交互元素 */
+    const onCardClick = (rule, event) => {
+      if (!bulkMode.value) return
+      if (event.target.closest('button, input, select, textarea, label, a')) return
+      toggleRuleSelection(rule.id)
+    }
+
+    /** 打开批量添加账户弹窗 */
+    const openBatchModal = async () => {
+      if (selectedCount.value === 0) return
+      batchError.value = ''
+      batchResult.value = null
+      batchAccountIds.value = []
+      batchAccounts.value = []
+      showBatchModal.value = true
+      try {
+        batchAccounts.value = await facebookApi.getAdAccounts()
+      } catch (e) {
+        batchError.value = `加载账户失败：${e.message}`
+      }
+    }
+
+    /** 关闭批量添加账户弹窗 */
+    const closeBatchModal = () => {
+      showBatchModal.value = false
+      batchAccountIds.value = []
+      batchResult.value = null
+      batchError.value = ''
+    }
+
+    /** 切换批量弹窗内的账户选择 */
+    const toggleBatchAccount = (accountId) => {
+      const idx = batchAccountIds.value.indexOf(accountId)
+      if (idx >= 0) {
+        batchAccountIds.value.splice(idx, 1)
+      } else {
+        batchAccountIds.value.push(accountId)
+      }
+    }
+
+    /** 全选批量弹窗内账户 */
+    const selectAllBatchAccounts = () => {
+      batchAccountIds.value = batchAccounts.value.map(a => a.id)
+    }
+
+    /** 清空批量弹窗内账户选择 */
+    const clearBatchAccounts = () => {
+      batchAccountIds.value = []
+    }
+
+    /** 提交批量添加账户 */
+    const submitBatchAddAccounts = async () => {
+      if (batchAccountIds.value.length === 0 || selectedRuleIds.value.length === 0) return
+      batchSaving.value = true
+      batchError.value = ''
+      batchResult.value = null
+      try {
+        const resp = await authFetch('/api/rules/batch/add-accounts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ruleIds: selectedRuleIds.value,
+            accountIds: batchAccountIds.value
+          })
+        })
+        const data = await resp.json()
+        if (!resp.ok) throw new Error(data.error || '批量添加失败')
+        batchResult.value = data
+        // 成功后重新加载规则列表
+        await loadRules()
+      } catch (e) {
+        batchError.value = e.message || '批量添加失败'
+      } finally {
+        batchSaving.value = false
+      }
+    }
 
     /** 规则列表卡片折叠：localStorage key 按用户隔离 */
     const CARD_EXPAND_STORAGE_PREFIX = 'fb_rule_cards_expanded_v1:'
@@ -886,13 +1114,17 @@ export default {
       (ruleForm.actions || []).some(a => a.type === 'increase_budget' || a.type === 'decrease_budget'))
     const zeroClickTemplate = computed(() => templates.value.find(t => t.slug === 'zero_click') || null)
 
-    /** 负责人筛选：触发器显示文案（未选=全部，已选=逗号拼接的负责人名） */
+    /** 负责人筛选：触发器显示文案（未选=全部，已选=负责人名 + 可选"无"） */
     const ownerFilterDisplayValue = computed(() => {
-      if (!selectedOwnerIds.value.length) return '全部 (不选=全部)'
-      const names = ownersList.value
-        .filter(o => selectedOwnerIds.value.includes(o.id))
-        .map(o => o.owner_name || o.ownerName || String(o.id))
-      return names.length ? names.join(', ') : '全部 (不选=全部)'
+      const parts = []
+      if (selectedOwnerIds.value.length > 0) {
+        const names = ownersList.value
+          .filter(o => selectedOwnerIds.value.includes(o.id))
+          .map(o => o.owner_name || o.ownerName || String(o.id))
+        if (names.length > 0) parts.push(names.join(', '))
+      }
+      if (includeNoOwner.value) parts.push('无')
+      return parts.length > 0 ? parts.join(' + ') : '全部 (不选=全部)'
     })
     /** 一键铺底按钮展示口径：仅非管理员、空规则列表时展示（按当前 owner 维度） */
     const showBootstrapButton = computed(() => rulesLoaded.value && !isAdminFromRules.value && rules.value.length === 0)
@@ -1223,11 +1455,18 @@ export default {
     }
 
     const loadRules = async () => {
+      // 列表重载时清空批量选中状态，避免旧列表选中残留到新列表
+      if (bulkMode.value) exitBulkMode()
       try {
         let url = '/api/rules'
-        if (isAdminFromRules.value && selectedOwnerIds.value.length > 0) {
-          const ids = selectedOwnerIds.value.map(id => Number(id)).filter(Number.isFinite)
-          if (ids.length > 0) url += '?ownerIds=' + ids.join(',')
+        if (isAdminFromRules.value) {
+          const params = []
+          if (selectedOwnerIds.value.length > 0) {
+            const ids = selectedOwnerIds.value.map(id => Number(id)).filter(Number.isFinite)
+            if (ids.length > 0) params.push('ownerIds=' + ids.join(','))
+          }
+          if (includeNoOwner.value) params.push('includeNoOwner=1')
+          if (params.length > 0) url += '?' + params.join('&')
         }
         const resp = await authFetch(url)
         const data = await resp.json()
@@ -1285,6 +1524,7 @@ export default {
     /** 负责人筛选：清除已选并重新拉规则 */
     const clearOwnerFilter = () => {
       selectedOwnerIds.value = []
+      includeNoOwner.value = false
       ownerFilterOpen.value = false
       loadRules()
     }
@@ -1298,6 +1538,12 @@ export default {
       } else {
         selectedOwnerIds.value = [...ids, id]
       }
+      loadRules()
+    }
+
+    /** 负责人筛选：切换"负责人无"选中状态并重新拉规则 */
+    const toggleNoOwnerOption = () => {
+      includeNoOwner.value = !includeNoOwner.value
       loadRules()
     }
 
@@ -2718,8 +2964,11 @@ export default {
 
     return {
       rules, showRuleModal, editingRuleId, ruleForm, running, runningRuleId, refreshingRuleId,
-      isAdminFromRules, ownersList, selectedOwnerIds,
-      ownerFilterOpen, ownerFilterDisplayValue, ownerDropdownRef, clearOwnerFilter, toggleOwnerOption,
+      isAdminFromRules, ownersList, selectedOwnerIds, includeNoOwner,
+      ownerFilterOpen, ownerFilterDisplayValue, ownerDropdownRef, clearOwnerFilter, toggleOwnerOption, toggleNoOwnerOption,
+      bulkMode, selectedRuleIds, selectedCount, enterBulkMode, exitBulkMode, toggleRuleSelection, toggleSelectAllRules, onCardClick,
+      showBatchModal, batchAccounts, batchAccountIds, batchSaving, batchResult, batchError,
+      openBatchModal, closeBatchModal, toggleBatchAccount, selectAllBatchAccounts, clearBatchAccounts, submitBatchAddAccounts,
       isRuleCardExpanded, toggleRuleCardExpand, collapseAllRuleCards, expandAllRuleCards,
       visibleConditionsForCard, extraCondGroupsCount,
       whenLines, whenTimeWindow, whenCustomRange,
@@ -3029,6 +3278,48 @@ export default {
 }
 .card-expand-chevron.open {
   transform: rotate(180deg);
+}
+
+/* 批量模式：规则卡片复选框 */
+.rule-select-checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  margin-top: 2px;
+  user-select: none;
+}
+.rule-select-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border-color, #d1d5db);
+  border-radius: 4px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.rule-select-box.checked {
+  background: var(--primary-color, #2563eb);
+  border-color: var(--primary-color, #2563eb);
+}
+.rule-select-check {
+  color: #fff;
+  font-size: 12px;
+  font-weight: bold;
+  line-height: 1;
+}
+
+/* 批量模式：已选计数 */
+.bulk-counter {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--primary-color, #2563eb);
+  align-self: center;
+  white-space: nowrap;
 }
 
 .cond-more-hint {
@@ -3353,6 +3644,103 @@ input:checked + .slider:before { transform: translateX(16px); }
 .scope-item .id { font-size: 12px; color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .scope-item-active { border-left: 3px solid #2563eb; }
 .scope-item-paused { border-left: 3px solid #9ca3af; }
+
+/* ===== 批量添加账户弹窗 ===== */
+.batch-hint {
+  font-size: 14px;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+}
+.batch-accounts-grid {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+.batch-account-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-color);
+  transition: background 0.15s;
+}
+.batch-account-item:last-child {
+  border-bottom: none;
+}
+.batch-account-item:hover {
+  background: #f0f9ff;
+}
+.batch-account-item.checked {
+  background: #eff6ff;
+}
+.batch-account-checkbox {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border-color);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: #fff;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.batch-account-checkbox.checked {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+}
+.batch-account-name {
+  flex: 1;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+.batch-account-id {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, monospace;
+}
+.batch-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+.batch-select-actions {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.batch-result {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 8px;
+  background: #f9fafb;
+  border: 1px solid var(--border-color);
+}
+.batch-result-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.batch-result-title.ok { color: #059669; }
+.batch-result-title.warn { color: #d97706; }
+.batch-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.batch-stat strong { color: var(--text-primary); }
+.batch-stat-ok { color: #059669; }
+.batch-stat-err { color: #dc2626; }
+.batch-stat-pending {
+  color: #d97706;
+  font-style: italic;
+}
 </style>
 
 
