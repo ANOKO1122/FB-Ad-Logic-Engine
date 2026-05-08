@@ -12,6 +12,11 @@ sudo journalctl -u fb-ad-logic-engine.service -n 120 --no-pager
 是否有 listen 端口错误（正常不该有）
 是否有你新增登录路由触发日志（后面请求时会出现）
 
+停止服务：sudo systemctl stop fb-ad-logic-engine.service
+立即看状态：sudo systemctl status fb-ad-logic-engine.service --no-pager -l
+验证端口不监听（可选）：ss -lntp | rg ":3101"
+
+
 
 cd /root/work/FB-Ad-Logic-Engine
 node server/scripts/upsert-account-mapping.js
