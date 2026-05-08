@@ -1789,3 +1789,97 @@ export async function runHourlyStructureFullRotation(facebookApi, opts = {}) {
     }
   }
 }
+
+/**
+ * 结构完整性自愈：确保任意 structure_ads 的 campaign_id / adset_id 都能在对应上层结构表中找到
+ * 
+ * 场景：structure_ads 已有子广告，但 structure_campaigns 或 structure_adsets 暂未补齐（增量同步窗口可能导致）
+ * 策略：对缺失的上层对象，写入最小占位记录保证关系链闭合
+ * 
+ * @param {string} [accountId] - 可选，指定账户；不传则检查全部活跃账户
+ * @returns {Promise<{ campaignsHealed: number, adsetsHealed: number, errors: string[] }>}
+ */
+export async function healStructureIntegrity(accountId = null) {
+  const result = { campaignsHealed: 0, adsetsHealed: 0, errors: [] }
+  const accountFilter = accountId ? 'AND sa.account_id = ?' : ''
+
+  try {
+    // 1. 找出 structure_ads 中存在但 structure_campaigns 缺失的 campaign_id
+    const [missingCampaigns] = await pool.query(
+      `SELECT DISTINCT sa.account_id, sa.campaign_id
+       FROM structure_ads sa
+       LEFT JOIN structure_campaigns sc ON sa.account_id = sc.account_id AND sa.campaign_id = sc.campaign_id
+       WHERE sc.campaign_id IS NULL
+         AND sa.campaign_id IS NOT NULL
+         AND sa.campaign_id != ''
+         ${accountFilter}
+       LIMIT 1000`,
+      accountId ? [accountId] : []
+    )
+
+    if (missingCampaigns.length > 0) {
+      logger.warn(`[结构自愈] 发现 ${missingCampaigns.length} 个缺失的 structure_campaigns 记录`)
+      const values = []
+      const params = []
+      for (const row of missingCampaigns) {
+        values.push('(?, ?, ?)')
+        params.push(row.account_id, row.campaign_id, row.campaign_id)
+      }
+      try {
+        await pool.query(
+          `INSERT IGNORE INTO structure_campaigns (account_id, campaign_id, name) VALUES ${values.join(',')}`,
+          params
+        )
+        result.campaignsHealed = missingCampaigns.length
+        logger.info(`[结构自愈] 已补全 ${result.campaignsHealed} 条 structure_campaigns 占位记录`)
+      } catch (err) {
+        result.errors.push(`structure_campaigns 补全失败: ${err.message}`)
+        logger.error(`[结构自愈] structure_campaigns 补全失败:`, err.message)
+      }
+    }
+
+    // 2. 找出 structure_ads 中存在但 structure_adsets 缺失的 adset_id
+    const [missingAdsets] = await pool.query(
+      `SELECT DISTINCT sa.account_id, sa.adset_id, MAX(sa.campaign_id) AS campaign_id
+       FROM structure_ads sa
+       LEFT JOIN structure_adsets sas ON sa.account_id = sas.account_id AND sa.adset_id = sas.adset_id
+       WHERE sas.adset_id IS NULL
+         AND sa.adset_id IS NOT NULL
+         AND sa.adset_id != ''
+         ${accountFilter}
+       GROUP BY sa.account_id, sa.adset_id
+       LIMIT 1000`,
+      accountId ? [accountId] : []
+    )
+
+    if (missingAdsets.length > 0) {
+      logger.warn(`[结构自愈] 发现 ${missingAdsets.length} 个缺失的 structure_adsets 记录`)
+      const values = []
+      const params = []
+      for (const row of missingAdsets) {
+        values.push('(?, ?, ?, ?)')
+        params.push(row.account_id, row.adset_id, row.adset_id, row.campaign_id || row.adset_id)
+      }
+      try {
+        await pool.query(
+          `INSERT IGNORE INTO structure_adsets (account_id, adset_id, name, campaign_id) VALUES ${values.join(',')}`,
+          params
+        )
+        result.adsetsHealed = missingAdsets.length
+        logger.info(`[结构自愈] 已补全 ${result.adsetsHealed} 条 structure_adsets 占位记录`)
+      } catch (err) {
+        result.errors.push(`structure_adsets 补全失败: ${err.message}`)
+        logger.error(`[结构自愈] structure_adsets 补全失败:`, err.message)
+      }
+    }
+
+    if (result.campaignsHealed === 0 && result.adsetsHealed === 0) {
+      logger.debug('[结构自愈] 结构完整性检查通过，无需修复')
+    }
+  } catch (err) {
+    result.errors.push(`结构自愈整体失败: ${err.message}`)
+    logger.error('[结构自愈] 结构完整性检查异常:', err.message)
+  }
+
+  return result
+}

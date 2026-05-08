@@ -327,9 +327,10 @@ const TIME_WINDOW_LABEL = {
   custom_range: '自定义'
 }
 
+// M1 合同：状态动作标签不再写死「广告」，由前端按 targetLevel 渲染实际目标层级文案
 const ACTION_LABEL = {
-  pause_ad: '暂停广告',
-  activate_ad: '启用广告',
+  pause_ad: '暂停目标',
+  activate_ad: '启用目标',
   increase_budget: '增加预算',
   decrease_budget: '减少预算',
   set_budget: '设置预算'

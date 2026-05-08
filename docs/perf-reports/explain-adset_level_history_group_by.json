@@ -1,0 +1,21 @@
+{
+  "generatedAt": "2026-05-06T06:59:43.337Z",
+  "accountId": "act_4252903478277839",
+  "check": "adset_level_history_group_by",
+  "raw": [
+    {
+      "id": 1,
+      "select_type": "SIMPLE",
+      "table": "daily_stats",
+      "partitions": null,
+      "type": "range",
+      "possible_keys": "uk_account_ad_date,idx_account_id,idx_date,idx_account_date,idx_daily_account_date_adset,idx_daily_account_date_campaign",
+      "key": "idx_date",
+      "key_len": "3",
+      "ref": null,
+      "rows": 1,
+      "filtered": 5,
+      "Extra": "Using index condition; Using where; Using temporary"
+    }
+  ]
+}

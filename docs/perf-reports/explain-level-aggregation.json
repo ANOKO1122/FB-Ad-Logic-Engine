@@ -1,0 +1,118 @@
+{
+  "generatedAt": "2026-05-06T06:59:43.337Z",
+  "accountId": "act_4252903478277839",
+  "checks": [
+    {
+      "name": "ad_level_today_latest_snapshot",
+      "rowCount": 3,
+      "allScanRows": 0,
+      "sample": {
+        "table": "s",
+        "type": "ref",
+        "key": "uk_account_ad_date",
+        "rows": 1,
+        "filtered": 10
+      },
+      "raw": [
+        {
+          "id": 1,
+          "select_type": "PRIMARY",
+          "table": "s",
+          "partitions": null,
+          "type": "ref",
+          "possible_keys": "uk_ad_id,uk_account_ad_date,idx_account_id,idx_synced_at,idx_account_synced,idx_ad_synced,idx_ad_synced_desc,idx_account_date_ad,idx_snap_account_data_date_adset,idx_snap_account_data_date_campaign",
+          "key": "uk_account_ad_date",
+          "key_len": "202",
+          "ref": "const",
+          "rows": 1,
+          "filtered": 10,
+          "Extra": "Using index condition"
+        },
+        {
+          "id": 1,
+          "select_type": "PRIMARY",
+          "table": "<derived2>",
+          "partitions": null,
+          "type": "ref",
+          "possible_keys": "<auto_key0>",
+          "key": "<auto_key0>",
+          "key_len": "208",
+          "ref": "fb_ad_brain.s.ad_id,fb_ad_brain.s.synced_at",
+          "rows": 2,
+          "filtered": 100,
+          "Extra": "Using index"
+        },
+        {
+          "id": 2,
+          "select_type": "DERIVED",
+          "table": "ad_snapshots",
+          "partitions": null,
+          "type": "ref",
+          "possible_keys": "uk_ad_id,uk_account_ad_date,idx_account_id,idx_account_synced,idx_ad_synced,idx_ad_synced_desc,idx_account_date_ad,idx_snap_account_data_date_adset,idx_snap_account_data_date_campaign",
+          "key": "uk_account_ad_date",
+          "key_len": "202",
+          "ref": "const",
+          "rows": 1,
+          "filtered": 10,
+          "Extra": "Using index condition"
+        }
+      ]
+    },
+    {
+      "name": "adset_level_history_group_by",
+      "rowCount": 1,
+      "allScanRows": 0,
+      "sample": {
+        "table": "daily_stats",
+        "type": "range",
+        "key": "idx_date",
+        "rows": 1,
+        "filtered": 5
+      },
+      "raw": [
+        {
+          "id": 1,
+          "select_type": "SIMPLE",
+          "table": "daily_stats",
+          "partitions": null,
+          "type": "range",
+          "possible_keys": "uk_account_ad_date,idx_account_id,idx_date,idx_account_date,idx_daily_account_date_adset,idx_daily_account_date_campaign",
+          "key": "idx_date",
+          "key_len": "3",
+          "ref": null,
+          "rows": 1,
+          "filtered": 5,
+          "Extra": "Using index condition; Using where; Using temporary"
+        }
+      ]
+    },
+    {
+      "name": "campaign_level_history_group_by",
+      "rowCount": 1,
+      "allScanRows": 0,
+      "sample": {
+        "table": "daily_stats",
+        "type": "range",
+        "key": "idx_date",
+        "rows": 1,
+        "filtered": 5
+      },
+      "raw": [
+        {
+          "id": 1,
+          "select_type": "SIMPLE",
+          "table": "daily_stats",
+          "partitions": null,
+          "type": "range",
+          "possible_keys": "uk_account_ad_date,idx_account_id,idx_date,idx_account_date,idx_daily_account_date_adset,idx_daily_account_date_campaign",
+          "key": "idx_date",
+          "key_len": "3",
+          "ref": null,
+          "rows": 1,
+          "filtered": 5,
+          "Extra": "Using index condition; Using where; Using temporary"
+        }
+      ]
+    }
+  ]
+}

@@ -645,10 +645,13 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
         code: 'INVALID_FORMAT'
       })
     }
-    const actCheck = validateActions(actions)
+    const normalizedTargetLevel = String(targetLevel || 'ad').toLowerCase()
+    const actCheck = validateActions(actions, normalizedTargetLevel)
     if (!actCheck.valid) {
       return res.status(400).json({ error: actCheck.error, code: 'INVALID_ACTIONS' })
     }
+    // M1 合同：若未来引入 pause_adset/pause_campaign 等新枚举，必须与 targetLevel 一致，否则 400
+    // 当期仅校验旧枚举 pause_ad/activate_ad 为合法值，不引入新枚举入库存入。
     // 验证 conditions：允许 v1 array 或 v2 object
     const condCheck = validateConditionsStructure(conditions)
     if (!condCheck.valid) {
@@ -662,7 +665,7 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
     }
     
     // 验证 targetLevel（如果提供）
-    if (targetLevel && !['ad', 'adset', 'campaign'].includes(targetLevel)) {
+    if (targetLevel && !['ad', 'adset', 'campaign'].includes(normalizedTargetLevel)) {
       return res.status(400).json({ 
         error: 'targetLevel 必须是 ad、adset 或 campaign',
         code: 'INVALID_TARGET_LEVEL'
@@ -875,7 +878,8 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
       if (!Array.isArray(updates.actions)) {
         return res.status(400).json({ error: 'actions 必须是数组' })
       }
-      const actCheck = validateActions(updates.actions)
+      const actionTargetLevel = String(updates.targetLevel || body.targetLevel || 'ad').toLowerCase()
+      const actCheck = validateActions(updates.actions, actionTargetLevel)
       if (!actCheck.valid) {
         return res.status(400).json({ error: actCheck.error, code: 'INVALID_ACTIONS' })
       }

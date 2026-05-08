@@ -1858,6 +1858,102 @@ class FacebookMarketingAPI {
     }
   }
 
+  // ============================================
+  // M4 同层执行：adset / campaign 状态动作 API
+  // ============================================
+
+  async pauseAdset(adsetId) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${adsetId}`
+      const body = {
+        status: 'PAUSED',
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'pause_adset'
+      })
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return !data.error
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`暂停广告组失败: ${error.message}`)
+    }
+  }
+
+  async activateAdset(adsetId) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${adsetId}`
+      const body = {
+        status: 'ACTIVE',
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'activate_adset'
+      })
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return !data.error
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`激活广告组失败: ${error.message}`)
+    }
+  }
+
+  async pauseCampaign(campaignId) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${campaignId}`
+      const body = {
+        status: 'PAUSED',
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'pause_campaign'
+      })
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return !data.error
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`暂停广告系列失败: ${error.message}`)
+    }
+  }
+
+  async activateCampaign(campaignId) {
+    try {
+      const url = `${FACEBOOK_API_BASE}/${campaignId}`
+      const body = {
+        status: 'ACTIVE',
+        access_token: this.accessToken
+      }
+      const data = await this.makeRequest(url, {}, 'POST', body, {
+        requestPriority: 'action',
+        requestLabel: 'activate_campaign'
+      })
+      if (data.error) {
+        throw new Error(`Facebook API Error: ${data.error.message}`)
+      }
+      return !data.error
+    } catch (error) {
+      if (error.message.includes('Facebook API Error')) {
+        throw error
+      }
+      throw new Error(`激活广告系列失败: ${error.message}`)
+    }
+  }
+
   /**
    * 获取广告组预算（M4 3.5：对上游暴露「分」）
    * FB API 的 daily_budget 读写均为账户最小货币单位（USD=分），GET 返回的已是分，不要乘 100
@@ -2146,9 +2242,24 @@ class RuleEngine {
     
     for (const adData of dataArray) {
       // 评估条件（支持 AND/OR 逻辑）
-      const conditionsMet = this.evaluateConditions(rule.conditions, adData, rule.logicOperator ?? rule.logic_operator ?? 'AND')
+      const conditionTrace = this.buildConditionTrace(rule.conditions, adData, rule.logicOperator ?? rule.logic_operator ?? 'AND')
+      const conditionsMet = this.isConditionTraceMatched(conditionTrace)
       
       if (conditionsMet) {
+        const targetLevel = String(rule.targetLevel || rule.target_level || adData.object_type || 'ad').toLowerCase()
+        const objectType = adData.object_type || targetLevel
+        const objectId = String(
+          adData.object_id
+          || (objectType === 'campaign' ? adData.campaign_id : (objectType === 'adset' ? (adData.ad_set_id || adData.adset_id) : adData.ad_id))
+          || ''
+        ).trim()
+        const objectName = adData.object_name
+          || (objectType === 'campaign' ? adData.campaign_name : (objectType === 'adset' ? (adData.adset_name || adData.ad_set_name) : adData.ad_name))
+          || null
+        const statusSourceRef = adData.status_source_ref
+          || (objectType === 'campaign'
+            ? 'structure_campaigns.effective_status'
+            : (objectType === 'adset' ? 'structure_adsets.effective_status' : 'ad_snapshots.status'))
         // 如果满足条件，添加到匹配列表
         // 🔧 修复：使用扁平结构，与 actionExecutorService 期望的结构一致
         matchedAds.push({
@@ -2156,6 +2267,12 @@ class RuleEngine {
           ad_name: adData.ad_name,
           ad_set_id: adData.ad_set_id,  // 用于预算调整动作
           campaign_id: adData.campaign_id ?? null,  // CBO 时向上调系列预算
+          objectType,
+          objectId: objectId || null,
+          objectName,
+          statusSourceRef,
+          aggregationTrace: adData.aggregationTrace || null,
+          conditionTrace,
           status: adData.status,        // M4 Pre-Flight：用于 pause/activate 目标已达成判断
           mute_until: adData.mute_until,  // M4 Smart Mute：挂起截止时间
           mute_reason: adData.mute_reason, // M4 Smart Mute：挂起原因
@@ -2197,13 +2314,34 @@ class RuleEngine {
     const dataArray = Array.isArray(ruleDataArray) ? ruleDataArray : []
     const matchedAds = []
     for (const adData of dataArray) {
-      const conditionsMet = this.evaluateConditions(rule.conditions, adData, logicOp)
+      const conditionTrace = this.buildConditionTrace(rule.conditions, adData, logicOp)
+      const conditionsMet = this.isConditionTraceMatched(conditionTrace)
       if (conditionsMet) {
+        const targetLevel = String(rule.targetLevel || rule.target_level || adData.object_type || 'ad').toLowerCase()
+        const objectType = adData.object_type || targetLevel
+        const objectId = String(
+          adData.object_id
+          || (objectType === 'campaign' ? adData.campaign_id : (objectType === 'adset' ? (adData.ad_set_id || adData.adset_id) : adData.ad_id))
+          || ''
+        ).trim()
+        const objectName = adData.object_name
+          || (objectType === 'campaign' ? adData.campaign_name : (objectType === 'adset' ? (adData.adset_name || adData.ad_set_name) : adData.ad_name))
+          || null
+        const statusSourceRef = adData.status_source_ref
+          || (objectType === 'campaign'
+            ? 'structure_campaigns.effective_status'
+            : (objectType === 'adset' ? 'structure_adsets.effective_status' : 'ad_snapshots.status'))
         matchedAds.push({
           ad_id: adData.ad_id,
           ad_name: adData.ad_name,
           ad_set_id: adData.ad_set_id,
           campaign_id: adData.campaign_id ?? null,
+          objectType,
+          objectId: objectId || null,
+          objectName,
+          statusSourceRef,
+          aggregationTrace: adData.aggregationTrace || null,
+          conditionTrace,
           status: adData.status,
           mute_until: adData.mute_until,
           mute_reason: adData.mute_reason,
@@ -2341,6 +2479,46 @@ class RuleEngine {
     return v2.groups.some(g =>
       (g.conditions || []).every(c => this.evaluateCondition(c, adData))
     )
+  }
+
+  buildConditionTrace(conditions, adData, logicOperator = 'AND') {
+    const v2 = normalizeConditionsToV2(conditions, logicOperator)
+    const groups = Array.isArray(v2?.groups) ? v2.groups : []
+    if (groups.length === 0) return []
+    const traces = []
+    let traceIndex = 0
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = groups[groupIndex]
+      const conds = Array.isArray(group?.conditions) ? group.conditions : []
+      for (let conditionIndex = 0; conditionIndex < conds.length; conditionIndex++) {
+        const condition = conds[conditionIndex]
+        const actual = this.getMetricValue(condition.metric, adData)
+        const expected = condition.value
+        const passed = this.evaluateCondition(condition, adData)
+        traces.push({
+          index: traceIndex++,
+          groupIndex,
+          conditionIndex,
+          metric: condition.metric,
+          operator: condition.operator,
+          threshold: expected,
+          actual,
+          passed,
+          formula: `${condition.metric} ${condition.operator} ${expected}`
+        })
+      }
+    }
+    return traces
+  }
+
+  isConditionTraceMatched(conditionTrace) {
+    if (!Array.isArray(conditionTrace) || conditionTrace.length === 0) return true
+    const groupPassed = new Map()
+    for (const item of conditionTrace) {
+      if (!groupPassed.has(item.groupIndex)) groupPassed.set(item.groupIndex, true)
+      if (!item.passed) groupPassed.set(item.groupIndex, false)
+    }
+    return [...groupPassed.values()].some(Boolean)
   }
 
   /**

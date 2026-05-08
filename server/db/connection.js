@@ -1,6 +1,7 @@
 import mysql from 'mysql2/promise'
 import dotenv from 'dotenv'
 import logger from '../utils/logger.js'
+import { runAutomationLogsSchemaGuard } from '../services/dbSchemaGuardService.js'
 
 dotenv.config()
 
@@ -103,6 +104,7 @@ rawPool.getConnection()
     } catch (err) {
       logger.warn('验证会话时区失败', { message: err.message })
     }
+    await runAutomationLogsSchemaGuard((sql, params) => conn.execute(sql, params))
     conn.release()
   })
   .catch(err => {

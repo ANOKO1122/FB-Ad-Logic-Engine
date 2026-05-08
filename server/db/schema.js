@@ -203,6 +203,7 @@ export const dailyArchiveStatus = mysqlTable('daily_archive_status', {
 // automation_logs 表（审计日志）
 // 记录每次规则执行的详细信息，用于审计和问题排查
 // M4：增加 run_id，同一 run 下同一 ad_id 仅一条执行记录（验收用）
+// M5：增加 object_type/object_id/object_name/preflight_mode 通用对象字段（双写兼容）
 export const automationLogs = mysqlTable('automation_logs', {
   // 主键
   id: int('id').primaryKey().autoincrement(),
@@ -213,13 +214,20 @@ export const automationLogs = mysqlTable('automation_logs', {
   // 关联信息
   accountId: varchar('account_id', { length: 50 }).notNull(),
   adId: varchar('ad_id', { length: 50 }).notNull(),
-  adName: varchar('ad_name', { length: 500 }),                                // 广告名称（快照）
+  adName: varchar('ad_name', { length: 500 }),                                // 广告名称（快照；旧字段，保留兼容）
   ruleId: int('rule_id'),                                                     // 规则ID（可为NULL表示手动触发）
   ruleName: varchar('rule_name', { length: 255 }),                            // 规则名称（快照）
   ownerId: int('owner_id').notNull(),
   
+  // M5 通用对象字段（新字段，双写兼容）
+  objectType: varchar('object_type', { length: 16 }),                         // 目标对象类型：ad|adset|campaign
+  objectId: varchar('object_id', { length: 50 }),                             // 目标对象 ID
+  objectName: varchar('object_name', { length: 500 }),                        // 目标对象名称
+  preflightMode: varchar('preflight_mode', { length: 32 }),                   // Pre-Flight 模式：preflight|direct_api_fallback
+  
   // 触发时的指标快照
   metricsSnapshot: json('metrics_snapshot'),                                  // 指标快照（JSON格式）
+  explanation: json('explanation'),                                           // 可解释审计：输入快照 + 聚合推导 + 条件命中链路
   
   // 动作信息
   actionType: varchar('action_type', { length: 50 }).notNull(),               // 动作类型（PAUSE、INCREASE_BUDGET等）
@@ -257,13 +265,15 @@ export const ruleAdExecutionState = mysqlTable('rule_ad_execution_state', {
   pk: primaryKey({ columns: [t.ruleId, t.scopeKey] })
 }))
 
-// rule_matched_objects：动态筛选预计算快照表
-// 存储「规则 × 账户」在 ad 级别的目标快照，执行层按 rule_id+account_id 直接读 object_id 列得到 ad_id
+// rule_matched_objects：动态筛选预计算快照表（M2 升级为 typed snapshot）
+// 存储「规则 × 账户 × 目标层级」的目标对象快照
+// object_type 真实生效（ad | adset | campaign），唯一键升级为 (rule_id, account_id, object_type, object_id)
+// 执行层按 rule_id + account_id + object_type 读取，不再默认只读 ad
 export const ruleMatchedObjects = mysqlTable('rule_matched_objects', {
   id: int('id').primaryKey().autoincrement(),
   ruleId: int('rule_id').notNull(),
   accountId: varchar('account_id', { length: 50 }).notNull(),
-  objectId: varchar('object_id', { length: 50 }).notNull(),       // V1：ad_id
-  objectType: varchar('object_type', { length: 16 }).notNull(),   // V1 固定 'ad'，为后续扩展预留
+  objectId: varchar('object_id', { length: 50 }).notNull(),       // 同层对象 ID（ad_id / adset_id / campaign_id）
+  objectType: varchar('object_type', { length: 16 }).notNull(),   // 真实业务字段：ad | adset | campaign
   createdAt: timestamp('created_at').notNull().defaultNow()
 })

@@ -252,6 +252,42 @@ describe('规则 API 测试', () => {
       expect(res.body).toHaveProperty('error')
       expect(res.body.code).toBe('INVALID_LOGIC_OPERATOR')
     })
+
+    // ===== M1 合同层测试 =====
+    it('M1: pause_ad + targetLevel=campaign 应创建成功且 DB 仍保存 pause_ad', async () => {
+      const ruleData = {
+        ruleName: 'M1合同测试-pause_ad+campaign',
+        accountId: TEST_ACCOUNT_ID,
+        targetLevel: 'campaign',
+        conditions: [
+          { metric: 'spend', operator: 'gt', value: 10, time_window: 'today' }
+        ],
+        actions: [
+          { type: 'pause_ad' }
+        ]
+      }
+
+      const res = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send(ruleData)
+
+      expect(res.status).toBe(201)
+      expect(res.body.rule.targetLevel).toBe('campaign')
+
+      // 验证 DB 仍保存旧枚举 pause_ad
+      const [rows] = await pool.execute(
+        'SELECT target_level, actions FROM rules WHERE id = ?',
+        [res.body.rule.id]
+      )
+      expect(rows.length).toBe(1)
+      expect(rows[0].target_level).toBe('campaign')
+      const savedActions = typeof rows[0].actions === 'string'
+        ? JSON.parse(rows[0].actions)
+        : rows[0].actions
+      expect(Array.isArray(savedActions)).toBe(true)
+      expect(savedActions[0].type).toBe('pause_ad')
+    })
   })
 
   describe('GET /api/rules - 获取规则列表', () => {

@@ -653,8 +653,8 @@
             </p>
             <div v-for="(a, idx) in ruleForm.actions" :key="idx" class="action-row">
               <select v-model="a.type" class="select action-select" @change="onActionTypeChange(a)">
-                <option value="pause_ad">⏸ 暂停广告</option>
-                <option value="activate_ad">▶️ 启用广告</option>
+                <option value="pause_ad">⏸ 暂停目标</option>
+                <option value="activate_ad">▶️ 启用目标</option>
                 <option value="increase_budget">💰 增加预算</option>
                 <option value="decrease_budget">💸 减少预算</option>
                 <option value="set_budget">📌 设置预算为固定值</option>
@@ -1587,7 +1587,7 @@ export default {
       return map[op] || op
     }
     const actionLabel = (t) => {
-      const map = { pause_ad: '暂停广告', activate_ad: '启用广告', increase_budget: '增加预算', decrease_budget: '减少预算', set_budget: '设置预算' }
+      const map = { pause_ad: '暂停目标', activate_ad: '启用目标', increase_budget: '增加预算', decrease_budget: '减少预算', set_budget: '设置预算' }
       return map[t] || t
     }
     const getActionClass = (type) => {
@@ -2165,8 +2165,15 @@ export default {
       runningRuleId.value = r.id
       try {
         const res = await facebookApi.executeRuleById(r.id)
+        const statusMap = {
+          no_match: '已执行，本次 0 命中（未找到满足条件的对象）',
+          skipped: '已执行，但本次被跳过',
+          matched: '已执行，并产生命中对象',
+          error: '已执行，但过程出错'
+        }
+        const statusText = statusMap[res.status] || (res.status || '未知')
         const msg = res.success
-          ? `已执行。匹配 ${res.matched_count ?? 0} 个，执行成功 ${res.executed_count ?? 0}，失败 ${res.failed_count ?? 0}。`
+          ? `已执行。\n状态：${statusText}\n匹配 ${res.matched_count ?? 0} 个，执行成功 ${res.executed_count ?? 0}，失败 ${res.failed_count ?? 0}。\nRun ID: ${res.run_id ?? 'N/A'}`
           : (res.message || '执行完成')
         alert(msg)
       } catch (e) {

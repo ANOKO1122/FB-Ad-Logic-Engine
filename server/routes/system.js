@@ -6,6 +6,7 @@ import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJ
 import { getCronStatus, manualSyncAccounts } from '../services/cronService.js'
 import { getCircuitBreakerStatus } from '../services/rateLimitService.js'
 import { HEARTBEAT_RESULT_CODE } from '../services/heartbeatStatusContract.js'
+import { parseLogJsonField } from '../utils/automationLogExplanation.js'
 
 const router = Router()
 
@@ -253,13 +254,19 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     const dataSql = `
       SELECT 
         al.id,
+        al.run_id,
         al.account_id,
         al.ad_id,
         al.ad_name,
+        al.object_type,
+        al.object_id,
+        al.object_name,
+        al.preflight_mode,
         al.rule_id,
         al.rule_name,
         al.owner_id,
         al.metrics_snapshot,
+        al.explanation,
         al.action_type,
         al.action_payload,
         al.is_simulation,
@@ -287,6 +294,7 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
       metrics_snapshot: typeof row.metrics_snapshot === 'string' 
         ? JSON.parse(row.metrics_snapshot || '{}') 
         : (row.metrics_snapshot || {}),
+      explanation: parseLogJsonField(row.explanation, null),
       action_payload: typeof row.action_payload === 'string'
         ? JSON.parse(row.action_payload || '{}')
         : (row.action_payload || {})
@@ -367,7 +375,8 @@ router.get('/automation-logs/:id', requireAuth, requireActive, async (req, res) 
         : (row.metrics_snapshot || {}),
       action_payload: typeof row.action_payload === 'string'
         ? JSON.parse(row.action_payload || '{}')
-        : (row.action_payload || {})
+        : (row.action_payload || {}),
+      explanation: parseLogJsonField(row.explanation, null)
     }
     
     res.json({ success: true, log })
@@ -553,6 +562,8 @@ router.post('/system/sync-accounts', requireAuth, requireActive, async (req, res
  * 仅管理员可用
  */
 router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, res) => {
+  let whereClause = ''
+  let params = []
   try {
     // 权限检查：仅管理员可查看
     if (!isAdminLikeRole(req.user.role)) {
@@ -570,6 +581,7 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
       user_id,
       owner_id,
       status,
+      summary_scope,
       skip_reason,
       page = 1,
       limit = 50,
@@ -579,7 +591,7 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
     
     // 构建 WHERE 条件
     const whereConditions = []
-    const params = []
+    params = []
     
     if (run_id) {
       whereConditions.push('run_id = ?')
@@ -609,6 +621,10 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
       whereConditions.push('status = ?')
       params.push(status)
     }
+    if (summary_scope) {
+      whereConditions.push('summary_scope = ?')
+      params.push(summary_scope)
+    }
     if (skip_reason) {
       whereConditions.push('skip_reason = ?')
       params.push(skip_reason)
@@ -622,7 +638,7 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
       params.push(end_date)
     }
     
-    const whereClause = whereConditions.length > 0 
+    whereClause = whereConditions.length > 0 
       ? `WHERE ${whereConditions.join(' AND ')}`
       : ''
     
@@ -643,7 +659,7 @@ router.get('/rule-execution-summaries', requireAuth, requireActive, async (req, 
       `SELECT 
         id, run_id, rule_id, rule_name, account_id, user_id, owner_id,
         matched_count, executed_count, failed_count, skipped_count,
-        status, skip_reason, skip_details, error_message, duration_ms,
+        status, summary_scope, skip_reason, skip_details, error_message, duration_ms,
         evaluated_at, created_at
        FROM rule_execution_summaries
        ${whereClause}
@@ -714,7 +730,7 @@ router.get('/rule-execution-summaries/stats', requireAuth, requireActive, async 
       })
     }
     
-    const { start_date, end_date } = req.query
+    const { start_date, end_date, summary_scope } = req.query
     
     // 构建 WHERE 条件
     const whereConditions = []
@@ -727,6 +743,14 @@ router.get('/rule-execution-summaries/stats', requireAuth, requireActive, async 
     if (end_date) {
       whereConditions.push('evaluated_at <= ?')
       params.push(end_date)
+    }
+    if (summary_scope) {
+      whereConditions.push('summary_scope = ?')
+      params.push(summary_scope)
+    } else {
+      // 默认只统计 account 级别，避免 rollup 汇总重复计算同一批执行结果
+      whereConditions.push('summary_scope = ?')
+      params.push('account')
     }
     
     const whereClause = whereConditions.length > 0 
