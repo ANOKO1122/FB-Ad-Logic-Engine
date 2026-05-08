@@ -24,6 +24,7 @@ import logger from '../utils/logger.js'
  * @param {Object} summary.skipDetails - 跳过详情（JSON对象）
  * @param {string} summary.errorMessage - 错误信息（已脱敏）
  * @param {number} summary.durationMs - 耗时（毫秒）
+ * @param {string} summary.summaryScope - 摘要层级：'account'=账户级明细，'rollup'=汇总级
  * @param {Date} summary.evaluatedAt - 评估时间
  */
 export async function insertRuleExecutionSummary(summary) {
@@ -32,8 +33,8 @@ export async function insertRuleExecutionSummary(summary) {
       INSERT INTO rule_execution_summaries (
         run_id, rule_id, rule_name, account_id, user_id, owner_id,
         matched_count, executed_count, failed_count, skipped_count,
-        status, skip_reason, skip_details, error_message, duration_ms, evaluated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, summary_scope, skip_reason, skip_details, error_message, duration_ms, evaluated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     
     // ✅ 确保 evaluatedAt 是 UTC 时间字符串（避免时区转换问题）
@@ -61,6 +62,7 @@ export async function insertRuleExecutionSummary(summary) {
       summary.failedCount || 0,
       summary.skippedCount || 0,
       summary.status || null,
+      summary.summaryScope || null,
       summary.skipReason || null,
       summary.skipDetails ? JSON.stringify(summary.skipDetails) : null,  // MySQL JSON 列需要 stringify
       summary.errorMessage || null,
@@ -71,7 +73,10 @@ export async function insertRuleExecutionSummary(summary) {
     await pool.execute(sql, params)
   } catch (error) {
     // 摘要记录失败不应该影响规则执行，只记录错误
-    logger.error('❌ 插入规则执行摘要失败:', error.message)
+    logger.error({
+      message: '❌ 插入规则执行摘要失败',
+      errorMessage: error.message
+    })
   }
 }
 

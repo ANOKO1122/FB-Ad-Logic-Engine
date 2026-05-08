@@ -81,6 +81,7 @@
         <div class="empty-icon">📋</div>
         <h3>暂无执行日志</h3>
         <p>当规则被触发执行后，日志会显示在这里</p>
+        <p class="hint-text">提示：若规则执行结果为"无命中 (no_match)"，不会产生动作审计日志。请前往规则管理页查看执行摘要。</p>
       </div>
 
       <div v-else class="table-container">
@@ -89,7 +90,7 @@
             <tr>
               <th class="col-time">执行时间</th>
               <th class="col-rule">规则名称</th>
-              <th class="col-ad">广告名称</th>
+              <th class="col-ad">执行对象</th>
               <th class="col-action">执行动作</th>
               <th class="col-status">状态</th>
               <th class="col-mode">模式</th>
@@ -110,9 +111,9 @@
                 <div class="rule-name">{{ log.rule_name || '-' }}</div>
                 <div class="account-text">{{ log.account_name || log.account_id }}</div>
               </td>
-              <td class="col-ad" :title="log.ad_name">
-                <div class="ad-name">{{ log.ad_name || '-' }}</div>
-                <div class="ad-id">{{ log.ad_id }}</div>
+              <td class="col-ad" :title="getLogObjectName(log)">
+                <div class="ad-name">{{ getLogObjectName(log) }}</div>
+                <div class="ad-id">{{ getLogObjectType(log) }} / {{ getLogObjectId(log) }}</div>
               </td>
               <td class="col-action">
                 <span class="action-badge" :class="getActionClass(log.action_type)">
@@ -187,12 +188,16 @@
                 <span>{{ detailLog.account_name || detailLog.account_id }}</span>
               </div>
               <div class="detail-item">
-                <label>广告名称</label>
-                <span>{{ detailLog.ad_name || '-' }}</span>
+                <label>Run ID</label>
+                <span class="mono">{{ detailLog.run_id || '-' }}</span>
               </div>
               <div class="detail-item">
-                <label>广告 ID</label>
-                <span class="mono">{{ detailLog.ad_id }}</span>
+                <label>执行对象</label>
+                <span>{{ getLogObjectName(detailLog) }}</span>
+              </div>
+              <div class="detail-item">
+                <label>对象类型/ID</label>
+                <span class="mono">{{ getLogObjectType(detailLog) }} / {{ getLogObjectId(detailLog) }}</span>
               </div>
               <div class="detail-item">
                 <label>执行状态</label>
@@ -229,6 +234,21 @@
                 <span>{{ formatMetricValue(key, value) }}</span>
               </div>
             </div>
+          </div>
+
+          <div v-if="detailLog.explanation?.aggregate" class="detail-section">
+            <h4>聚合结果</h4>
+            <pre class="json-box">{{ JSON.stringify(detailLog.explanation.aggregate, null, 2) }}</pre>
+          </div>
+
+          <div v-if="Array.isArray(detailLog.explanation?.conditionTrace) && detailLog.explanation.conditionTrace.length" class="detail-section">
+            <h4>条件命中链路</h4>
+            <pre class="json-box">{{ JSON.stringify(detailLog.explanation.conditionTrace, null, 2) }}</pre>
+          </div>
+
+          <div v-if="Array.isArray(detailLog.explanation?.input?.children) && detailLog.explanation.input.children.length" class="detail-section">
+            <h4>子 ad 快照表</h4>
+            <pre class="json-box">{{ JSON.stringify(detailLog.explanation.input.children, null, 2) }}</pre>
           </div>
 
           <!-- 动作参数 -->
@@ -418,6 +438,18 @@ export default {
       return map[status] || status
     }
 
+    const getLogObjectType = (log) => {
+      return log?.object_type || (log?.ad_id ? 'ad' : '-')
+    }
+
+    const getLogObjectId = (log) => {
+      return log?.object_id || log?.ad_id || '-'
+    }
+
+    const getLogObjectName = (log) => {
+      return log?.object_name || log?.ad_name || '-'
+    }
+
     const getActionLabel = (type) => {
       const map = {
         pause_ad: '暂停广告',
@@ -484,6 +516,7 @@ export default {
       loadLogs, resetAndLoad, clearFilters, goToPage, openDetail,
       formatTime, formatDate, formatDateTime,
       formatAccountTime, formatAccountDate, formatDateTimeBeijingLocale,
+      getLogObjectType, getLogObjectId, getLogObjectName,
       getStatusLabel, getActionLabel, getActionClass,
       getMetricLabel, formatMetricValue, formatActionPayloadDisplay
     }
@@ -740,6 +773,7 @@ export default {
 .empty-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
 .empty-state h3 { margin: 0 0 8px 0; color: var(--text-primary); }
 .empty-state p { margin: 0; }
+.empty-state .hint-text { margin-top: 12px; font-size: 13px; color: var(--text-tertiary, #888); max-width: 400px; line-height: 1.5; }
 
 .spinner {
   width: 32px;

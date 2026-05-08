@@ -14,7 +14,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "export:pg": "node server/scripts/export-facebook-to-pg.js"
+    "export:pg": "node server/scripts/export-facebook-to-pg.js",
+    "perf:explain": "node scripts/perf/verify-level-aggregation-explain.js",
+    "perf:bench": "node scripts/perf/benchmark-rule-level-query.js",
+    "perf:gate": "npm run perf:explain && npm run perf:bench"
   },
   "dependencies": {
     "@vuepic/vue-datepicker": "^11.0.2",

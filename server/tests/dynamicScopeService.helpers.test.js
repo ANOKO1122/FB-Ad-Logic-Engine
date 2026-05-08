@@ -61,6 +61,26 @@ describe('DynamicScopeService helpers', () => {
   })
 })
 
+// ===== M2 typed snapshot 测试 =====
+describe('M2 typed snapshot helpers', () => {
+  it('getRuleOutputObjectType 应按 targetLevel 输出 campaign/adset/ad', () => {
+    expect(_internals.getRuleOutputObjectType({ targetLevel: 'campaign' })).toBe('campaign')
+    expect(_internals.getRuleOutputObjectType({ target_level: 'adset' })).toBe('adset')
+    expect(_internals.getRuleOutputObjectType({})).toBe('ad')
+  })
+
+  // NOTE: getRuleOutputObjectType is extracted from the module; use _internals if available
+  it('M2: normalizeCompositeId 保持 act_xxx:objId 格式', () => {
+    const id = _internals.normalizeCompositeId('act_123', 'ad_456')
+    expect(id).toBe('act_123:ad_456')
+  })
+
+  it('M2: normalizeCompositeId 对 act_act_ 前缀归一化', () => {
+    const id = _internals.normalizeCompositeId('act_act_999', 'ad_001')
+    expect(id).toBe('act_999:ad_001')
+  })
+})
+
 describe('previewDynamicScope', () => {
   it('returns object_ids, count and optional per_account; invalid scopeFilters yield per_account error', async () => {
     const result = await previewDynamicScope(['act_123'], {

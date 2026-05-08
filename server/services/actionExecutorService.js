@@ -18,6 +18,99 @@ import { automationLogs } from '../db/schema.js'
 import pool from '../db/connection.js'
 import { FacebookMarketingAPI } from '../index.js'
 import { isCooldownDue } from './ruleExecutionStateService.js'
+import { buildAutomationLogExplanation } from '../utils/automationLogExplanation.js'
+import {
+  logAuditInsertFailure,
+  logAuditInsertSuccess,
+  logFbActionFailure,
+  logFbActionSuccess
+} from '../utils/auditLogTelemetry.js'
+
+// ============================================
+// M1 合同层：动作语义解析（执行意图解释器）
+// 约定：持久化层继续保存旧枚举 pause_ad/activate_ad；
+//       执行前根据 targetLevel 解析出真实目标层级与操作。
+// ============================================
+
+/**
+ * M1 内部解释层：根据规则 targetLevel 解析状态动作的真实执行意图
+ *
+ * 合同：
+ * - rules.actions[*].type 持久化值不变（pause_ad / activate_ad）
+ * - 执行语义由 targetLevel 决定：
+ *   - targetLevel=ad       → 作用于 ad（pauseAd / activateAd）
+ *   - targetLevel=adset    → 作用于 adset（pauseAdset / activateAdset）
+ *   - targetLevel=campaign → 作用于 campaign（pauseCampaign / activateCampaign）
+ *
+ * @param {Object} rule - 规则对象（含 targetLevel, target_level）
+ * @param {Object} action - 动作对象（含 type）
+ * @param {Object} matchedObject - 匹配的目标对象（含 ad_id, adset_id, campaign_id, 及各层名称）
+ * @returns {{ resolvedStatusTargetLevel: string, resolvedStatusOp: string, resolvedObjectId: string, resolvedObjectName: string | null }}
+ */
+export function resolveStatusActionIntent(rule, action, matchedObject) {
+  const actionType = action?.type || ''
+  const targetLevel = (rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+
+  // 仅状态动作需要解释；预算动作保持原有 ABO/CBO 路由
+  if (!['pause_ad', 'activate_ad'].includes(actionType)) {
+    return {
+      resolvedStatusTargetLevel: targetLevel,
+      resolvedStatusOp: actionType,
+      resolvedObjectId: matchedObject?.ad_id || '',
+      resolvedObjectName: matchedObject?.ad_name || null
+    }
+  }
+
+  const op = actionType === 'pause_ad' ? 'pause' : 'activate'
+
+  switch (targetLevel) {
+    case 'adset': {
+      const adsetId = matchedObject?.adset_id || matchedObject?.ad_set_id || ''
+      const adsetName = matchedObject?.adset_name || null
+      return {
+        resolvedStatusTargetLevel: 'adset',
+        resolvedStatusOp: op,
+        resolvedObjectId: adsetId,
+        resolvedObjectName: adsetName
+      }
+    }
+    case 'campaign': {
+      const campaignId = matchedObject?.campaign_id || ''
+      const campaignName = matchedObject?.campaign_name || null
+      return {
+        resolvedStatusTargetLevel: 'campaign',
+        resolvedStatusOp: op,
+        resolvedObjectId: campaignId,
+        resolvedObjectName: campaignName
+      }
+    }
+    case 'ad':
+    default: {
+      const adId = matchedObject?.ad_id || ''
+      const adName = matchedObject?.ad_name || null
+      return {
+        resolvedStatusTargetLevel: 'ad',
+        resolvedStatusOp: op,
+        resolvedObjectId: adId,
+        resolvedObjectName: adName
+      }
+    }
+  }
+}
+
+function getMatchedObjectScopeKey(rule, matchedObject) {
+  const level = String(rule?.targetLevel || rule?.target_level || matchedObject?.objectType || 'ad').toLowerCase()
+  if (level === 'adset') {
+    const adsetId = String(matchedObject?.objectId || matchedObject?.ad_set_id || matchedObject?.adset_id || '').trim()
+    return adsetId ? `status_adset:${adsetId}` : null
+  }
+  if (level === 'campaign') {
+    const campaignId = String(matchedObject?.objectId || matchedObject?.campaign_id || '').trim()
+    return campaignId ? `status_campaign:${campaignId}` : null
+  }
+  const adId = String(matchedObject?.objectId || matchedObject?.ad_id || '').trim()
+  return adId ? `status_ad:${adId}` : null
+}
 
 // Facebook API Token（从环境变量读取）
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -27,6 +120,67 @@ const MIN_BUDGET_CENTS = 100
 
 /** value_unit 合法值：percent=百分比，usd=固定美元 */
 const VALID_VALUE_UNITS = ['percent', 'usd']
+const PREFLIGHT_STALE_MS = 30 * 60 * 1000
+
+async function loadPreflightStatusByLevel({ accountId, targetLevel, targetObjectId, fallbackStatus = null }) {
+  if (targetLevel === 'ad' && fallbackStatus) {
+    return { preflightMode: 'preflight', status: fallbackStatus }
+  }
+  try {
+    const [heartbeatRows] = await pool.execute(
+      `SELECT last_heartbeat_data_update_at
+       FROM structure_sync_status
+       WHERE account_id = ?
+       LIMIT 1`,
+      [accountId]
+    )
+    const heartbeatAt = heartbeatRows?.[0]?.last_heartbeat_data_update_at
+    if (!heartbeatAt || (Date.now() - new Date(heartbeatAt).getTime()) > PREFLIGHT_STALE_MS) {
+      if (targetLevel === 'ad' && fallbackStatus) {
+        return { preflightMode: 'preflight', status: fallbackStatus }
+      }
+      return { preflightMode: 'direct_api_fallback', status: fallbackStatus }
+    }
+
+    if (targetLevel === 'adset') {
+      const [rows] = await pool.execute(
+        `SELECT effective_status AS status
+         FROM structure_adsets
+         WHERE account_id = ? AND adset_id = ?
+         LIMIT 1`,
+        [accountId, targetObjectId]
+      )
+      const status = rows?.[0]?.status || null
+      return status ? { preflightMode: 'preflight', status } : { preflightMode: 'direct_api_fallback', status: fallbackStatus }
+    }
+
+    if (targetLevel === 'campaign') {
+      const [rows] = await pool.execute(
+        `SELECT effective_status AS status
+         FROM structure_campaigns
+         WHERE account_id = ? AND campaign_id = ?
+         LIMIT 1`,
+        [accountId, targetObjectId]
+      )
+      const status = rows?.[0]?.status || null
+      return status ? { preflightMode: 'preflight', status } : { preflightMode: 'direct_api_fallback', status: fallbackStatus }
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT status
+       FROM ad_snapshots
+       WHERE account_id = ? AND ad_id = ?
+       ORDER BY synced_at DESC, id DESC
+       LIMIT 1`,
+      [accountId, targetObjectId]
+    )
+    const status = rows?.[0]?.status || null
+    return status ? { preflightMode: 'preflight', status } : { preflightMode: 'direct_api_fallback', status: fallbackStatus }
+  } catch (err) {
+    logger.warn(`    ⚠️  Pre-Flight 状态源查询失败，降级直连 API: ${err.message}`)
+    return { preflightMode: 'direct_api_fallback', status: fallbackStatus }
+  }
+}
 
 /**
  * 预算 Pre-Flight 跳过原因细分：
@@ -283,6 +437,11 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     ad_name: matchedAd.ad_name,
     status: matchedAd.status ?? null
   }
+  const explanationPayload = buildAutomationLogExplanation({
+    rule,
+    matchedObject: matchedAd,
+    accountId
+  })
 
   // 遍历所有动作，逐个执行
   for (const action of actions) {
@@ -292,6 +451,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     let apiRequest = null
     let apiResponse = null
     let cooldownKey = null  // 冷却键：供 cron 写 rule_ad_execution_state(scope_key)
+    let logPreflightMode = null
 
     try {
       if (isSimulation) {
@@ -326,93 +486,110 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
         status = 'skipped'
         errorMessage = 'Facebook Token 未配置'
       } else {
-        // ===== 真实执行动作（M4 Pre-Flight：本地 status 判断 + FB already 容错）=====
+        // ===== 真实执行动作（M4 同层执行：按 targetLevel 分发 + Pre-Flight 信任门禁 + FB already 容错）=====
         switch (action.type) {
-          case 'pause_ad': {
-            const adStatus = (matchedAd.status || '').toUpperCase()
-            const alreadyPaused = ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)
-            if (alreadyPaused) {
-              logger.info(`    ⏭️  Pre-Flight: 广告 ${matchedAd.ad_id} 已处于 ${adStatus}，无需再 pause，跳过`)
+          case 'pause_ad':
+          case 'activate_ad': {
+            // M4 同层分发：根据规则 targetLevel 解释动作目标
+            const intent = resolveStatusActionIntent(rule, action, matchedAd)
+            const targetLevel = intent.resolvedStatusTargetLevel
+            const op = intent.resolvedStatusOp // 'pause' | 'activate'
+            const targetObjectId = intent.resolvedObjectId
+            const targetObjectName = intent.resolvedObjectName
+
+            if (!targetObjectId) {
+              logger.warn(`    ⚠️  无法确定${targetLevel}级目标ID，跳过${action.type}`)
+              status = 'fail'
+              errorMessage = `${targetLevel}_id 不存在`
+              break
+            }
+
+            const preflightInfo = await loadPreflightStatusByLevel({
+              accountId,
+              targetLevel,
+              targetObjectId,
+              fallbackStatus: matchedAd.status || null
+            })
+            logPreflightMode = preflightInfo.preflightMode
+            const targetStatus = String(preflightInfo.status || '').toUpperCase()
+            const isPause = op === 'pause'
+            const alreadyPaused = ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(targetStatus)
+            const alreadyActive = targetStatus === 'ACTIVE'
+            const cannotActivate = ['ARCHIVED', 'DELETED'].includes(targetStatus)
+
+            if (preflightInfo.preflightMode === 'preflight' && isPause && alreadyPaused) {
+              logger.info(`    ⏭️  Pre-Flight: ${targetLevel} ${targetObjectId} 已处于 ${targetStatus}，无需 pause，跳过`)
               status = 'skipped'
-              errorMessage = `目标已达成（status=${adStatus}）`
-              apiRequest = JSON.stringify({ preFlight: true, status: adStatus })
+              errorMessage = `目标已达成（status=${targetStatus}）`
+              apiRequest = JSON.stringify({ preFlight: true, preflightMode: preflightInfo.preflightMode, targetLevel, targetObjectId, status: targetStatus })
               apiResponse = JSON.stringify({ skipped: true, reason: 'already_paused' })
               break
             }
-            cooldownKey = `ad:${matchedAd.ad_id}`
-            // 收集状态类 PendingAction（真实执行路径），Dry Run 仅作为模拟不收集
-            if (!isSimulation) {
-              pendingActions.push({
-                kind: 'status',
-                op: 'pause',
-                accountId,
-                adId: matchedAd.ad_id,
-                ruleId: rule.id,
-                runId
-              })
-            }
-            logger.info(`    🔧 执行: 暂停广告 ${matchedAd.ad_id}`)
-            apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'PAUSED' } })
-            try {
-              await api.pauseAd(matchedAd.ad_id)
-              apiResponse = JSON.stringify({ success: true })
-              logger.info(`    ✅ 成功暂停广告 ${matchedAd.ad_id}`)
-            } catch (err) {
-              const msg = (err.message || '').toLowerCase()
-              if (msg.includes('already') || msg.includes('duplicate')) {
-                status = 'skipped'
-                errorMessage = `FB 返回已达成: ${err.message}`
-                apiResponse = JSON.stringify({ skipped: true, reason: 'already_in_state', apiError: err.message })
-                logger.info(`    ⏭️  FB 容错: 广告 ${matchedAd.ad_id} 已暂停，记 skipped`)
-              } else throw err
-            }
-            break
-          }
-          
-          case 'activate_ad': {
-            const adStatus = (matchedAd.status || '').toUpperCase()
-            const alreadyActive = adStatus === 'ACTIVE'
-            const cannotActivate = ['ARCHIVED', 'DELETED'].includes(adStatus)
-            if (alreadyActive) {
-              logger.info(`    ⏭️  Pre-Flight: 广告 ${matchedAd.ad_id} 已 ACTIVE，无需再 activate，跳过`)
+            if (preflightInfo.preflightMode === 'preflight' && !isPause && alreadyActive) {
+              logger.info(`    ⏭️  Pre-Flight: ${targetLevel} ${targetObjectId} 已 ACTIVE，无需 activate，跳过`)
               status = 'skipped'
-              errorMessage = `目标已达成（status=ACTIVE）`
-              apiRequest = JSON.stringify({ preFlight: true, status: 'ACTIVE' })
+              errorMessage = '目标已达成（status=ACTIVE）'
+              apiRequest = JSON.stringify({ preFlight: true, preflightMode: preflightInfo.preflightMode, targetLevel, targetObjectId, status: 'ACTIVE' })
               apiResponse = JSON.stringify({ skipped: true, reason: 'already_active' })
               break
             }
-            if (cannotActivate) {
-              logger.info(`    ⏭️  Pre-Flight: 广告 ${matchedAd.ad_id} 处于 ${adStatus}，不可激活，跳过`)
+            if (preflightInfo.preflightMode === 'preflight' && !isPause && cannotActivate) {
+              logger.info(`    ⏭️  Pre-Flight: ${targetLevel} ${targetObjectId} 处于 ${targetStatus}，不可激活，跳过`)
               status = 'skipped'
-              errorMessage = `不可激活（status=${adStatus}）`
-              apiRequest = JSON.stringify({ preFlight: true, status: adStatus })
+              errorMessage = `不可激活（status=${targetStatus}）`
+              apiRequest = JSON.stringify({ preFlight: true, preflightMode: preflightInfo.preflightMode, targetLevel, targetObjectId, status: targetStatus })
               apiResponse = JSON.stringify({ skipped: true, reason: 'cannot_activate' })
               break
             }
-            cooldownKey = `ad:${matchedAd.ad_id}`
+
+            // 冷却键按层级区分
+            cooldownKey = `status_${targetLevel}:${targetObjectId}`
+
+            // 收集状态类 PendingAction
             if (!isSimulation) {
               pendingActions.push({
                 kind: 'status',
-                op: 'activate',
+                op,
+                targetLevel,
                 accountId,
-                adId: matchedAd.ad_id,
+                targetObjectId,
+                targetObjectName,
                 ruleId: rule.id,
                 runId
               })
             }
-            logger.info(`    🔧 执行: 激活广告 ${matchedAd.ad_id}`)
-            apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${matchedAd.ad_id}`, body: { status: 'ACTIVE' } })
+
+            // 按层级分发 API 调用
+            logger.info(`    🔧 执行: ${isPause ? '暂停' : '激活'} ${targetLevel} ${targetObjectId}${targetObjectName ? ` (${targetObjectName})` : ''}`)
+            apiRequest = JSON.stringify({ method: 'POST', endpoint: `/${targetObjectId}`, preflightMode: preflightInfo.preflightMode, targetLevel, body: { status: isPause ? 'PAUSED' : 'ACTIVE' } })
+
             try {
-              await api.activateAd(matchedAd.ad_id)
-              apiResponse = JSON.stringify({ success: true })
-              logger.info(`    ✅ 成功激活广告 ${matchedAd.ad_id}`)
+              if (targetLevel === 'ad') {
+                isPause ? await api.pauseAd(targetObjectId) : await api.activateAd(targetObjectId)
+              } else if (targetLevel === 'adset') {
+                isPause ? await api.pauseAdset(targetObjectId) : await api.activateAdset(targetObjectId)
+              } else {
+                isPause ? await api.pauseCampaign(targetObjectId) : await api.activateCampaign(targetObjectId)
+              }
+              apiResponse = JSON.stringify({ success: true, targetLevel, targetObjectId })
+              logger.info(`    ✅ 成功${isPause ? '暂停' : '激活'} ${targetLevel} ${targetObjectId}`)
+              logFbActionSuccess({
+                runId: runId || null,
+                ruleId: rule.id || null,
+                accountId: String(accountId),
+                objectType: targetLevel,
+                objectId: String(targetObjectId),
+                adId: String(matchedAd?.ad_id || ''),
+                actionType: action.type,
+                httpStatus: 200
+              })
             } catch (err) {
               const msg = (err.message || '').toLowerCase()
               if (msg.includes('already') || msg.includes('duplicate')) {
                 status = 'skipped'
                 errorMessage = `FB 返回已达成: ${err.message}`
-                apiResponse = JSON.stringify({ skipped: true, reason: 'already_in_state', apiError: err.message })
-                logger.info(`    ⏭️  FB 容错: 广告 ${matchedAd.ad_id} 已激活或不可变更，记 skipped`)
+                apiResponse = JSON.stringify({ skipped: true, reason: 'already_in_state', targetLevel, targetObjectId, apiError: err.message })
+                logger.info(`    ⏭️  FB 容错: ${targetLevel} ${targetObjectId} 已在目标状态，记 skipped`)
               } else throw err
             }
             break
@@ -421,12 +598,19 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
           case 'increase_budget':
           case 'decrease_budget':
           case 'set_budget': {
+            const budgetTargetLevel = String(rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+            if (budgetTargetLevel !== 'ad') {
+              status = 'fail'
+              errorMessage = `预算动作仅支持 targetLevel=ad，当前为 ${budgetTargetLevel}`
+              cooldownKey = getMatchedObjectScopeKey(rule, matchedAd)
+              break
+            }
             const adsetId = matchedAd.ad_set_id || matchedAd.adset_id
             if (!adsetId) {
               logger.warn(`    ⚠️  无法调整预算：广告 ${matchedAd.ad_id} 没有 adset_id`)
               status = 'fail'
               errorMessage = 'adset_id 不存在，无法调整预算'
-              cooldownKey = `ad:${matchedAd.ad_id}` // 作用域缺失时按广告冷却，避免空键
+              cooldownKey = getMatchedObjectScopeKey(rule, matchedAd)
               break
             }
 
@@ -515,7 +699,7 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
                 logger.warn(`    ⚠️  CBO 广告系列但无 campaign_id，无法调整预算`)
                 status = 'fail'
                 errorMessage = 'CBO 广告系列缺少 campaign_id，无法调整系列预算'
-                cooldownKey = `ad:${matchedAd.ad_id}` // 作用域缺失时按广告冷却，避免空键
+                cooldownKey = getMatchedObjectScopeKey(rule, matchedAd)
                 break
               }
               targetNodeId = campaignId
@@ -594,6 +778,16 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               budgetTarget: targetLabel
             })
             logger.info(`    ✅ 成功${adjustDirection}预算: ${newBudgetCents} 分 (${targetLabel})`)
+            logFbActionSuccess({
+              runId: runId || null,
+              ruleId: rule.id || null,
+              accountId: String(accountId),
+              objectType: isABO ? 'adset' : 'campaign',
+              objectId: String(targetNodeId || ''),
+              adId: String(matchedAd?.ad_id || ''),
+              actionType: action.type,
+              httpStatus: 200
+            })
             break
           }
           
@@ -609,20 +803,84 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
       status = 'fail'
       errorMessage = error.message
       apiResponse = JSON.stringify({ error: error.message })
+      const fallbackObjectType = String(rule?.targetLevel || rule?.target_level || matchedAd?.objectType || 'ad').toLowerCase()
+      const fallbackObjectId = String(
+        fallbackObjectType === 'campaign'
+          ? (matchedAd?.campaign_id || matchedAd?.ad_id || '')
+          : fallbackObjectType === 'adset'
+            ? (matchedAd?.ad_set_id || matchedAd?.adset_id || matchedAd?.ad_id || '')
+            : (matchedAd?.ad_id || '')
+      )
+      logFbActionFailure({
+        context: {
+          runId: runId || null,
+          ruleId: rule.id || null,
+          accountId: String(accountId),
+          objectType: fallbackObjectType,
+          objectId: fallbackObjectId,
+          adId: String(matchedAd?.ad_id || ''),
+          actionType: action.type,
+          requestPreview: apiRequest
+        },
+        error
+      })
     }
 
-    // ===== 写入审计日志（M4：写入 run_id；triggered_at 存 UTC，由前端按 UTC 解析后转北京展示）=====
+    // ===== 写入审计日志（M5：通用对象字段双写 + 旧字段兼容）=====
     const now = new Date()
+    // M5 通用对象字段：从 intent 或 matchedAd 推断
+    const statusActionTypes = ['pause_ad', 'activate_ad']
+    const logObjectType = statusActionTypes.includes(action.type)
+      ? (matchedAd?.objectType || rule?.targetLevel || rule?.target_level || 'ad')
+      : (matchedAd?.objectType || 'ad')
+    const logObjectId = String(
+      matchedAd?.objectId
+      || (statusActionTypes.includes(action.type)
+        ? (logObjectType === 'adset' ? (matchedAd.ad_set_id || matchedAd.adset_id || matchedAd.ad_id)
+          : logObjectType === 'campaign' ? (matchedAd.campaign_id || matchedAd.ad_id)
+          : matchedAd.ad_id)
+        : matchedAd.ad_id)
+      || ''
+    )
+    const logObjectName = matchedAd?.objectName
+      || (statusActionTypes.includes(action.type)
+        ? (logObjectType === 'adset' ? (matchedAd.adset_name || null)
+          : logObjectType === 'campaign' ? (matchedAd.campaign_name || null)
+          : matchedAd.ad_name || null)
+        : (matchedAd.ad_name || null))
+    // preflight_mode：skipped 且 reason 含 already 视为 preflight 命中，否则 direct_api_fallback
+    const resolvedPreflightMode = statusActionTypes.includes(action.type)
+      ? (logPreflightMode || (status === 'skipped' ? 'preflight' : 'direct_api_fallback'))
+      : null
+
+    const auditLogContext = {
+      runId: runId || null,
+      ruleId: rule.id || null,
+      accountId: String(accountId),
+      ownerId: ownerId ?? null,
+      objectType: logObjectType,
+      objectId: String(logObjectId || ''),
+      adId: String(matchedAd?.ad_id || ''),
+      actionType: action.type,
+      auditStatus: status
+    }
+
     try {
-      await db.insert(automationLogs).values({
+      const insertResult = await db.insert(automationLogs).values({
         runId: runId || null,
         accountId: String(accountId),
-        adId: String(matchedAd.ad_id),
-        adName: matchedAd.ad_name || null,
+        adId: String(matchedAd?.ad_id || ''),        // 旧字段保留兼容：campaign/adset 目标避免写入字符串 'null'
+        adName: matchedAd.ad_name || null,             // 旧字段保留兼容
+        // M5 通用对象字段（双写）
+        objectType: logObjectType,
+        objectId: String(logObjectId || ''),
+        objectName: logObjectName,
+        preflightMode: resolvedPreflightMode,
         ruleId: rule.id || null,
         ruleName: rule.ruleName || rule.rule_name || null,
         ownerId: ownerId,
         metricsSnapshot: metricsSnapshot,
+        explanation: explanationPayload,
         actionType: action.type.toUpperCase(),
         actionPayload: action,
         isSimulation: isSimulation,
@@ -632,9 +890,24 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
         errorMessage: errorMessage,
         triggeredAt: now
       })
+      const auditLogId = Array.isArray(insertResult)
+        ? insertResult?.[0]?.insertId ?? null
+        : insertResult?.insertId ?? null
+      logAuditInsertSuccess({
+        ...auditLogContext,
+        auditLogId
+      })
     } catch (logError) {
       // 审计日志写入失败不应该中断主流程
-      logger.error(`    ⚠️  写入审计日志失败:`, logError.message)
+      logAuditInsertFailure({
+        context: auditLogContext,
+        payload: {
+          actionPayload: action,
+          metricsSnapshot,
+          explanation: explanationPayload
+        },
+        error: logError
+      })
     }
 
     // 记录结果
@@ -651,6 +924,17 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
   // 调用方当前仍按原约定把 results 当数组使用；如需 Batch，可按需读取 results.pendingActions
   results.pendingActions = pendingActions
   return results
+}
+
+export async function executeActionsForObject({ rule, matchedObject, accountId, ownerId, runId = null, actionsOverride = null }) {
+  return executeActionsForAd({
+    rule,
+    matchedAd: matchedObject,
+    accountId,
+    ownerId,
+    runId,
+    actionsOverride
+  })
 }
 
 /**
@@ -683,7 +967,8 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
   const ruleActions = Array.isArray(rule.actions) ? rule.actions : []
   const singleAction = ruleActions.length === 1 ? ruleActions[0] : null
   const isSingleStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction.type)
-  const canBatchSingleRuleStatus = enableActionBatch && !isSimulation && !!FACEBOOK_ACCESS_TOKEN && isSingleStatusAction
+  const targetLevel = String(rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+  const canBatchSingleRuleStatus = enableActionBatch && !isSimulation && !!FACEBOOK_ACCESS_TOKEN && isSingleStatusAction && targetLevel === 'ad'
   if (!canBatchSingleRuleStatus && !isSimulation) {
     const maybeStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction?.type)
     if (maybeStatusAction || ruleActions.some(a => ['pause_ad', 'activate_ad'].includes(a?.type))) {
@@ -716,16 +1001,43 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
         ad_name: matchedAd?.ad_name,
         status: matchedAd?.status ?? null
       }
+      // M5 通用对象字段
+      const logObjectType = matchedAd?.objectType || rule?.targetLevel || rule?.target_level || 'ad'
+      const logObjectId = matchedAd?.objectId || matchedAd?.ad_id || ''
+      const logObjectName = matchedAd?.objectName || matchedAd?.ad_name || null
+      const explanationPayload = buildAutomationLogExplanation({
+        rule,
+        matchedObject: matchedAd,
+        accountId
+      })
+
       try {
-        await db.insert(automationLogs).values({
+        const auditLogContext = {
+          runId: runId || null,
+          ruleId: rule?.id || null,
+          accountId: String(accountId),
+          ownerId: ownerId ?? null,
+          objectType: logObjectType,
+          objectId: String(logObjectId || ''),
+          adId: String(matchedAd?.ad_id || ''),
+          actionType: actionType,
+          auditStatus: status
+        }
+        const insertResult = await db.insert(automationLogs).values({
           runId: runId || null,
           accountId: String(accountId),
-          adId: String(matchedAd?.ad_id || ''),
-          adName: matchedAd?.ad_name || null,
+          adId: String(matchedAd?.ad_id || ''),           // 旧字段兼容
+          adName: matchedAd?.ad_name || null,              // 旧字段兼容
+          // M5 通用对象字段（双写）
+          objectType: logObjectType,
+          objectId: String(logObjectId),
+          objectName: logObjectName,
+          preflightMode: status === 'skipped' ? 'preflight' : 'preflight',
           ruleId: rule?.id || null,
           ruleName: rule?.ruleName || rule?.rule_name || null,
           ownerId: ownerId ?? 0,
           metricsSnapshot,
+          explanation: explanationPayload,
           actionType: actionUpper,
           actionPayload: { type: actionType },
           isSimulation,
@@ -735,8 +1047,33 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
           errorMessage,
           triggeredAt: new Date()
         })
+        const auditLogId = Array.isArray(insertResult)
+          ? insertResult?.[0]?.insertId ?? null
+          : insertResult?.insertId ?? null
+        logAuditInsertSuccess({
+          ...auditLogContext,
+          auditLogId
+        })
       } catch (logErr) {
-        logger.warn(`    ⚠️  写入 Batch 审计日志失败 ad=${matchedAd?.ad_id || 'unknown'}: ${logErr.message}`)
+        logAuditInsertFailure({
+          context: {
+            runId: runId || null,
+            ruleId: rule?.id || null,
+            accountId: String(accountId),
+            ownerId: ownerId ?? null,
+            objectType: logObjectType,
+            objectId: String(logObjectId || ''),
+            adId: String(matchedAd?.ad_id || ''),
+            actionType: actionType,
+            auditStatus: status
+          },
+          payload: {
+            actionPayload: { type: actionType },
+            metricsSnapshot,
+            explanation: explanationPayload
+          },
+          error: logErr
+        })
       }
     }
 
@@ -792,14 +1129,44 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
           const errorMessage = ok ? null : (res?.body?.error?.message || `Batch code=${res?.code || 0}`)
           if (ok) {
             logger.info(`    ✅ Batch 成功${actionType === 'pause_ad' ? '暂停' : '激活'}广告 ${plan.adId}`)
+            logFbActionSuccess({
+              runId: runId || null,
+              ruleId: rule?.id || null,
+              accountId: String(accountId),
+              objectType: 'ad',
+              objectId: String(plan.adId),
+              adId: String(plan.adId),
+              actionType,
+              httpStatus: Number(res?.code || 0) || 200
+            })
           } else {
             logger.warn(`    ❌ Batch 失败 ad=${plan.adId}: ${errorMessage}`)
+            logFbActionFailure({
+              context: {
+                runId: runId || null,
+                ruleId: rule?.id || null,
+                accountId: String(accountId),
+                objectType: 'ad',
+                objectId: String(plan.adId),
+                adId: String(plan.adId),
+                actionType,
+                requestPreview: JSON.stringify(requests[i]),
+                responsePreview: JSON.stringify(res?.body || null)
+              },
+              error: {
+                message: errorMessage,
+                response: {
+                  status: Number(res?.code || 0) || null,
+                  data: res?.body || null
+                }
+              }
+            })
           }
           if (ok) stats.successCount++
           else stats.failCount++
           stats.results.push({
             adId: plan.adId,
-            results: [{ actionType, status, errorMessage, durationMs: 0, cooldownKey: `ad:${plan.adId}` }]
+            results: [{ actionType, status, errorMessage, durationMs: 0, cooldownKey: `status_ad:${plan.adId}` }]
           })
           await insertBatchAuditLog({
             matchedAd: plan.matchedAd,
@@ -812,11 +1179,24 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
         logger.info(`  [执行] Batch 状态动作完成: success=${stats.successCount}, fail=${stats.failCount}, skipped=${stats.skippedCount}`)
       } catch (err) {
         logger.error(`    ❌ 单规则 Batch 状态动作执行失败:`, err.message)
+        logFbActionFailure({
+          context: {
+            runId: runId || null,
+            ruleId: rule?.id || null,
+            accountId: String(accountId),
+            objectType: 'ad',
+            objectId: null,
+            adId: null,
+            actionType,
+            requestPreview: 'batchRequests'
+          },
+          error: err
+        })
         for (const plan of batchPlans) {
           stats.failCount++
           stats.results.push({
             adId: plan.adId,
-            results: [{ actionType, status: 'fail', errorMessage: err.message, durationMs: 0, cooldownKey: `ad:${plan.adId}` }]
+            results: [{ actionType, status: 'fail', errorMessage: err.message, durationMs: 0, cooldownKey: `status_ad:${plan.adId}` }]
           })
           await insertBatchAuditLog({
             matchedAd: plan.matchedAd,

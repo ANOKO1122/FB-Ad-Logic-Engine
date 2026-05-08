@@ -3,7 +3,9 @@
  * 校验 when_lines、when_time_window、when_custom_range、actions
  */
 
-const VALID_TIME_WINDOWS = ['today', 'yesterday', 'last_3_days', 'lifetime', 'custom_range']
+const VALID_TIME_WINDOWS = ['today', 'yesterday', 'last_3_days', 'last_7_days', 'last_30_days', 'lifetime', 'custom_range']
+// M1 合同：持久化动作枚举不变（旧枚举继续入库，执行层按 targetLevel 解释）
+// pause_ad/activate_ad 在数据库中保持不变，执行时根据 targetLevel 决定实际目标层级
 const VALID_ACTION_TYPES = ['pause_ad', 'activate_ad', 'increase_budget', 'decrease_budget', 'set_budget']
 /** value_unit：percent=百分比增减，usd=固定美元增减 */
 const VALID_VALUE_UNITS = ['percent', 'usd']
@@ -45,7 +47,7 @@ export function validateTemplateBody(body, isUpdate = false) {
   const tw = validateWhenTimeWindow(body.when_time_window, body.when_custom_range)
   if (!tw.valid) return tw
 
-  const act = validateActions(body.actions)
+  const act = validateActions(body.actions, body.target_level || body.targetLevel || 'ad')
   if (!act.valid) return act
 
   if (body.sort_order != null && (typeof body.sort_order !== 'number' || !Number.isFinite(body.sort_order))) {
@@ -121,15 +123,16 @@ function validateWhenTimeWindow(whenTimeWindow, whenCustomRange) {
  * @param {Array} actions
  * @returns {{ valid: boolean, error?: string, field?: string }}
  */
-export function validateActions(actions) {
-  return _validateActions(actions)
+export function validateActions(actions, targetLevel = 'ad') {
+  return _validateActions(actions, targetLevel)
 }
 
-function _validateActions(actions) {
+function _validateActions(actions, targetLevel = 'ad') {
   if (!Array.isArray(actions) || actions.length === 0) {
     return { valid: false, error: 'actions 须为非空数组', field: 'actions' }
   }
   const budgetTypes = ['increase_budget', 'decrease_budget', 'set_budget']
+  const safeTargetLevel = String(targetLevel || 'ad').toLowerCase()
   for (let i = 0; i < actions.length; i++) {
     const a = actions[i]
     const hasMaxDailyBudget = a?.max_daily_budget != null
@@ -139,6 +142,9 @@ function _validateActions(actions) {
     }
     if (!VALID_ACTION_TYPES.includes(a.type)) {
       return { valid: false, error: `actions[${i}] type 不支持: ${a.type}`, field: 'actions' }
+    }
+    if (budgetTypes.includes(a.type) && safeTargetLevel !== 'ad') {
+      return { valid: false, error: `actions[${i}] 预算动作仅支持 targetLevel=ad`, field: 'actions' }
     }
     if (hasMaxDailyBudget && hasMinDailyBudget) {
       return { valid: false, error: `actions[${i}] 不允许同时配置 max_daily_budget 与 min_daily_budget`, field: 'actions' }

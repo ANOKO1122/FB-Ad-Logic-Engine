@@ -2,11 +2,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 const mockQueryRuleData = vi.fn()
+const mockQueryRuleDataByLevel = vi.fn()
 const mockGetAccountTimezone = vi.fn()
 const mockPoolExecute = vi.fn()
 
 vi.mock('../services/ruleDataService.js', () => ({
   queryRuleData: (...args) => mockQueryRuleData(...args),
+  queryRuleDataByLevel: (...args) => mockQueryRuleDataByLevel(...args),
   getAccountTimezone: (...args) => mockGetAccountTimezone(...args)
 }))
 
@@ -22,9 +24,11 @@ describe('RuleEngineDispatcher', () => {
   const accountId = 'act_test'
 
   beforeEach(() => {
+    process.env.RULE_LEVEL_EXECUTION_V2 = '1'
     ruleEngine = new RuleEngine(null)
     mockGetAccountTimezone.mockResolvedValue('UTC')
     mockQueryRuleData.mockReset()
+    mockQueryRuleDataByLevel.mockReset()
     mockPoolExecute.mockReset()
   })
 
@@ -131,13 +135,110 @@ describe('RuleEngineDispatcher', () => {
       conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }],
       logicOperator: 'AND'
     }
-    const cacheKey = 'today'
+    const cacheKey = 'ad:today'
     const loadResult = {
       cacheKeysByRule: new Map([[rule.id, cacheKey]]),
       cache: new Map([[cacheKey, [{ ad_id: 'should_not_see', spend: 100, link_clicks: 0 }]]]),
+      targetObjectIdsByRuleId: new Map([[rule.id, []]]),
       targetAdIdsByRuleId: new Map([[rule.id, []]])
     }
     const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
     expect(matched.length).toBe(0)
+  })
+
+  it('动态快照查询异常时应 fail-closed 且不抛 ReferenceError', async () => {
+    mockPoolExecute.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM rule_matched_objects')) {
+        throw new Error('snapshot query failed')
+      }
+      if (String(sql).includes('FROM ad_snapshots s')) {
+        return [[{ ad_id: 'ad_should_not_be_used' }]]
+      }
+      throw new Error(`unexpected SQL: ${sql}`)
+    })
+    mockQueryRuleDataByLevel.mockResolvedValue({ data: [] })
+
+    const rule = {
+      id: 9010,
+      ruleName: 'DynFailClosed',
+      enabled: true,
+      useDynamicScope: true,
+      targetLevel: 'campaign',
+      targetIds: ['cmp_1'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    await expect(loadDataForAccount(accountId, [rule], ruleEngine)).resolves.toBeTruthy()
+    expect(mockQueryRuleDataByLevel).toHaveBeenCalledTimes(0)
+  })
+
+  it('campaign 规则应调用 queryRuleDataByLevel 且按 level 缓存', async () => {
+    process.env.RULE_LEVEL_EXECUTION_V2 = '1'
+    mockPoolExecute.mockResolvedValue([[{ ad_id: 'ad_1' }]])
+    mockQueryRuleDataByLevel.mockResolvedValue({
+      data: [
+        {
+          campaign_id: 'cmp_1',
+          spend: 12,
+          purchases: 2,
+          link_clicks: 10
+        }
+      ]
+    })
+
+    const rule = {
+      id: 5,
+      ruleName: 'R5',
+      enabled: true,
+      targetLevel: 'campaign',
+      targetIds: ['cmp_1'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 10, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(mockQueryRuleData).toHaveBeenCalledTimes(0)
+    expect(mockQueryRuleDataByLevel).toHaveBeenCalledTimes(1)
+    expect(loadResult.cacheKeysByRule.get(rule.id)).toBe('campaign:today')
+    expect(matched.length).toBe(1)
+  })
+
+  it('RULE_LEVEL_EXECUTION_V2=0 时 campaign 规则应回退 ad 级查询', async () => {
+    process.env.RULE_LEVEL_EXECUTION_V2 = '0'
+    mockPoolExecute.mockResolvedValue([[{ ad_id: 'ad_1' }]])
+    mockQueryRuleData.mockResolvedValue({
+      data: [
+        {
+          ad_id: 'ad_1',
+          ad_name: 'A',
+          ad_set_id: 'as_1',
+          campaign_id: 'cmp_1',
+          spend: 12,
+          purchases: 2,
+          link_clicks: 10
+        }
+      ]
+    })
+
+    const rule = {
+      id: 6,
+      ruleName: 'R6',
+      enabled: true,
+      targetLevel: 'campaign',
+      targetIds: ['cmp_1'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 10, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(mockQueryRuleDataByLevel).toHaveBeenCalledTimes(0)
+    expect(mockQueryRuleData).toHaveBeenCalledTimes(1)
+    expect(loadResult.cacheKeysByRule.get(rule.id)).toBe('ad:today')
+    expect(matched.length).toBe(1)
   })
 })

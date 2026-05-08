@@ -6,6 +6,18 @@ import { describe, it, expect } from 'vitest'
 import { validateActions } from '../utils/templateValidator.js'
 
 describe('validateActions', () => {
+  it('campaign 级规则配置预算动作应失败', () => {
+    const result = validateActions([{ type: 'increase_budget', value: 10 }], 'campaign')
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/预算动作仅支持 targetLevel=ad/)
+  })
+
+  it('adset 级规则配置 set_budget 应失败', () => {
+    const result = validateActions([{ type: 'set_budget', value: 30, value_unit: 'usd' }], 'adset')
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/预算动作仅支持 targetLevel=ad/)
+  })
+
   it('set_budget value_unit=abc 应失败', () => {
     const result = validateActions([{ type: 'set_budget', value: 30, value_unit: 'abc' }])
     expect(result.valid).toBe(false)
@@ -67,6 +79,11 @@ describe('validateActions', () => {
     }])
     expect(result.valid).toBe(false)
     expect(result.error).toMatch(/不允许同时配置/)
+  })
+
+  // ===== M1 合同层测试 =====
+  it('M1: activate_ad 作为旧枚举仍应通过校验', () => {
+    expect(validateActions([{ type: 'activate_ad' }]).valid).toBe(true)
   })
 
   it('min_daily_budget 非整数或小于 100 应失败', () => {

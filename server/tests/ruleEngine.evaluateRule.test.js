@@ -64,4 +64,27 @@ describe('evaluateRule 真实链路（logicOperator 驼峰）', () => {
     expect(matched.length).toBe(1)
     expect(matched[0].ad_id).toBe('ad_1')
   })
+
+  it('evaluateRuleWithData 在 campaign 规则下应产出对象合同字段', () => {
+    const rule = {
+      enabled: true,
+      targetLevel: 'campaign',
+      conditions: [{ metric: 'spend', operator: 'gt', value: 5 }],
+      logicOperator: 'AND'
+    }
+    const matched = ruleEngine.evaluateRuleWithData(rule, [
+      {
+        object_type: 'campaign',
+        object_id: 'cmp_1',
+        object_name: 'Campaign-1',
+        campaign_id: 'cmp_1',
+        spend: 10
+      }
+    ])
+
+    expect(matched.length).toBe(1)
+    expect(matched[0].objectType).toBe('campaign')
+    expect(matched[0].objectId).toBe('cmp_1')
+    expect(matched[0].objectName).toBe('Campaign-1')
+  })
 })

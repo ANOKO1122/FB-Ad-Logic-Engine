@@ -94,7 +94,7 @@ export async function isCooldownDue(ruleId, scopeKey, intervalMin) {
 
 /**
  * 批量写入规则×冷却键状态（ON DUPLICATE KEY UPDATE）
- * 迁移 031 后主键为 (rule_id, scope_key)；ad_id 仅回填兼容（ad: 前缀时写入，非 ad 键写空串以满足 NOT NULL）
+ * 迁移 031 后主键为 (rule_id, scope_key)；ad_id 仅回填兼容（ad:/status_ad: 前缀时写入，非 ad 键写空串以满足 NOT NULL）
  * @param {Array<{ ruleId: number, scopeKey: string, lastStatus: string }>} entries
  */
 export async function upsertRuleAdExecutionStateBatch(entries) {
@@ -103,8 +103,13 @@ export async function upsertRuleAdExecutionStateBatch(entries) {
   try {
     for (const { ruleId, scopeKey, lastStatus } of entries) {
       const status = validStatus.includes(lastStatus) ? lastStatus : null
-      // 表 ad_id 为 NOT NULL：仅 ad: 前缀回填 ad_id，其余写空串
-      const adIdVal = scopeKey.startsWith('ad:') ? scopeKey.slice(3) : ''
+      // 表 ad_id 为 NOT NULL：仅 ad/status_ad 前缀回填 ad_id，其余写空串
+      let adIdVal = ''
+      if (scopeKey.startsWith('status_ad:')) {
+        adIdVal = scopeKey.slice('status_ad:'.length)
+      } else if (scopeKey.startsWith('ad:')) {
+        adIdVal = scopeKey.slice(3)
+      }
       await pool.execute(
         `INSERT INTO rule_ad_execution_state (rule_id, scope_key, last_executed_at, last_status, ad_id)
          VALUES (?, ?, UTC_TIMESTAMP(), ?, ?)

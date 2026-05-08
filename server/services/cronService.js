@@ -61,6 +61,7 @@ async function writeBatchStatusAuditLog({
   actionType,
   actionPayload = null,
   status,
+  preflightMode = null,
   errorMessage = null,
   apiRequest = null,
   apiResponse = null
@@ -82,16 +83,52 @@ async function writeBatchStatusAuditLog({
     ad_name: matchedAd?.ad_name,
     status: matchedAd?.status ?? null
   }
+  const explanationPayload = buildAutomationLogExplanation({
+    rule,
+    matchedObject: matchedAd,
+    accountId
+  })
+  // M5 通用对象字段
+  const logObjectType = matchedAd?.objectType || rule?.targetLevel || rule?.target_level || 'ad'
+  const logObjectId = matchedAd?.objectId || (logObjectType === 'campaign'
+    ? (matchedAd?.campaign_id || matchedAd?.ad_id || '')
+    : logObjectType === 'adset'
+      ? (matchedAd?.ad_set_id || matchedAd?.adset_id || matchedAd?.ad_id || '')
+      : (matchedAd?.ad_id || ''))
+  const logObjectName = matchedAd?.objectName || (logObjectType === 'campaign'
+    ? (matchedAd?.campaign_name || null)
+    : logObjectType === 'adset'
+      ? (matchedAd?.adset_name || null)
+      : (matchedAd?.ad_name || null))
+
+  const auditLogContext = {
+    runId: runId || null,
+    ruleId: rule?.id || null,
+    accountId: String(accountId),
+    ownerId: ownerId ?? null,
+    objectType: logObjectType,
+    objectId: String(logObjectId || ''),
+    adId: String(matchedAd?.ad_id || ''),
+    actionType: String(actionType || ''),
+    auditStatus: status
+  }
+
   try {
-    await db.insert(automationLogs).values({
+    const insertResult = await db.insert(automationLogs).values({
       runId: runId || null,
       accountId: String(accountId),
-      adId: String(matchedAd?.ad_id || ''),
-      adName: matchedAd?.ad_name || null,
+      adId: String(matchedAd?.ad_id || ''),           // 旧字段兼容
+      adName: matchedAd?.ad_name || null,              // 旧字段兼容
+      // M5 通用对象字段（双写）
+      objectType: logObjectType,
+      objectId: String(logObjectId),
+      objectName: logObjectName,
+      preflightMode: preflightMode,
       ruleId: rule?.id || null,
       ruleName: rule?.ruleName || rule?.rule_name || null,
       ownerId: ownerId ?? 0,
       metricsSnapshot,
+      explanation: explanationPayload,
       actionType: String(actionType || '').toUpperCase(),
       actionPayload: actionPayload || { type: actionType },
       isSimulation,
@@ -101,12 +138,27 @@ async function writeBatchStatusAuditLog({
       errorMessage,
       triggeredAt: new Date()
     })
+    const auditLogId = Array.isArray(insertResult)
+      ? insertResult?.[0]?.insertId ?? null
+      : insertResult?.insertId ?? null
+    logAuditInsertSuccess({
+      ...auditLogContext,
+      auditLogId
+    })
   } catch (e) {
-    logger.warn(`   ⚠️  写入 Batch 审计日志失败 ad=${matchedAd?.ad_id || 'unknown'}: ${e.message}`)
+    logAuditInsertFailure({
+      context: auditLogContext,
+      payload: {
+        actionPayload: actionPayload || { type: actionType },
+        metricsSnapshot,
+        explanation: explanationPayload
+      },
+      error: e
+    })
   }
 }
 import { syncAccountsFromFacebook } from './accountSyncService.js'
-import { runHourlyStructureFullRotation, fastSyncStructureForAccount, collectFastSyncDataForAccount, applyMergedFastSyncPayload } from './structureSyncService.js'
+import { runHourlyStructureFullRotation, fastSyncStructureForAccount, collectFastSyncDataForAccount, applyMergedFastSyncPayload, healStructureIntegrity } from './structureSyncService.js'
 import { refreshDynamicTargetsForAccount, isDynamicScopeFeatureEnabled } from './dynamicScopeService.js'
 import { 
   insertRuleExecutionSummary, 
@@ -115,6 +167,13 @@ import {
 } from './ruleExecutionSummaryService.js'
 import { DateTime } from 'luxon'
 import pLimit from 'p-limit'
+import { buildAutomationLogExplanation } from '../utils/automationLogExplanation.js'
+import {
+  logAuditInsertFailure,
+  logAuditInsertSuccess,
+  logFbActionFailure,
+  logFbActionSuccess
+} from '../utils/auditLogTelemetry.js'
 
 // ============================================
 // 执行频率与执行时间（文档：执行频率与执行时间 — 适配方案）
@@ -408,29 +467,44 @@ async function collectAllMatchesForAccount(ruleEngine, allRulesForAccount, locke
  * @param {Array<{ rule: Object, matchedAds: Array }>} matchesPerRule
  * @returns {Map<string, { winnerRule, winnerAction, matchedAd, suppressedRules: Array }>}
  */
-function arbitrateByAdId(matchesPerRule) {
-  // 压成「每 (rule, ad) 一个候选动作」
-  const byAdId = new Map() // ad_id -> Array<{ rule, matchedAd, candidateAction }>
+function getExecutionScopeKey(rule, matchedObject) {
+  const level = (rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+  if (level === 'adset') {
+    const adsetId = String(matchedObject?.ad_set_id || matchedObject?.adset_id || '').trim()
+    return adsetId ? `status_adset:${adsetId}` : null
+  }
+  if (level === 'campaign') {
+    const campaignId = String(matchedObject?.campaign_id || '').trim()
+    return campaignId ? `status_campaign:${campaignId}` : null
+  }
+  const adId = String(matchedObject?.ad_id || '').trim()
+  return adId ? `status_ad:${adId}` : null
+}
+
+function arbitrateByScopeKey(matchesPerRule) {
+  // 压成「每 (rule, scopeKey) 一个候选动作」
+  const byScopeKey = new Map() // scopeKey -> Array<{ rule, matchedAd, candidateAction }>
   for (const { rule, matchedAds } of matchesPerRule) {
     const candidateAction = pickSingleCandidateAction(rule.actions)
     if (!candidateAction) continue
     const priority = getActionPriority(candidateAction.type)
     for (const matchedAd of matchedAds) {
-      const adId = String(matchedAd.ad_id)
-      if (!byAdId.has(adId)) byAdId.set(adId, [])
-      byAdId.get(adId).push({ rule, matchedAd, candidateAction, priority })
+      const scopeKey = getExecutionScopeKey(rule, matchedAd)
+      if (!scopeKey) continue
+      if (!byScopeKey.has(scopeKey)) byScopeKey.set(scopeKey, [])
+      byScopeKey.get(scopeKey).push({ rule, matchedAd, candidateAction, priority })
     }
   }
-  // 每个 ad 选赢家：优先级数字小优先，同优先级 ruleId 小者赢
+  // 每个 scopeKey 选赢家：优先级数字小优先，同优先级 ruleId 小者赢
   const result = new Map()
-  for (const [adId, candidates] of byAdId) {
+  for (const [scopeKey, candidates] of byScopeKey) {
     candidates.sort((a, b) => {
       if (a.priority !== b.priority) return a.priority - b.priority
       return (a.rule.id || 0) - (b.rule.id || 0)
     })
     const winner = candidates[0]
     const suppressedRules = candidates.slice(1).map(c => c.rule)
-    result.set(adId, {
+    result.set(scopeKey, {
       winnerRule: winner.rule,
       winnerAction: winner.candidateAction,
       matchedAd: winner.matchedAd,
@@ -446,24 +520,24 @@ function arbitrateByAdId(matchesPerRule) {
  * @param {string} runId
  * @param {Array<{ rule: Object, matchedAds: Array }>} matchesPerRule
  * @param {Map<string, { winnerRule, winnerAction, matchedAd, suppressedRules }>} arbitrated
- * @param {Object} executionResultsByAd - ad_id -> { success, fail }
+ * @param {Object} executionResultsByScope - scope_key -> { success, fail }
  * @param {string} accountId
- * @param {Map<number, Array>} ruleToMuted - ruleId -> [{ ad_id, mute_until, mute_reason }]（Smart Mute 已移除，通常为空）
- * @param {Map<number, Array>} ruleToOutsideWindow - ruleId -> [{ ad_id, windows }] 不在执行时间段内的广告
+ * @param {Map<number, Array>} ruleToMuted - ruleId -> [{ scope_key, mute_until, mute_reason }]（Smart Mute 已移除，通常为空）
+ * @param {Map<number, Array>} ruleToOutsideWindow - ruleId -> [{ scope_key, windows }] 不在执行时间段内的对象
  */
-async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated, executionResultsByAd, accountId, ruleToMuted = new Map(), ruleToOutsideWindow = new Map()) {
+async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated, executionResultsByScope, accountId, ruleToMuted = new Map(), ruleToOutsideWindow = new Map()) {
   const ruleToExecuted = new Map()   // ruleId -> { executed, failed }
   const ruleToSuppressed = new Map() // ruleId -> Array<{ ad_id, winner_rule_id }>
-  for (const [adId, meta] of arbitrated) {
+  for (const [scopeKey, meta] of arbitrated) {
     const rid = meta.winnerRule.id
     if (!ruleToExecuted.has(rid)) ruleToExecuted.set(rid, { executed: 0, failed: 0 })
-    const res = executionResultsByAd[adId] || {}
+    const res = executionResultsByScope[scopeKey] || {}
     ruleToExecuted.get(rid).executed += res.success || 0
     ruleToExecuted.get(rid).failed += res.fail || 0
     for (const r of meta.suppressedRules) {
       const ruleId = r.id
       if (!ruleToSuppressed.has(ruleId)) ruleToSuppressed.set(ruleId, [])
-      ruleToSuppressed.get(ruleId).push({ ad_id: adId, winner_rule_id: meta.winnerRule.id })
+      ruleToSuppressed.get(ruleId).push({ scope_key: scopeKey, winner_rule_id: meta.winnerRule.id })
     }
   }
   for (const { rule, matchedAds } of matchesPerRule) {
@@ -475,8 +549,8 @@ async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated,
     const status = (exec.executed + exec.failed) > 0 ? 'matched' : (outsideList.length > 0 ? 'skipped' : (supp.length > 0 ? 'skipped' : (muted.length > 0 ? 'skipped' : 'no_match')))
     const skipReason = muted.length > 0 ? 'muted' : (outsideList.length > 0 ? 'outside_execution_window' : (supp.length > 0 ? 'suppressed_by_priority' : (totalMatched === 0 ? 'no_match' : null)))
     const skipDetails = muted.length > 0
-      ? { mute_until: muted[0]?.mute_until, mute_reason: muted[0]?.mute_reason, ad_ids: muted.map(m => m.ad_id) }
-      : (outsideList.length > 0 ? { windows: outsideList[0]?.windows, ad_ids: outsideList.map(o => o.ad_id) } : (supp.length > 0 ? { suppressed_for_ads: supp } : null))
+      ? { mute_until: muted[0]?.mute_until, mute_reason: muted[0]?.mute_reason, scope_keys: muted.map(m => m.scope_key) }
+      : (outsideList.length > 0 ? { windows: outsideList[0]?.windows, scope_keys: outsideList.map(o => o.scope_key) } : (supp.length > 0 ? { suppressed_for_scopes: supp } : null))
     await insertRuleExecutionSummary({
       runId,
       ruleId: rule.id,
@@ -489,6 +563,7 @@ async function writeSummariesAfterArbitration(runId, matchesPerRule, arbitrated,
       failedCount: exec.failed,
       skippedCount: 0,
       status,
+      summaryScope: 'account',
       skipReason,
       skipDetails,
       errorMessage: null,
@@ -650,6 +725,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
             userId: parseInt(userId),
             ownerId: 0,
             status: 'skipped',
+            summaryScope: 'account',
             skipReason: 'user_not_found',
             skipDetails: { user_id: parseInt(userId) },
             evaluatedAt: new Date()
@@ -678,6 +754,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
             userId: parseInt(userId),
             ownerId: user.owner_id || 0,
             status: 'skipped',
+            summaryScope: 'account',
             skipReason: 'no_permission',
             skipDetails: { user_id: parseInt(userId), account_id: lockedAccountId },
             evaluatedAt: new Date()
@@ -700,16 +777,17 @@ export async function executeRulesForAccount(accountId, options = {}) {
     // 全量评估 → 按 ad_id 仲裁 → 执行（每 ad 只执行一次赢家动作）
     let matchesPerRule = await collectAllMatchesForAccount(ruleEngine, allRulesForAccount, lockedAccountId)
 
-    // 调度路径：广告级冷却过滤 + 冷却表读写
+    // 调度路径：广告级冷却过滤 + 冷却表读写（M5：status 冷却键按层级区分）
     if (fromScheduler) {
       const nowUtc = Date.now()
-      const pairs = [] // { ruleId, scopeKey, intervalMin, rule, matchedAd }[]（调度层非预算统一用 ad: 冷却键）
+      const pairs = [] // { ruleId, scopeKey, intervalMin, rule, matchedAd }[]
       for (const { rule, matchedAds } of matchesPerRule) {
         const intervalMin = rule.executionIntervalMinutes ?? rule.execution_interval_minutes ?? 15
+        const targetLevel = (rule.targetLevel || rule.target_level || 'ad').toLowerCase()
         for (const ad of matchedAds || []) {
-          const adId = String(ad?.ad_id ?? '').trim()
-          if (!adId) continue
-          pairs.push({ ruleId: rule.id, scopeKey: `ad:${adId}`, intervalMin, rule, matchedAd: ad })
+          const scopeKey = getExecutionScopeKey({ targetLevel }, ad)
+          if (!scopeKey) continue
+          pairs.push({ ruleId: rule.id, scopeKey, intervalMin, rule, matchedAd: ad })
         }
       }
       // 按 ruleId 分组批量查冷却表（scope_key）
@@ -743,7 +821,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
     }
 
-    const arbitrated = arbitrateByAdId(matchesPerRule)
+    const arbitrated = arbitrateByScopeKey(matchesPerRule)
 
     // M4 Pre-Flight 刷新：对 pause/activate 且非 Dry Run 的广告，批量拉取 FB effective_status
     const refreshAdIds = []
@@ -757,13 +835,21 @@ export async function executeRulesForAccount(accountId, options = {}) {
     const validRefreshIds = [...new Set(refreshAdIds.filter(Boolean))]
     if (validRefreshIds.length > 0) {
       const statusMap = await refreshEffectiveStatusForAds(validRefreshIds)
-      for (const [adId, meta] of arbitrated) {
-        const fresh = statusMap.get(String(adId))
+      for (const [, meta] of arbitrated) {
+        const adId = String(meta.matchedAd?.ad_id || '').trim()
+        if (!adId) continue
+        const fresh = statusMap.get(adId)
         if (typeof fresh === 'string' && fresh.trim()) meta.matchedAd.status = fresh
       }
     }
 
-    const executionResultsByAd = {}
+    /**
+     * M4/M5: 根据规则 targetLevel 构建状态动作冷却键
+     * 格式：status_ad:{adId} | status_adset:{adsetId} | status_campaign:{campaignId}
+     */
+    const buildStatusCooldownKey = getExecutionScopeKey
+
+    const executionResultsByScope = {}
     const ruleToMuted = new Map()  // 保留结构，Smart Mute 已移除，不再写入
     const ruleToOutsideWindow = new Map()  // ruleId -> [{ ad_id, windows }]
     const stateUpdates = []  // 调度路径：{ ruleId, scopeKey, lastStatus }[]
@@ -771,27 +857,31 @@ export async function executeRulesForAccount(accountId, options = {}) {
     let budgetApi = null
     const batchStatusPlans = []
     const batchBudgetPlans = [] // 保留声明供 canUseBatchForBudget 块内使用（当前 canUseBatchForBudget=false 不进入）
-    for (const [adId, meta] of arbitrated) {
+    for (const [scopeKey, meta] of arbitrated) {
+      const adId = String(meta.matchedAd?.ad_id || '').trim()
       // 调度路径：执行时间段检查（文档 §4.2）
       if (fromScheduler) {
         const nowBJ = DateTime.utc().setZone(ZONE_BJ)
         const inWindow = isInExecutionWindow(meta.winnerRule, nowBJ)
         const triggeredRulesForAd = [meta.winnerRule, ...(meta.suppressedRules || [])]
         if (!inWindow) {
-          logger.info(`   🕐 [${lockedAccountId}] 广告 ${adId} 不在执行时间段内，跳过执行`)
-          executionResultsByAd[adId] = { success: 0, fail: 0 }
+          logger.info(`   🕐 [${lockedAccountId}] 对象 ${scopeKey} 不在执行时间段内，跳过执行`)
+          executionResultsByScope[scopeKey] = { success: 0, fail: 0 }
           const list = ruleToOutsideWindow.get(meta.winnerRule.id) || []
-          list.push({ ad_id: adId, windows: meta.winnerRule.executionTimeWindows ?? meta.winnerRule.execution_time_windows })
+          list.push({ scope_key: scopeKey, windows: meta.winnerRule.executionTimeWindows ?? meta.winnerRule.execution_time_windows })
           ruleToOutsideWindow.set(meta.winnerRule.id, list)
-          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'outside_window' })
+          const statusKey = buildStatusCooldownKey(meta.winnerRule, meta.matchedAd)
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: statusKey, lastStatus: 'outside_window' })
           for (const r of meta.suppressedRules || []) {
-            stateUpdates.push({ ruleId: r.id, scopeKey: `ad:${adId}`, lastStatus: 'suppressed' })
+            const supKey = buildStatusCooldownKey(r, meta.matchedAd)
+            stateUpdates.push({ ruleId: r.id, scopeKey: supKey, lastStatus: 'suppressed' })
           }
           continue
         }
         // 在执行时间段内：suppressed 先写入；winner 状态在执行完后按结果写入
         for (const r of meta.suppressedRules || []) {
-          stateUpdates.push({ ruleId: r.id, scopeKey: `ad:${adId}`, lastStatus: 'suppressed' })
+          const supKey = buildStatusCooldownKey(r, meta.matchedAd)
+          stateUpdates.push({ ruleId: r.id, scopeKey: supKey, lastStatus: 'suppressed' })
         }
       }
 
@@ -814,7 +904,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
       let fail = 0
       let results = []
       const isStatusAction = actionToPass && ['pause_ad', 'activate_ad'].includes(actionToPass.type)
-      const canUseBatchForStatus = enableActionBatch && fromScheduler && isStatusAction && !isSim
+      // M4: 仅 ad 级状态动作可使用 Batch；adset/campaign 走逐条执行
+      const winnerTargetLevel = (meta.winnerRule?.targetLevel || meta.winnerRule?.target_level || 'ad').toLowerCase()
+      const isAdLevelStatusAction = isStatusAction && winnerTargetLevel === 'ad'
+      const canUseBatchForStatus = enableActionBatch && fromScheduler && isAdLevelStatusAction && !isSim
       if (canUseBatchForStatus) {
         const adStatus = String(meta.matchedAd?.status || '').toUpperCase()
         const skipPause = actionToPass.type === 'pause_ad' && ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)
@@ -825,10 +918,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
           const reason = skipPause
             ? 'already_paused'
             : (skipActivateDone ? 'already_active' : 'cannot_activate')
-          executionResultsByAd[adId] = { success: 0, fail: 0 }
+          executionResultsByScope[scopeKey] = { success: 0, fail: 0 }
           accountMatched++
           accountExecuted++
-          const cooldownKey = `ad:${adId}`
+          const cooldownKey = buildStatusCooldownKey(meta.winnerRule, meta.matchedAd)
           stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
           await writeBatchStatusAuditLog({
             runId: currentRunId,
@@ -845,17 +938,20 @@ export async function executeRulesForAccount(accountId, options = {}) {
           continue
         }
         batchStatusPlans.push({
+          scopeKey,
           adId,
           rule: meta.winnerRule,
           matchedAd: meta.matchedAd,
           ownerId: meta.winnerRule._ownerId ?? 0,
-          actionType: actionToPass.type
+          actionType: actionToPass.type,
+          cooldownKey: buildStatusCooldownKey(meta.winnerRule, meta.matchedAd)
         })
         allPendingActions.push({
           kind: 'status',
           op: actionToPass.type === 'pause_ad' ? 'pause' : 'activate',
+          targetLevel: winnerTargetLevel,
           accountId: lockedAccountId,
-          adId,
+          targetObjectId: adId,
           ruleId: meta.winnerRule.id,
           runId: currentRunId
         })
@@ -868,11 +964,11 @@ export async function executeRulesForAccount(accountId, options = {}) {
           const intervalMin = meta.winnerRule.executionIntervalMinutes ?? meta.winnerRule.execution_interval_minutes ?? 15
           const adsetId = meta.matchedAd?.ad_set_id || meta.matchedAd?.adset_id
           if (!adsetId) {
-            executionResultsByAd[adId] = { success: 0, fail: 1 }
+            executionResultsByScope[scopeKey] = { success: 0, fail: 1 }
             accountMatched++
             accountExecuted++
             accountErrors++
-            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: buildStatusCooldownKey(meta.winnerRule, meta.matchedAd), lastStatus: 'fail' })
             await writeBatchStatusAuditLog({
               runId: currentRunId,
               accountId: lockedAccountId,
@@ -901,11 +997,11 @@ export async function executeRulesForAccount(accountId, options = {}) {
           } else {
             const campaignId = meta.matchedAd?.campaign_id || null
             if (!campaignId) {
-              executionResultsByAd[adId] = { success: 0, fail: 1 }
+              executionResultsByScope[scopeKey] = { success: 0, fail: 1 }
               accountMatched++
               accountExecuted++
               accountErrors++
-              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: buildStatusCooldownKey(meta.winnerRule, meta.matchedAd), lastStatus: 'fail' })
               await writeBatchStatusAuditLog({
                 runId: currentRunId,
                 accountId: lockedAccountId,
@@ -932,11 +1028,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
           if (intervalMin > 0) {
             const due = await isCooldownDue(meta.winnerRule.id, cooldownKey, intervalMin)
             if (!due) {
-              executionResultsByAd[adId] = { success: 0, fail: 0 }
+              executionResultsByScope[scopeKey] = { success: 0, fail: 0 }
               accountMatched++
               accountExecuted++
               stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
-              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'success' })
               await writeBatchStatusAuditLog({
                 runId: currentRunId,
                 accountId: lockedAccountId,
@@ -960,11 +1055,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
                 ? actionToPass._resolvedBudgetCents
                 : computeNewBudgetCentsOnce(currentCents, actionToPass))
           if (currentCents === newBudgetCents) {
-            executionResultsByAd[adId] = { success: 0, fail: 0 }
+            executionResultsByScope[scopeKey] = { success: 0, fail: 0 }
             accountMatched++
             accountExecuted++
             stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
-            stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'success' })
             await writeBatchStatusAuditLog({
               runId: currentRunId,
               accountId: lockedAccountId,
@@ -1009,11 +1103,11 @@ export async function executeRulesForAccount(accountId, options = {}) {
           })
           continue
         } catch (err) {
-          executionResultsByAd[adId] = { success: 0, fail: 1 }
+          executionResultsByScope[scopeKey] = { success: 0, fail: 1 }
           accountMatched++
           accountExecuted++
           accountErrors++
-          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: `ad:${adId}`, lastStatus: 'fail' })
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: buildStatusCooldownKey(meta.winnerRule, meta.matchedAd), lastStatus: 'fail' })
           await writeBatchStatusAuditLog({
             runId: currentRunId,
             accountId: lockedAccountId,
@@ -1055,18 +1149,12 @@ export async function executeRulesForAccount(accountId, options = {}) {
         accountErrors++
         logger.error(`   ❌ [${lockedAccountId}] ad ${adId} 执行失败:`, err.message)
       }
-      executionResultsByAd[adId] = { success, fail }
+      executionResultsByScope[scopeKey] = { success, fail }
       if (fromScheduler) {
-        // 使用执行层返回的 cooldownKey（预算为 budget_adset:/budget_campaign:，否则 ad:）；所有 skipped（含 Pre-Flight、预算幂等、FB already in state）均按 success 占冷却
+        // 使用执行层返回的 cooldownKey（预算为 budget_adset:/budget_campaign:，状态为 status_ad:/status_adset:/status_campaign:）；所有 skipped（含 Pre-Flight、预算幂等、FB already in state）均按 success 占冷却
         const statusForCooldown = fail > 0 ? 'fail' : 'success'
-        const cooldownKey = (Array.isArray(results) && results[0]?.cooldownKey) ? results[0].cooldownKey : `ad:${adId}`
-        // 精细冷却：按预算目标节点或广告本身
+        const cooldownKey = (Array.isArray(results) && results[0]?.cooldownKey) ? results[0].cooldownKey : buildStatusCooldownKey(meta.winnerRule, meta.matchedAd)
         stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: statusForCooldown })
-        // 粗粒度冷却：始终为当前广告写一条 ad: 冷却，供下轮 Cron 过滤使用
-        const adScopeKey = `ad:${adId}`
-        if (adScopeKey !== cooldownKey) {
-          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: adScopeKey, lastStatus: statusForCooldown })
-        }
       }
     }
 
@@ -1083,12 +1171,44 @@ export async function executeRulesForAccount(accountId, options = {}) {
           const plan = batchStatusPlans[i]
           const res = batchResults[i]
           const ok = Number(res?.code || 0) >= 200 && Number(res?.code || 0) < 300 && !res?.body?.error
-          executionResultsByAd[plan.adId] = { success: ok ? 1 : 0, fail: ok ? 0 : 1 }
+          if (ok) {
+            logFbActionSuccess({
+              runId: currentRunId,
+              ruleId: plan.rule.id,
+              accountId: lockedAccountId,
+              objectType: 'ad',
+              objectId: String(plan.adId),
+              adId: String(plan.adId),
+              actionType: plan.actionType,
+              httpStatus: Number(res?.code || 0) || 200
+            })
+          } else {
+            logFbActionFailure({
+              context: {
+                runId: currentRunId,
+                ruleId: plan.rule.id,
+                accountId: lockedAccountId,
+                objectType: 'ad',
+                objectId: String(plan.adId),
+                adId: String(plan.adId),
+                actionType: plan.actionType,
+                requestPreview: JSON.stringify(requests[i]),
+                responsePreview: JSON.stringify(res?.body || null)
+              },
+              error: {
+                message: res?.body?.error?.message || `Batch code=${res?.code || 0}`,
+                response: {
+                  status: Number(res?.code || 0) || null,
+                  data: res?.body || null
+                }
+              }
+            })
+          }
+          executionResultsByScope[plan.scopeKey] = { success: ok ? 1 : 0, fail: ok ? 0 : 1 }
           accountMatched++
           accountExecuted++
           if (!ok) accountErrors++
-          const cooldownKey = `ad:${plan.adId}`
-          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: cooldownKey, lastStatus: ok ? 'success' : 'fail' })
+          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: plan.cooldownKey, lastStatus: ok ? 'success' : 'fail' })
           await writeBatchStatusAuditLog({
             runId: currentRunId,
             accountId: lockedAccountId,
@@ -1104,13 +1224,25 @@ export async function executeRulesForAccount(accountId, options = {}) {
         }
       } catch (err) {
         logger.error(`   ❌ [${lockedAccountId}] Batch 状态动作执行失败:`, err.message)
+        logFbActionFailure({
+          context: {
+            runId: currentRunId,
+            ruleId: null,
+            accountId: lockedAccountId,
+            objectType: 'ad',
+            objectId: null,
+            adId: null,
+            actionType: 'batch_status_action',
+            requestPreview: 'batchRequests'
+          },
+          error: err
+        })
         for (const plan of batchStatusPlans) {
-          executionResultsByAd[plan.adId] = { success: 0, fail: 1 }
+          executionResultsByScope[plan.scopeKey] = { success: 0, fail: 1 }
           accountMatched++
           accountExecuted++
           accountErrors++
-          const cooldownKey = `ad:${plan.adId}`
-          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: cooldownKey, lastStatus: 'fail' })
+          stateUpdates.push({ ruleId: plan.rule.id, scopeKey: plan.cooldownKey, lastStatus: 'fail' })
           await writeBatchStatusAuditLog({
             runId: currentRunId,
             accountId: lockedAccountId,
@@ -1141,7 +1273,7 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
     }
 
-    await writeSummariesAfterArbitration(currentRunId, matchesPerRule, arbitrated, executionResultsByAd, lockedAccountId, ruleToMuted, ruleToOutsideWindow)
+    await writeSummariesAfterArbitration(currentRunId, matchesPerRule, arbitrated, executionResultsByScope, lockedAccountId, ruleToMuted, ruleToOutsideWindow)
 
     // 调度路径：写入规则×广告冷却表；不更新 rules.last_executed_at（冷却由冷却表负责）
     if (fromScheduler && stateUpdates.length > 0) {
@@ -1216,6 +1348,7 @@ export async function executeSingleRule(rule, options = {}) {
           failedCount: 0,
           skippedCount: 1,
           status: 'skipped',
+          summaryScope: 'account',
           skipReason: 'account_inactive',
           skipDetails: { fb_account_id: accountId, note: 'account_mappings.is_active=0' },
           errorMessage: null,
@@ -1238,6 +1371,7 @@ export async function executeSingleRule(rule, options = {}) {
           failedCount: 0,
           skippedCount: 0,
           status: null,
+          summaryScope: 'account',
           skipReason: null,
           skipDetails: null,
           errorMessage: null,
@@ -1267,6 +1401,23 @@ export async function executeSingleRule(rule, options = {}) {
         summary.matchedCount = matchedAds.length
         logger.info(`   📋 规则 "${rule.ruleName}" [${lockedAccountId}] 匹配 ${matchedAds.length} 个广告`)
         if (matchedAds.length > 0) {
+          const nowBJ = DateTime.utc().setZone(ZONE_BJ)
+          const inWindow = isInExecutionWindow(rule, nowBJ)
+          if (!inWindow) {
+            summary.status = 'skipped'
+            summary.skipReason = 'outside_execution_window'
+            summary.skipDetails = {
+              windows: rule.executionTimeWindows ?? rule.execution_time_windows
+            }
+            summary.durationMs = Date.now() - ruleStartTime
+            return {
+              matched_count: summary.matchedCount,
+              executed_count: 0,
+              failed_count: 0,
+              status: summary.status,
+              summary
+            }
+          }
           const candAction = pickSingleCandidateAction(rule.actions)
           const act = candAction?.type
           const isSim = rule.isSimulation ?? rule.is_simulation ?? false
@@ -1347,6 +1498,7 @@ export async function executeSingleRule(rule, options = {}) {
       failedCount: aggregated.failedCount,
       skippedCount: 0,
       status: aggregated.status,
+      summaryScope: 'rollup',
       skipReason: aggregated.skipReason ?? (aggregated.lockSkippedAccounts.length ? 'lock_skipped' : null),
       skipDetails: aggregated.lockSkippedAccounts.length ? { lockSkippedAccounts: aggregated.lockSkippedAccounts } : aggregated.skipDetails,
       errorMessage: aggregated.errorMessage,
@@ -1658,6 +1810,18 @@ export function startCronJob() {
         logger.info(`[结构轮转] 本轮跳过: ${result.reason}`)
       } else if (result.synced > 0) {
         logger.info(`[结构轮转] 本轮完成: ${result.synced} 个账户`)
+        // 结构同步完成后执行完整性自愈，确保 structure_ads → structure_campaigns/adsets 关系链闭合
+        try {
+          const healResult = await healStructureIntegrity()
+          if (healResult.campaignsHealed > 0 || healResult.adsetsHealed > 0) {
+            logger.info(`[结构自愈] 修复: campaigns=${healResult.campaignsHealed}, adsets=${healResult.adsetsHealed}`)
+          }
+          if (healResult.errors.length > 0) {
+            logger.warn(`[结构自愈] 异常: ${healResult.errors.join('; ')}`)
+          }
+        } catch (healErr) {
+          logger.warn('[结构自愈] 自愈过程异常:', healErr.message)
+        }
       }
     } catch (err) {
       logger.warn('[结构轮转] 失败:', err.message)

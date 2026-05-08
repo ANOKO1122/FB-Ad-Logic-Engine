@@ -22,6 +22,18 @@ const TRIGGER_B_DEBOUNCE_MS =
 
 const triggerBTimers = new Map()
 
+/**
+ * M2 typed snapshot: 根据规则 targetLevel 确定快照输出时的 object_type
+ * @param {Object} rule
+ * @returns {string} 'ad' | 'adset' | 'campaign'
+ */
+function getRuleOutputObjectType(rule) {
+  const level = (rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+  if (level === 'adset') return 'adset'
+  if (level === 'campaign') return 'campaign'
+  return 'ad'
+}
+
 function parseJsonSafe(value, fallback = null) {
   if (value == null) return fallback
   if (typeof value === 'string') {
@@ -245,8 +257,26 @@ async function expandExcludeIdsToAdLevel(accountId, excludeIds) {
   return result
 }
 
-async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
+async function mapAdIdsToTargetObjectIds(accountId, targetLevel, adIds) {
+  const safeLevel = (targetLevel || 'ad').toLowerCase()
+  const safeAdIds = [...new Set((adIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  if (safeLevel === 'ad') return safeAdIds
+  if (safeAdIds.length === 0) return []
+  const selectColumn = safeLevel === 'adset' ? 'adset_id' : 'campaign_id'
+  const placeholders = safeAdIds.map(() => '?').join(',')
+  const [rows] = await pool.execute(
+    `SELECT DISTINCT ${selectColumn} AS object_id
+     FROM structure_ads
+     WHERE account_id = ?
+       AND ad_id IN (${placeholders})`,
+    [accountId, ...safeAdIds]
+  )
+  return [...new Set((rows || []).map((row) => String(row.object_id || '').trim()).filter(Boolean))]
+}
+
+async function calculateMatchedObjectIdsForRule(accountId, rule, nowUtc) {
   const now = nowUtc || DateTime.utc()
+  const targetLevel = (rule.targetLevel || rule.target_level || 'ad').toLowerCase()
   const dynamicSet = new Set()
   const manualSet = await expandManualTargetIdsToAdLevel(accountId, rule)
   const excludeSet = await expandExcludeIdsToAdLevel(accountId, rule.excludeIds || rule.exclude_ids)
@@ -261,7 +291,7 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
       return {
         status: 'ERROR_FILTER_INVALID',
         errorMsg: 'scope_filters.conditions 不能为空',
-        finalAdIds: null,
+        finalObjectIds: null,
         dynamicCount: 0,
         manualCount: manualSet.size
       }
@@ -273,7 +303,7 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
       return {
         status: 'ERROR_FILTER_INVALID',
         errorMsg: e.message || 'invalid scopeFilters',
-        finalAdIds: null,
+        finalObjectIds: null,
         dynamicCount: 0,
         manualCount: manualSet.size
       }
@@ -336,15 +366,20 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
   for (const id of union) {
     if (!excludeSet.has(id)) finalAdIds.push(id)
   }
+  const dynamicAdIds = [...dynamicSet].filter((id) => !excludeSet.has(id))
+  const manualAdIds = [...manualSet].filter((id) => !excludeSet.has(id))
+  const finalObjectIds = await mapAdIdsToTargetObjectIds(accountId, targetLevel, finalAdIds)
+  const dynamicObjectIds = await mapAdIdsToTargetObjectIds(accountId, targetLevel, dynamicAdIds)
+  const manualObjectIds = await mapAdIdsToTargetObjectIds(accountId, targetLevel, manualAdIds)
 
   const max = rule.maxDynamicMatches ?? rule.max_dynamic_matches ?? DEFAULT_MAX_MATCHES
   const safeMax = Number.isFinite(Number(max)) ? Math.max(1, Math.min(Number(max), 5000)) : DEFAULT_MAX_MATCHES
 
-  if (finalAdIds.length > safeMax) {
+  if (finalObjectIds.length > safeMax) {
     return {
       status: 'ERROR_OVERSIZE',
-      errorMsg: `matched ${finalAdIds.length} ads, exceed max_dynamic_matches=${safeMax}`,
-      finalAdIds: null,
+      errorMsg: `matched ${finalObjectIds.length} objects, exceed max_dynamic_matches=${safeMax}`,
+      finalObjectIds: null,
       dynamicCount: dynamicSet.size,
       manualCount: manualSet.size
     }
@@ -353,15 +388,15 @@ async function calculateMatchedAdIdsForRule(accountId, rule, nowUtc) {
   return {
     status: 'NORMAL',
     errorMsg: null,
-    finalAdIds,
-    dynamicCount: dynamicSet.size,
-    manualCount: manualSet.size
+    finalObjectIds,
+    dynamicCount: dynamicObjectIds.length,
+    manualCount: manualObjectIds.length
   }
 }
 
 /**
- * 预览动态范围：对给定账户列表 + 监控条件 + 排除名单，按与规则刷新一致逻辑算出全量 ad_id，返回 act_xxx:id 数组。
- * 内部仅调用 calculateMatchedAdIdsForRule，不新增 SQL；与规则执行共用同一时间基准（UTC now）。
+ * 预览动态范围：对给定账户列表 + 监控条件 + 排除名单，按与规则刷新一致逻辑算出全量对象ID，返回 act_xxx:id 数组。
+ * 内部仅调用 calculateMatchedObjectIdsForRule，不新增 SQL；与规则执行共用同一时间基准（UTC now）。
  *
  * @param {string[]|string} accountIds - 广告账户 ID 列表（或逗号分隔字符串）
  * @param {object} options
@@ -422,10 +457,10 @@ export async function previewDynamicScope(accountIds, options) {
 
   for (const accountId of accountList) {
     try {
-      const result = await calculateMatchedAdIdsForRule(accountId, virtualRule, nowUtc)
-      if (result.status === 'NORMAL' && Array.isArray(result.finalAdIds) && result.finalAdIds.length > 0) {
-        for (const adId of result.finalAdIds) {
-          objectIds.push(normalizeCompositeId(accountId, adId))
+      const result = await calculateMatchedObjectIdsForRule(accountId, virtualRule, nowUtc)
+      if (result.status === 'NORMAL' && Array.isArray(result.finalObjectIds) && result.finalObjectIds.length > 0) {
+        for (const objectId of result.finalObjectIds) {
+          objectIds.push(normalizeCompositeId(accountId, objectId))
         }
       } else if (result.status && result.status !== 'NORMAL') {
         perAccount[accountId] = { status: result.status, errorMsg: result.errorMsg ?? undefined }
@@ -465,7 +500,7 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
 
   for (const rule of rules) {
     try {
-      const result = await calculateMatchedAdIdsForRule(accountId, rule, nowUtc)
+      const result = await calculateMatchedObjectIdsForRule(accountId, rule, nowUtc)
       perRule.push({ ruleId: rule.id, ...result })
       if (result.status === 'NORMAL') normalCount++
       if (result.status === 'ERROR_OVERSIZE') oversizeCount++
@@ -475,7 +510,7 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
         ruleId: rule.id,
         status: 'ERROR_REFRESH_FAILED',
         errorMsg: e.message || 'refresh failed',
-        finalAdIds: null
+        finalObjectIds: null
       })
       refreshFailedCount++
     }
@@ -491,13 +526,14 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
     if (normalRuleIds.length > 0) {
       const placeholders = normalRuleIds.map(() => '?').join(',')
       const [oldRows] = await connection.execute(
-        `SELECT rule_id, object_id FROM rule_matched_objects WHERE account_id = ? AND rule_id IN (${placeholders})`,
+        `SELECT rule_id, object_id, object_type FROM rule_matched_objects WHERE account_id = ? AND rule_id IN (${placeholders})`,
         [accountId, ...normalRuleIds]
       )
       for (const row of oldRows || []) {
         const rid = row.rule_id
         if (!oldIdsByRule.has(rid)) oldIdsByRule.set(rid, new Set())
-        oldIdsByRule.get(rid).add(String(row.object_id || '').trim())
+        // M2 composite key: objectType:objectId 避免跨层冲突
+        oldIdsByRule.get(rid).add(`${String(row.object_type || 'ad')}:${String(row.object_id || '').trim()}`)
       }
     }
 
@@ -513,6 +549,12 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
         )
       }
     }
+    // 构建 ruleId -> rule 的快速查找 Map，避免循环内每次 find
+    const ruleById = new Map()
+    for (const rule of rules) {
+      ruleById.set(rule.id, rule)
+    }
+
     let inserted = 0
     for (const r of perRule) {
       if (r.status !== 'NORMAL') continue
@@ -520,15 +562,17 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
         `DELETE FROM rule_matched_objects WHERE account_id = ? AND rule_id = ?`,
         [accountId, r.ruleId]
       )
-      if (!Array.isArray(r.finalAdIds) || r.finalAdIds.length === 0) continue
-      const batch = r.finalAdIds
+      if (!Array.isArray(r.finalObjectIds) || r.finalObjectIds.length === 0) continue
+      const ruleForItem = ruleById.get(r.ruleId)
+      const objectType = ruleForItem ? getRuleOutputObjectType(ruleForItem) : getRuleOutputObjectType(rules[rules.length - 1])
+      const batch = r.finalObjectIds
       for (let i = 0; i < batch.length; i += INSERT_CHUNK_SIZE) {
         const chunk = batch.slice(i, i + INSERT_CHUNK_SIZE)
         if (chunk.length === 0) continue
         const placeholders = chunk.map(() => '(?,?,?,?,NOW())').join(',')
         const params = []
-        for (const adId of chunk) {
-          params.push(r.ruleId, accountId, adId, 'ad')
+        for (const objId of chunk) {
+          params.push(r.ruleId, accountId, objId, objectType)
         }
         await connection.execute(
           `INSERT INTO rule_matched_objects
@@ -547,9 +591,12 @@ async function refreshDynamicTargetsForRulesInAccount(accountId, rules, options 
     const LARGE_LIST_THRESHOLD = 500
     for (const r of perRule) {
       if (r.status !== 'NORMAL') continue
+      const ruleForItem = ruleById.get(r.ruleId)
+      const objectType = ruleForItem ? getRuleOutputObjectType(ruleForItem) : getRuleOutputObjectType(rules[rules.length - 1])
       const oldSet = oldIdsByRule.get(r.ruleId) || new Set()
-      const newIds = Array.isArray(r.finalAdIds) ? r.finalAdIds : []
-      const newSet = new Set(newIds.map((id) => String(id).trim()).filter(Boolean))
+      const newIds = Array.isArray(r.finalObjectIds) ? r.finalObjectIds : []
+      // M2: 使用 composite key objectType:objectId 进行比较，避免跨层冲突
+      const newSet = new Set(newIds.map((id) => `${objectType}:${String(id).trim()}`).filter(Boolean))
       const added = [...newSet].filter((id) => !oldSet.has(id))
       const removed = [...oldSet].filter((id) => !newSet.has(id))
       const addedCount = added.length
@@ -807,11 +854,14 @@ export async function scheduleDynamicScopeRefreshForRule(ruleId, options = {}) {
 
 export const _internals = {
   buildStructureFilter,
+  getRuleOutputObjectType,
   getRuleTargetAccountIds,
   getScopedTargetIdsForAccount,
   expandManualTargetIdsToAdLevel,
   expandExcludeIdsToAdLevel,
-  calculateMatchedAdIdsForRule,
+  calculateMatchedAdIdsForRule: calculateMatchedObjectIdsForRule,
+  calculateMatchedObjectIdsForRule,
+  mapAdIdsToTargetObjectIds,
   normalizeCompositeId
 }
 

@@ -3,18 +3,30 @@
 
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
-import { queryRuleData, getAccountTimezone } from './ruleDataService.js'
+import { queryRuleData, queryRuleDataByLevel, getAccountTimezone } from './ruleDataService.js'
 import { _internals as dynamicScopeInternals } from './dynamicScopeService.js'
+
+function isRuleLevelExecutionV2Enabled() {
+  const raw = String(process.env.RULE_LEVEL_EXECUTION_V2 ?? '0').toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
+
+function normalizeTimeWindowAlias(raw) {
+  if (raw === 'last_3d') return 'last_3_days'
+  if (raw === 'last_7d') return 'last_7_days'
+  if (raw === 'last_30d') return 'last_30_days'
+  return raw
+}
 
 /**
  * 解析单条规则的目标广告 ID 列表（与 index.js RuleEngine.evaluateRule 口径一致）
  * @param {string} accountId
  * @param {Object} rule - 含 targetLevel/target_level, targetIds/target_ids
  * @param {Set<string>} allAdIdsInAccount - 若已预先拉取「账户下全部 ad_id」，传入；否则 null
- * @returns {Promise<{ targetAdIds: string[], queryCount: number }>} 本规则目标 ad_id 列表及本步产生的查询次数（0 或 1）
+ * @returns {Promise<{ targetLevel: string, targetObjectIds: string[], targetAdIds: string[], queryCount: number }>}
  */
 async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = null) {
-  const ruleTargetLevel = rule.targetLevel || rule.target_level
+  const ruleTargetLevel = (rule.targetLevel || rule.target_level || 'ad').toLowerCase()
   const targetByAccount = rule.targetByAccount ?? rule.target_by_account
   const useDynamicScope = Boolean(rule.useDynamicScope ?? rule.use_dynamic_scope)
   let ruleTargetIds = []
@@ -36,25 +48,44 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
   let queryCount = 0
 
   if (useDynamicScope) {
+    const resolvedObjectType = (ruleTargetLevel || 'ad').toLowerCase()
     try {
+      // M2 typed snapshot: 按规则 targetLevel 读取快照，不再写死 object_type='ad'
       const [rows] = await pool.execute(
         `SELECT object_id
          FROM rule_matched_objects
          WHERE account_id = ?
            AND rule_id = ?
-           AND object_type = 'ad'`,
-        [accountId, rule.id]
+           AND object_type = ?`,
+        [accountId, rule.id, resolvedObjectType]
       )
-      targetAdIds = rows.map(row => String(row.object_id || '')).filter(Boolean)
+      const targetObjectIds = rows.map(row => String(row.object_id || '')).filter(Boolean)
       queryCount = 1
-      return { targetAdIds, queryCount }
+      if (resolvedObjectType === 'ad') {
+        return { targetLevel: resolvedObjectType, targetObjectIds, targetAdIds: targetObjectIds, queryCount }
+      }
+      // Phase B: 通过 structure_ads 将 campaign/adset 对象 ID 展开为子广告 ID
+      // V2=1 优先用 queryRuleDataByLevel() 做同层聚合评估，使用 targetObjectIds
+      // V2=0 兼容分支使用展开出的 targetAdIds 执行 ad 级评估，避免静默空集
+      let expandedAdIds = []
+      if (targetObjectIds.length > 0) {
+        const filterColumn = resolvedObjectType === 'adset' ? 'adset_id' : 'campaign_id'
+        const placeholders = targetObjectIds.map(() => '?').join(',')
+        const [adRows] = await pool.execute(
+          `SELECT DISTINCT ad_id FROM structure_ads WHERE account_id = ? AND ${filterColumn} IN (${placeholders})`,
+          [accountId, ...targetObjectIds.map(id => String(id))]
+        )
+        expandedAdIds = adRows.map(row => String(row.ad_id || '')).filter(Boolean)
+        queryCount += 1
+      }
+      return { targetLevel: resolvedObjectType, targetObjectIds, targetAdIds: expandedAdIds, queryCount }
     } catch (err) {
       // 动态快照读失败：不得回退到「全账户广告」，否则会把圈外广告纳入评估（与 use_dynamic_scope 语义冲突）
       logger.warn(
         `   [Dispatcher] 规则 ${rule.id} 读取动态快照失败，本规则本轮跳过评估（fail-closed）:`,
         err.message
       )
-      return { targetAdIds: [], queryCount: 0 }
+      return { targetLevel: resolvedObjectType, targetObjectIds: [], targetAdIds: [], queryCount: 0 }
     }
   }
 
@@ -111,7 +142,8 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
     }
   }
 
-  return { targetAdIds, queryCount }
+  const targetObjectIds = ruleTargetLevel === 'ad' ? targetAdIds : ruleTargetIds
+  return { targetLevel: ruleTargetLevel, targetObjectIds, targetAdIds, queryCount }
 }
 
 /**
@@ -119,11 +151,14 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
  * @param {string} accountId
  * @param {Array<Object>} rules - 该账户下待评估规则（含 conditions, targetLevel, targetIds 等）
  * @param {Object} ruleEngine - RuleEngine 实例，用于 getTimeWindowFromConditions / getCustomRangeFromConditions
- * @returns {Promise<{ timezoneName: string, cache: Map<string, Array>, targetAdIdsByRuleId: Map<number, string[]>, dataQueryCount: number, targetResolutionQueryCount: number }>}
+ * @returns {Promise<{ timezoneName: string, cache: Map<string, Array>, targetObjectIdsByRuleId: Map<number, string[]>, targetAdIdsByRuleId: Map<number, string[]>, dataQueryCount: number, targetResolutionQueryCount: number }>}
  */
 export async function loadDataForAccount(accountId, rules, ruleEngine) {
+  const enableLevelExecution = isRuleLevelExecutionV2Enabled()
   const timezoneName = await getAccountTimezone(accountId)
+  const targetObjectIdsByRuleId = new Map()
   const targetAdIdsByRuleId = new Map()
+  const targetLevelByRuleId = new Map()
   let targetResolutionQueryCount = 0
   let allAdIdsInAccount = null
 
@@ -152,20 +187,14 @@ export async function loadDataForAccount(accountId, rules, ruleEngine) {
   const cacheKeysByRule = new Map() // ruleId -> cacheKey
 
   for (const rule of rules) {
-    const { targetAdIds, queryCount } = await resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount)
+    const { targetLevel, targetObjectIds, targetAdIds, queryCount } = await resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount)
+    const effectiveLevel = enableLevelExecution ? targetLevel : 'ad'
     targetResolutionQueryCount += queryCount
+    targetLevelByRuleId.set(rule.id, effectiveLevel)
+    targetObjectIdsByRuleId.set(rule.id, effectiveLevel === 'ad' ? targetAdIds : targetObjectIds)
     targetAdIdsByRuleId.set(rule.id, targetAdIds)
-    targetAdIds.forEach(id => unionAdIdsSet.add(id))
-  }
-
-  const unionAdIds = [...unionAdIdsSet]
-  if (unionAdIds.length === 0) {
-    return {
-      timezoneName,
-      cache: new Map(),
-      targetAdIdsByRuleId,
-      dataQueryCount: 0,
-      targetResolutionQueryCount
+    if (effectiveLevel === 'ad') {
+      targetAdIds.forEach(id => unionAdIdsSet.add(id))
     }
   }
 
@@ -178,26 +207,53 @@ export async function loadDataForAccount(accountId, rules, ruleEngine) {
     let timeWindow = 'today'
     let customRange = null
     try {
-      timeWindow = ruleEngine.getTimeWindowFromConditions(rule.conditions, logicOp) || 'today'
+      timeWindow = normalizeTimeWindowAlias(ruleEngine.getTimeWindowFromConditions(rule.conditions, logicOp) || 'today')
       customRange = timeWindow === 'custom_range' ? ruleEngine.getCustomRangeFromConditions(rule.conditions, logicOp) : null
     } catch (e) {
       logger.warn(`   [Dispatcher] 规则 ${rule.id} 时间窗口解析失败:`, e.message)
     }
-    const cacheKey = timeWindow + (customRange ? `:${JSON.stringify(customRange)}` : '')
+    const targetLevel = targetLevelByRuleId.get(rule.id) || (rule.targetLevel || rule.target_level || 'ad').toLowerCase()
+    const cacheKey = `${targetLevel}:${timeWindow}` + (customRange ? `:${JSON.stringify(customRange)}` : '')
     cacheKeysByRule.set(rule.id, cacheKey)
-    if (!keyToParams.has(cacheKey)) keyToParams.set(cacheKey, { timeWindow, customRange })
+    if (!keyToParams.has(cacheKey)) keyToParams.set(cacheKey, { targetLevel, timeWindow, customRange })
   }
 
   const cache = new Map()
   let dataQueryCount = 0
-  for (const [cacheKey, { timeWindow, customRange }] of keyToParams) {
+  for (const [cacheKey, { targetLevel, timeWindow, customRange }] of keyToParams) {
     try {
-      const result = await queryRuleData(accountId, unionAdIds, timeWindow, timezoneName, customRange)
+      let result
+      if (targetLevel === 'ad') {
+        const unionAdIds = [...unionAdIdsSet]
+        if (unionAdIds.length === 0) {
+          cache.set(cacheKey, [])
+          continue
+        }
+        result = await queryRuleData(accountId, unionAdIds, timeWindow, timezoneName, customRange)
+      } else {
+        const ruleIdsForKey = rules
+          .filter((r) => cacheKeysByRule.get(r.id) === cacheKey)
+          .map((r) => r.id)
+        const objectIds = [...new Set(ruleIdsForKey.flatMap((id) => targetObjectIdsByRuleId.get(id) || []))]
+        if (objectIds.length === 0) {
+          cache.set(cacheKey, [])
+          continue
+        }
+        result = await queryRuleDataByLevel(accountId, objectIds, targetLevel, timeWindow, timezoneName, customRange)
+      }
       const data = result?.data ?? result
       cache.set(cacheKey, Array.isArray(data) ? data : [])
       dataQueryCount += 1
     } catch (err) {
-      logger.warn(`   [Dispatcher] queryRuleData(${timeWindow}) 失败:`, err.message)
+      logger.warn({
+        message: `   [Dispatcher] queryRuleData(${timeWindow}) 失败`,
+        errorMessage: err.message,
+        code: err.code,
+        sqlMessage: err.sqlMessage,
+        errno: err.errno,
+        sqlState: err.sqlState,
+        stack: err.stack?.split('\n').slice(0, 4).join('\n')
+      })
       cache.set(cacheKey, [])
     }
   }
@@ -205,6 +261,7 @@ export async function loadDataForAccount(accountId, rules, ruleEngine) {
   return {
     timezoneName,
     cache,
+    targetObjectIdsByRuleId,
     targetAdIdsByRuleId,
     cacheKeysByRule,
     dataQueryCount,
@@ -221,10 +278,14 @@ export async function loadDataForAccount(accountId, rules, ruleEngine) {
  */
 export function evaluateRuleWithCache(ruleEngine, rule, loadResult) {
   if (!rule.enabled) return []
+  const enableLevelExecution = isRuleLevelExecutionV2Enabled()
   const cacheKey = loadResult.cacheKeysByRule?.get(rule.id)
   if (cacheKey == null) return []
   const fullData = loadResult.cache.get(cacheKey) || []
-  const targetIds = loadResult.targetAdIdsByRuleId.get(rule.id) || []
+  const targetLevel = enableLevelExecution
+    ? (rule.targetLevel || rule.target_level || 'ad').toLowerCase()
+    : 'ad'
+  const targetIds = loadResult.targetObjectIdsByRuleId?.get(rule.id) || []
   const useDyn = Boolean(rule.useDynamicScope ?? rule.use_dynamic_scope)
   // 动态筛选：目标仅以 rule_matched_objects 为准。快照为空时不得用「本批 union」全量数据评估，
   // 否则同账户多规则一轮扫描时会把其它规则圈内的广告误纳入本条规则（名称条件被绕过）。
@@ -237,8 +298,15 @@ export function evaluateRuleWithCache(ruleEngine, rule, loadResult) {
     return ruleEngine.evaluateRuleWithData(rule, [])
   }
   const filterSet = targetIds.length > 0 ? new Set(targetIds) : null
-  const ruleDataArray = filterSet
-    ? fullData.filter(row => filterSet.has(String(row?.ad_id || '')))
-    : fullData
+  let ruleDataArray = fullData
+  if (filterSet) {
+    if (targetLevel === 'ad') {
+      ruleDataArray = fullData.filter(row => filterSet.has(String(row?.ad_id || '')))
+    } else if (targetLevel === 'adset') {
+      ruleDataArray = fullData.filter(row => filterSet.has(String(row?.ad_set_id || row?.adset_id || '')))
+    } else if (targetLevel === 'campaign') {
+      ruleDataArray = fullData.filter(row => filterSet.has(String(row?.campaign_id || '')))
+    }
+  }
   return ruleEngine.evaluateRuleWithData(rule, ruleDataArray)
 }

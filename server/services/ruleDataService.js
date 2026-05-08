@@ -1057,3 +1057,419 @@ export async function getAccountTimezone(accountId) {
   }
 }
 
+// ============================================
+// M3: 同层聚合查询（queryRuleDataByLevel）
+// ============================================
+
+/**
+ * M3 同层聚合查询：根据目标层级（ad/adset/campaign）进行数据聚合
+ *
+ * 合同：
+ * - 聚合规则固定为「先 SUM 分子分母，再计算派生指标」
+ * - 禁止对各 ad 的派生指标直接平均（辛普森悖论）
+ *
+ * @param {string} accountId - 广告账户ID
+ * @param {string[]} objectIds - 同层对象 ID 列表（ad_id / ad_set_id / campaign_id）
+ * @param {string} level - 目标层级：ad | adset | campaign
+ * @param {string} timeWindow - 时间窗口：today | yesterday | last_3_days | last_7_days | last_30_days | lifetime | custom_range
+ * @param {string} timezoneName - 账户时区
+ * @param {Object} [customRange] - 自定义时间范围 { since, until }
+ * @returns {Promise<{data: Array, warnings: Array}>} 聚合后的数据数组
+ */
+export async function queryRuleDataByLevel(accountId, objectIds, level, timeWindow, timezoneName = null, customRange = null) {
+  if (!timezoneName) timezoneName = await getAccountTimezone(accountId)
+  const validLevel = ['ad', 'adset', 'campaign'].includes(level) ? level : 'ad'
+  if (validLevel === 'ad') {
+    return queryRuleData(accountId, objectIds, timeWindow, timezoneName, customRange)
+  }
+
+  const objectIdSet = new Set((objectIds || []).map((id) => String(id || '').trim()).filter(Boolean))
+  const allIds = [...objectIdSet]
+  if (allIds.length === 0) return { data: [], warnings: [] }
+
+  const { start, end } = calculateTimeWindow(timeWindow, timezoneName, customRange)
+  const startDate = start.toFormat('yyyy-MM-dd')
+  const endDate = end.toFormat('yyyy-MM-dd')
+  const nowInZone = DateTime.now().setZone(timezoneName)
+  const todayDate = nowInZone.toFormat('yyyy-MM-dd')
+  const yesterdayDate = nowInZone.minus({ days: 1 }).toFormat('yyyy-MM-dd')
+  const includeToday = startDate <= todayDate && endDate >= todayDate
+  const historySince = startDate
+  const historyUntil = endDate < yesterdayDate ? endDate : yesterdayDate
+  const includeHistory = historySince <= historyUntil
+  const levelColumn = validLevel === 'adset' ? 'ad_set_id' : 'campaign_id'
+  const statusSourceRef = validLevel === 'adset'
+    ? 'structure_adsets.effective_status'
+    : 'structure_campaigns.effective_status'
+
+  const warnings = []
+  const objectMetaById = await loadObjectMetaByLevel(accountId, validLevel, allIds)
+
+  const aggregateRows = await queryLevelAggregateRows({
+    accountId,
+    levelColumn,
+    levelObjectIds: allIds,
+    includeHistory,
+    historySince,
+    historyUntil,
+    includeToday,
+    todayDate
+  })
+
+  if (aggregateRows.length === 0) {
+    return { data: [], warnings }
+  }
+
+  const childrenRows = await queryLevelChildrenRows({
+    accountId,
+    levelColumn,
+    levelObjectIds: allIds,
+    includeHistory,
+    historySince,
+    historyUntil,
+    includeToday,
+    todayDate
+  })
+
+  const childrenByObjectId = new Map()
+  for (const row of childrenRows) {
+    const objectId = String(row.object_id || '').trim()
+    if (!objectId) continue
+    if (!childrenByObjectId.has(objectId)) childrenByObjectId.set(objectId, [])
+    childrenByObjectId.get(objectId).push({
+      adId: row.ad_id || null,
+      adName: row.ad_name || null,
+      adsetId: row.ad_set_id || null,
+      campaignId: row.campaign_id || null,
+      status: row.status || null,
+      spend: Number(row.spend || 0),
+      purchases: Number(row.purchases || 0),
+      link_clicks: Number(row.link_clicks || 0),
+      unique_link_clicks: Number(row.unique_link_clicks || 0),
+      purchase_value: Number(row.purchase_value || 0),
+      add_to_cart_count: Number(row.add_to_cart_count || 0),
+      initiate_checkout_count: Number(row.initiate_checkout_count || 0),
+      add_payment_info_count: Number(row.add_payment_info_count || 0)
+    })
+  }
+
+  const results = aggregateRows.map((row) => {
+    const objectId = String(row.object_id || '').trim()
+    const objectMeta = objectMetaById.get(objectId) || null
+    const children = childrenByObjectId.get(objectId) || []
+    const spend = Number(row.spend || 0)
+    const purchases = Number(row.purchases || 0)
+    const linkClicks = Number(row.link_clicks || 0)
+    const uniqueLinkClicks = Number(row.unique_link_clicks || 0)
+    const purchaseValue = Number(row.purchase_value || 0)
+    const addToCartCount = Number(row.add_to_cart_count || 0)
+    const checkoutCount = Number(row.initiate_checkout_count || 0)
+    const paymentCount = Number(row.add_payment_info_count || 0)
+
+    return {
+      account_id: accountId,
+      object_type: validLevel,
+      object_id: objectId,
+      object_name: objectMeta?.name || null,
+      status_source_ref: statusSourceRef,
+      [levelColumn]: objectId,
+      ...(validLevel === 'adset'
+        ? {
+            adset_id: objectId,
+            adset_name: objectMeta?.name || null,
+            campaign_id: objectMeta?.campaignId || null
+          }
+        : {
+            campaign_id: objectId,
+            campaign_name: objectMeta?.name || null
+          }),
+      ad_id: null,
+      ad_name: null,
+      spend,
+      purchases,
+      link_clicks: linkClicks,
+      unique_link_clicks: uniqueLinkClicks,
+      purchase_value: purchaseValue,
+      add_to_cart_count: addToCartCount,
+      initiate_checkout_count: checkoutCount,
+      add_payment_info_count: paymentCount,
+      roas: spend === 0 ? null : (purchaseValue > 0 ? purchaseValue / spend : 0),
+      cpa: purchases > 0 ? spend / purchases : null,
+      cpc: linkClicks > 0 ? spend / linkClicks : null,
+      ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : null,
+      add_to_cart_cost: addToCartCount > 0 ? spend / addToCartCount : null,
+      checkout_cost: checkoutCount > 0 ? spend / checkoutCount : null,
+      payment_cost: paymentCount > 0 ? spend / paymentCount : null,
+      aggregationTrace: {
+        window: {
+          timeWindow,
+          timezoneName,
+          customRange: customRange || null
+        },
+        children,
+        aggregate: {
+          spend,
+          purchases,
+          link_clicks: linkClicks,
+          unique_link_clicks: uniqueLinkClicks,
+          purchase_value: purchaseValue,
+          add_to_cart_count: addToCartCount,
+          initiate_checkout_count: checkoutCount,
+          add_payment_info_count: paymentCount,
+          roas: spend === 0 ? null : (purchaseValue > 0 ? purchaseValue / spend : 0),
+          cpa: purchases > 0 ? spend / purchases : null,
+          cpc: linkClicks > 0 ? spend / linkClicks : null,
+          ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : null,
+          add_to_cart_cost: addToCartCount > 0 ? spend / addToCartCount : null,
+          checkout_cost: checkoutCount > 0 ? spend / checkoutCount : null,
+          payment_cost: paymentCount > 0 ? spend / paymentCount : null
+        }
+      }
+    }
+  })
+
+  return { data: results, warnings }
+}
+
+async function loadObjectMetaByLevel(accountId, level, objectIds) {
+  const metaMap = new Map()
+  const safeIds = [...new Set((objectIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  if (safeIds.length === 0 || level === 'ad') return metaMap
+
+  const placeholders = safeIds.map(() => '?').join(',')
+  if (level === 'adset') {
+    const [rows] = await pool.execute(
+      `SELECT adset_id, name, campaign_id
+       FROM structure_adsets
+       WHERE account_id = ?
+         AND adset_id IN (${placeholders})`,
+      [accountId, ...safeIds]
+    )
+    for (const row of rows || []) {
+      const adsetId = String(row.adset_id || '').trim()
+      if (!adsetId) continue
+      metaMap.set(adsetId, {
+        name: row.name || null,
+        campaignId: row.campaign_id ? String(row.campaign_id) : null
+      })
+    }
+    return metaMap
+  }
+
+  const [rows] = await pool.execute(
+    `SELECT campaign_id, name
+     FROM structure_campaigns
+     WHERE account_id = ?
+       AND campaign_id IN (${placeholders})`,
+    [accountId, ...safeIds]
+  )
+  for (const row of rows || []) {
+    const campaignId = String(row.campaign_id || '').trim()
+    if (!campaignId) continue
+    metaMap.set(campaignId, {
+      name: row.name || null
+    })
+  }
+  return metaMap
+}
+
+async function queryLevelAggregateRows({
+  accountId,
+  levelColumn,
+  levelObjectIds,
+  includeHistory,
+  historySince,
+  historyUntil,
+  includeToday,
+  todayDate
+}) {
+  const placeholders = levelObjectIds.map(() => '?').join(',')
+  const params = []
+  let historySql = ''
+  if (includeHistory) {
+    historySql = `
+      SELECT
+        ${levelColumn} AS object_id,
+        SUM(COALESCE(spend, 0)) AS spend,
+        SUM(COALESCE(purchases, 0)) AS purchases,
+        SUM(COALESCE(link_clicks, 0)) AS link_clicks,
+        SUM(COALESCE(unique_link_clicks, 0)) AS unique_link_clicks,
+        SUM(COALESCE(purchase_value, 0)) AS purchase_value,
+        SUM(COALESCE(add_to_cart_count, 0)) AS add_to_cart_count,
+        SUM(COALESCE(initiate_checkout_count, 0)) AS initiate_checkout_count,
+        SUM(COALESCE(add_payment_info_count, 0)) AS add_payment_info_count
+      FROM daily_stats
+      WHERE account_id = ?
+        AND date >= ?
+        AND date <= ?
+        AND ${levelColumn} IN (${placeholders})
+      GROUP BY ${levelColumn}
+    `
+    params.push(accountId, historySince, historyUntil, ...levelObjectIds)
+  }
+
+  let todaySql = ''
+  if (includeToday) {
+    todaySql = `
+      SELECT
+        t.${levelColumn} AS object_id,
+        SUM(COALESCE(t.spend, 0)) AS spend,
+        SUM(COALESCE(t.purchases, 0)) AS purchases,
+        SUM(COALESCE(t.link_clicks, 0)) AS link_clicks,
+        SUM(COALESCE(t.unique_link_clicks, 0)) AS unique_link_clicks,
+        SUM(COALESCE(t.purchase_value, 0)) AS purchase_value,
+        SUM(COALESCE(t.add_to_cart_count, 0)) AS add_to_cart_count,
+        SUM(COALESCE(t.initiate_checkout_count, 0)) AS initiate_checkout_count,
+        SUM(COALESCE(t.add_payment_info_count, 0)) AS add_payment_info_count
+      FROM (
+        SELECT s.*
+        FROM ad_snapshots s
+        INNER JOIN (
+          SELECT ad_id, MAX(synced_at) AS max_synced_at
+          FROM ad_snapshots
+          WHERE account_id = ?
+            AND data_date = ?
+          GROUP BY ad_id
+        ) m ON s.ad_id = m.ad_id AND s.synced_at = m.max_synced_at
+        WHERE s.account_id = ?
+          AND s.data_date = ?
+      ) t
+      WHERE t.${levelColumn} IN (${placeholders})
+      GROUP BY t.${levelColumn}
+    `
+    params.push(accountId, todayDate, accountId, todayDate, ...levelObjectIds)
+  }
+
+  const sources = []
+  if (historySql) sources.push(historySql)
+  if (todaySql) sources.push(todaySql)
+  if (sources.length === 0) return []
+
+  const sql = `
+    SELECT
+      object_id,
+      SUM(spend) AS spend,
+      SUM(purchases) AS purchases,
+      SUM(link_clicks) AS link_clicks,
+      SUM(unique_link_clicks) AS unique_link_clicks,
+      SUM(purchase_value) AS purchase_value,
+      SUM(add_to_cart_count) AS add_to_cart_count,
+      SUM(initiate_checkout_count) AS initiate_checkout_count,
+      SUM(add_payment_info_count) AS add_payment_info_count
+    FROM (
+      ${sources.join('\nUNION ALL\n')}
+    ) merged
+    GROUP BY object_id
+  `
+  const [rows] = await pool.execute(sql, params)
+  return rows || []
+}
+
+async function queryLevelChildrenRows({
+  accountId,
+  levelColumn,
+  levelObjectIds,
+  includeHistory,
+  historySince,
+  historyUntil,
+  includeToday,
+  todayDate
+}) {
+  const placeholders = levelObjectIds.map(() => '?').join(',')
+  const params = []
+  let historySql = ''
+  if (includeHistory) {
+    historySql = `
+      SELECT
+        ${levelColumn} AS object_id,
+        ad_id,
+        MAX(ad_name) AS ad_name,
+        MAX(ad_set_id) AS ad_set_id,
+        MAX(campaign_id) AS campaign_id,
+        NULL AS status,
+        SUM(COALESCE(spend, 0)) AS spend,
+        SUM(COALESCE(purchases, 0)) AS purchases,
+        SUM(COALESCE(link_clicks, 0)) AS link_clicks,
+        SUM(COALESCE(unique_link_clicks, 0)) AS unique_link_clicks,
+        SUM(COALESCE(purchase_value, 0)) AS purchase_value,
+        SUM(COALESCE(add_to_cart_count, 0)) AS add_to_cart_count,
+        SUM(COALESCE(initiate_checkout_count, 0)) AS initiate_checkout_count,
+        SUM(COALESCE(add_payment_info_count, 0)) AS add_payment_info_count
+      FROM daily_stats
+      WHERE account_id = ?
+        AND date >= ?
+        AND date <= ?
+        AND ${levelColumn} IN (${placeholders})
+      GROUP BY ${levelColumn}, ad_id
+    `
+    params.push(accountId, historySince, historyUntil, ...levelObjectIds)
+  }
+
+  let todaySql = ''
+  if (includeToday) {
+    todaySql = `
+      SELECT
+        t.${levelColumn} AS object_id,
+        t.ad_id,
+        MAX(t.ad_name) AS ad_name,
+        MAX(t.ad_set_id) AS ad_set_id,
+        MAX(t.campaign_id) AS campaign_id,
+        MAX(t.status) AS status,
+        SUM(COALESCE(t.spend, 0)) AS spend,
+        SUM(COALESCE(t.purchases, 0)) AS purchases,
+        SUM(COALESCE(t.link_clicks, 0)) AS link_clicks,
+        SUM(COALESCE(t.unique_link_clicks, 0)) AS unique_link_clicks,
+        SUM(COALESCE(t.purchase_value, 0)) AS purchase_value,
+        SUM(COALESCE(t.add_to_cart_count, 0)) AS add_to_cart_count,
+        SUM(COALESCE(t.initiate_checkout_count, 0)) AS initiate_checkout_count,
+        SUM(COALESCE(t.add_payment_info_count, 0)) AS add_payment_info_count
+      FROM (
+        SELECT s.*
+        FROM ad_snapshots s
+        INNER JOIN (
+          SELECT ad_id, MAX(synced_at) AS max_synced_at
+          FROM ad_snapshots
+          WHERE account_id = ?
+            AND data_date = ?
+          GROUP BY ad_id
+        ) m ON s.ad_id = m.ad_id AND s.synced_at = m.max_synced_at
+        WHERE s.account_id = ?
+          AND s.data_date = ?
+      ) t
+      WHERE t.${levelColumn} IN (${placeholders})
+      GROUP BY t.${levelColumn}, t.ad_id
+    `
+    params.push(accountId, todayDate, accountId, todayDate, ...levelObjectIds)
+  }
+
+  const sources = []
+  if (historySql) sources.push(historySql)
+  if (todaySql) sources.push(todaySql)
+  if (sources.length === 0) return []
+
+  const sql = `
+    SELECT
+      object_id,
+      ad_id,
+      MAX(ad_name) AS ad_name,
+      MAX(ad_set_id) AS ad_set_id,
+      MAX(campaign_id) AS campaign_id,
+      MAX(status) AS status,
+      SUM(spend) AS spend,
+      SUM(purchases) AS purchases,
+      SUM(link_clicks) AS link_clicks,
+      SUM(unique_link_clicks) AS unique_link_clicks,
+      SUM(purchase_value) AS purchase_value,
+      SUM(add_to_cart_count) AS add_to_cart_count,
+      SUM(initiate_checkout_count) AS initiate_checkout_count,
+      SUM(add_payment_info_count) AS add_payment_info_count
+    FROM (
+      ${sources.join('\nUNION ALL\n')}
+    ) merged
+    GROUP BY object_id, ad_id
+    ORDER BY object_id, ad_id
+  `
+  const [rows] = await pool.execute(sql, params)
+  return rows || []
+}
+

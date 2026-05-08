@@ -1,0 +1,49 @@
+{
+  "generatedAt": "2026-05-06T06:59:43.337Z",
+  "accountId": "act_4252903478277839",
+  "check": "ad_level_today_latest_snapshot",
+  "raw": [
+    {
+      "id": 1,
+      "select_type": "PRIMARY",
+      "table": "s",
+      "partitions": null,
+      "type": "ref",
+      "possible_keys": "uk_ad_id,uk_account_ad_date,idx_account_id,idx_synced_at,idx_account_synced,idx_ad_synced,idx_ad_synced_desc,idx_account_date_ad,idx_snap_account_data_date_adset,idx_snap_account_data_date_campaign",
+      "key": "uk_account_ad_date",
+      "key_len": "202",
+      "ref": "const",
+      "rows": 1,
+      "filtered": 10,
+      "Extra": "Using index condition"
+    },
+    {
+      "id": 1,
+      "select_type": "PRIMARY",
+      "table": "<derived2>",
+      "partitions": null,
+      "type": "ref",
+      "possible_keys": "<auto_key0>",
+      "key": "<auto_key0>",
+      "key_len": "208",
+      "ref": "fb_ad_brain.s.ad_id,fb_ad_brain.s.synced_at",
+      "rows": 2,
+      "filtered": 100,
+      "Extra": "Using index"
+    },
+    {
+      "id": 2,
+      "select_type": "DERIVED",
+      "table": "ad_snapshots",
+      "partitions": null,
+      "type": "ref",
+      "possible_keys": "uk_ad_id,uk_account_ad_date,idx_account_id,idx_account_synced,idx_ad_synced,idx_ad_synced_desc,idx_account_date_ad,idx_snap_account_data_date_adset,idx_snap_account_data_date_campaign",
+      "key": "uk_account_ad_date",
+      "key_len": "202",
+      "ref": "const",
+      "rows": 1,
+      "filtered": 10,
+      "Extra": "Using index condition"
+    }
+  ]
+}
