@@ -29,18 +29,18 @@ isProject: false
 ### 总体目标
 
 - **统一原则**：
-                - 所有写入 MySQL `timestamp` 字段的时间一律使用 **UTC**（系统时间基准）。
-                - 所有面向用户/你自己查看的时间（前端 UI、调试 SQL）一律显示为 **北京时区（UTC+8）**，除非特别标注是 UTC。
-                - 业务逻辑里需要“账户时区”的地方（规则统计窗口、ad_snapshots 的 `data_date` 等），继续按“账户时区 / 数据时区”实现，不与系统 UTC 相互污染。
+                                                                - 所有写入 MySQL `timestamp` 字段的时间一律使用 **UTC**（系统时间基准）。
+                                                                - 所有面向用户/你自己查看的时间（前端 UI、调试 SQL）一律显示为 **北京时区（UTC+8）**，除非特别标注是 UTC。
+                                                                - 业务逻辑里需要“账户时区”的地方（规则统计窗口、ad_snapshots 的 `data_date` 等），继续按“账户时区 / 数据时区”实现，不与系统 UTC 相互污染。
 - **当前两大问题**：
 
-                1. 前端执行日志时间比你在 DB/本地看到的时间 **少 8 小时**。
-                2. 冷却日志 `lastAt=...Z` 与你预期的北京时间 **相差 8 小时**，难以直观判断冷却间隔。
+                                                                1. 前端执行日志时间比你在 DB/本地看到的时间 **少 8 小时**。
+                                                                2. 冷却日志 `lastAt=...Z` 与你预期的北京时间 **相差 8 小时**，难以直观判断冷却间隔。
 
 - **改造后的效果**：
-                - `automation_logs.triggered_at` 在 DB 中是真正的 UTC；前端执行日志统一显示为北京时间，与你右下角时间一眼对齐，不再少 8 小时。
-                - 冷却日志中既能看到 `lastAtUtc`（UTC）也能看到 `lastAtBj`（北京），你用北京时间对比就能简单判断“上次执行是什么时刻”“冷却过去了多久”。
-                - 所有新写的时间字段（如 `last_executed_at`, `synced_at`, `triggered_at` 等）都有明确语义：**存 UTC → 显示时由前端或调试 SQL 再转北京**。
+                                                                - `automation_logs.triggered_at` 在 DB 中是真正的 UTC；前端执行日志统一显示为北京时间，与你右下角时间一眼对齐，不再少 8 小时。
+                                                                - 冷却日志中既能看到 `lastAtUtc`（UTC）也能看到 `lastAtBj`（北京），你用北京时间对比就能简单判断“上次执行是什么时刻”“冷却过去了多久”。
+                                                                - 所有新写的时间字段（如 `last_executed_at`, `synced_at`, `triggered_at` 等）都有明确语义：**存 UTC → 显示时由前端或调试 SQL 再转北京**。
 
 ---
 
@@ -49,13 +49,13 @@ isProject: false
 聚焦这次需要统一的几个关键表/字段（仅列出和当前问题相关、且改动敏感的）：
 
 - `[server/db/schema.js]`
-                - `automationLogs.triggeredAt`：执行日志的触发时间（当前被你用来在前端展示执行时间）。
-                - `automationLogs.createdAt`：日志记录的创建时间（如果有，用于排序或调试）。
-                - `ruleAdExecutionState.lastExecutedAt`：冷却表中“上次执行时间”（现在 `TIMESTAMPDIFF` 用它和 `UTC_TIMESTAMP()` 来算 diffMin）。
-                - `dailyArchiveStatus.updatedAt` 等：归档状态更新时间（本次可以先保持现状，仅注意以后统一用 UTC）。
+                                                                - `automationLogs.triggeredAt`：执行日志的触发时间（当前被你用来在前端展示执行时间）。
+                                                                - `automationLogs.createdAt`：日志记录的创建时间（如果有，用于排序或调试）。
+                                                                - `ruleAdExecutionState.lastExecutedAt`：冷却表中“上次执行时间”（现在 `TIMESTAMPDIFF` 用它和 `UTC_TIMESTAMP()` 来算 diffMin）。
+                                                                - `dailyArchiveStatus.updatedAt` 等：归档状态更新时间（本次可以先保持现状，仅注意以后统一用 UTC）。
 - 其他非核心时间字段（先记录，不必这次全部改）：
-                - `ad_snapshots.synced_at` / `data_date`：同步时间 + 账户本地自然日（`data_date` 按账户时区写入，继续保持；`synced_at` 推荐改为 UTC）。
-                - `daily_stats.date` / `timezone_name`：按“账户时区 + 自然日”存储，保持现有含义不动。
+                                                                - `ad_snapshots.synced_at` / `data_date`：同步时间 + 账户本地自然日（`data_date` 按账户时区写入，继续保持；`synced_at` 推荐改为 UTC）。
+                                                                - `daily_stats.date` / `timezone_name`：按“账户时区 + 自然日”存储，保持现有含义不动。
 
 **目标**：本次执行优先把 `automationLogs.triggeredAt` 和 `ruleAdExecutionState.lastExecutedAt` 的写入/读取语义统一到 UTC 基准，其它时间字段以后按同一规范渐进统一。
 
@@ -69,24 +69,24 @@ isProject: false
 
 1. **MySQL 配置层**（推荐）：
 
-                        - 在 MySQL 配置文件 `my.cnf` 中加入：
-                                        - `[mysqld]`
-                                                        - `default_time_zone = '+00:00'`
-                        - 重启 MySQL 后，用 `SELECT NOW(), UTC_TIMESTAMP();` 验证两者几乎相等（差 <1 秒），说明会话时区已为 UTC。
+                                                                                                - 在 MySQL 配置文件 `my.cnf` 中加入：
+                                                                                                                                                                - `[mysqld]`
+                                                                                                                                                                                                                                - `default_time_zone = '+00:00'`
+                                                                                                - 重启 MySQL 后，用 `SELECT NOW(), UTC_TIMESTAMP();` 验证两者几乎相等（差 <1 秒），说明会话时区已为 UTC。
 
 2. **Node 连接层兜底**（如果不方便改全局配置，可在连接建立后显式设置）：
 
-                        - 在统一的连接初始化处（例如 `[server/db/connection.js]` 里创建 pool 后）：
-                                        - 调用一次 `SET time_zone = '+00:00';`，保证所有来自应用的会话都在 UTC 下运行。
+                                                                                                - 在统一的连接初始化处（例如 `[server/db/connection.js]` 里创建 pool 后）：
+                                                                                                                                                                - 调用一次 `SET time_zone = '+00:00';`，保证所有来自应用的会话都在 UTC 下运行。
 
 3. **验证**：
 
-                        - 连接 MySQL 后执行：
+                                                                                                - 连接 MySQL 后执行：
      ```sql
      SELECT @@global.time_zone, @@session.time_zone, NOW(), UTC_TIMESTAMP();
      ```
 
-                        - 期望输出：`@@session.time_zone = +00:00` 且 `NOW() ≈ UTC_TIMESTAMP()`。
+                                                                                                - 期望输出：`@@session.time_zone = +00:00` 且 `NOW() ≈ UTC_TIMESTAMP()`。
 
 > 这一步完成之后，DB 层已经“站在 UTC”，后续任何 `timestamp` 插入/更新都将以 UTC 语义解释。
 
@@ -164,13 +164,13 @@ const [rows] = await pool.execute(
 
 1. **写入 last_executed_at 时，必须使用 UTC**：
 
-                        - 如果现在的 upsert SQL 用的是 `NOW()`，要改成 `UTC_TIMESTAMP()`；
-                        - 如果是通过 Drizzle/JS `new Date()` 写入，则依赖第 2 步完成后 DB 会话已经为 UTC，那么 `new Date()` 会被当作 UTC 存。
+                                                                                                - 如果现在的 upsert SQL 用的是 `NOW()`，要改成 `UTC_TIMESTAMP()`；
+                                                                                                - 如果是通过 Drizzle/JS `new Date()` 写入，则依赖第 2 步完成后 DB 会话已经为 UTC，那么 `new Date()` 会被当作 UTC 存。
 
 2. **冷却 diff 计算维持 UTC 基准**：
 
-                        - `TIMESTAMPDIFF(MINUTE, last_executed_at, UTC_TIMESTAMP())` 在 DB 时区为 UTC 的前提下语义完全正确：
-                                        - 两个值都是 UTC → diffMin = 真实过去分钟数；
+                                                                                                - `TIMESTAMPDIFF(MINUTE, last_executed_at, UTC_TIMESTAMP())` 在 DB 时区为 UTC 的前提下语义完全正确：
+                                                                                                                                                                - 两个值都是 UTC → diffMin = 真实过去分钟数；
 
 3. **只在日志展示层处理「UTC vs 北京」**：
 ```js
@@ -208,9 +208,9 @@ logger.debug(
   ```
 
 - 期望：
-                - `raw_utc` 显示 UTC；`last_executed_bj` 是你熟悉的北京时间；
-                - `diff_min_utc` 与你手算 "now_bj - last_executed_bj" 的分钟差一致；
-                - 日志里的 `lastAtUtc`/`lastAtBj` 与这里一致。
+                                                                - `raw_utc` 显示 UTC；`last_executed_bj` 是你熟悉的北京时间；
+                                                                - `diff_min_utc` 与你手算 "now_bj - last_executed_bj" 的分钟差一致；
+                                                                - 日志里的 `lastAtUtc`/`lastAtBj` 与这里一致。
 
 > 冷却这块的关键：**逻辑上用 UTC 计算，展示时多打印一份北京时区，避免你肉眼看时出现“到底差几小时”的错觉。**
 
@@ -287,8 +287,8 @@ const formatDateTime = (dateStr) => formatDateTimeBeijing(dateStr)
 
 3. **验证**：
 
-                        - 用 `CONVERT_TZ(..., '+00:00', '+08:00')` 看几条老记录，确认北京视角下的时间仍然正确；
-                        - 前端执行日志在老记录上显示也合理，不再出现整体偏 8 小时的错位。
+                                                                                                - 用 `CONVERT_TZ(..., '+00:00', '+08:00')` 看几条老记录，确认北京视角下的时间仍然正确；
+                                                                                                - 前端执行日志在老记录上显示也合理，不再出现整体偏 8 小时的错位。
 
 > 这步属于「完美主义/长期一致性」工作，可在冷却和执行日志确认正常后再择机处理。
 
@@ -299,29 +299,29 @@ const formatDateTime = (dateStr) => formatDateTimeBeijing(dateStr)
 最后，把这次约定写进你的工程文档，避免以后再踩新坑：
 
 - 在 `[docs/0时区转换解决方案.md]` 里补充最终规范：
-                - **DB & 后端**：所有 `timestamp` 字段存储 UTC（通过 MySQL `time_zone='+00:00'` + Node `Date` 实现）；
-                - **前端**：统一假设时间字段为 UTC，使用 `utils/dateTime.js` 将其转换为北京时区展示；
-                - **业务“账户时区”**：仍由 `ruleDataService` 等模块的 `timezoneName` / `dataTimezoneUsed` 控制，不与系统 UTC 混淆。
+                                                                - **DB & 后端**：所有 `timestamp` 字段存储 UTC（通过 MySQL `time_zone='+00:00'` + Node `Date` 实现）；
+                                                                - **前端**：统一假设时间字段为 UTC，使用 `utils/dateTime.js` 将其转换为北京时区展示；
+                                                                - **业务“账户时区”**：仍由 `ruleDataService` 等模块的 `timezoneName` / `dataTimezoneUsed` 控制，不与系统 UTC 混淆。
 - 在代码注释中：
-                - `actionExecutorService`：说明 `triggeredAt` 存 UTC；
-                - `ruleExecutionStateService`：说明 `last_executed_at` 存 UTC、冷却 diff 以 UTC 计算，日志中额外打印北京时间仅为调试方便。
+                                                                - `actionExecutorService`：说明 `triggeredAt` 存 UTC；
+                                                                - `ruleExecutionStateService`：说明 `last_executed_at` 存 UTC、冷却 diff 以 UTC 计算，日志中额外打印北京时间仅为调试方便。
 
 ---
 
 ### 完成后的整体效果回顾
 
 - **执行日志页面**：
-                - 页面上“执行时间”与 `SELECT CONVERT_TZ(triggered_at, '+00:00', '+08:00')` 的时间一致，与当前本地时间、你记忆中的真实动作时间对齐；
-                - 不会再出现“少 8 小时”的情况。
+                                                                - 页面上“执行时间”与 `SELECT CONVERT_TZ(triggered_at, '+00:00', '+08:00')` 的时间一致，与当前本地时间、你记忆中的真实动作时间对齐；
+                                                                - 不会再出现“少 8 小时”的情况。
 
 - **冷却日志 debug**：
-                - 每次 `isCooldownDue` 输出：
-                                - `lastAtUtc=...Z`（绝对 UTC 时间）
-                                - `lastAtBj=yyyy-MM-dd HH:mm:ss`（北京时区）
-                                - `diffMin=...`（基于 UTC 的分钟差）
-                - 你只看 `lastAtBj` 和 `diffMin`，就能判断“上次执行是什么时间”“冷却过去多久”，不会再纠结 8/16 小时的问题。
+                                                                - 每次 `isCooldownDue` 输出：
+                                                                                                                                - `lastAtUtc=...Z`（绝对 UTC 时间）
+                                                                                                                                - `lastAtBj=yyyy-MM-dd HH:mm:ss`（北京时区）
+                                                                                                                                - `diffMin=...`（基于 UTC 的分钟差）
+                                                                - 你只看 `lastAtBj` 和 `diffMin`，就能判断“上次执行是什么时间”“冷却过去多久”，不会再纠结 8/16 小时的问题。
 
 - **系统整体时区行为**：
-                - DB、后端逻辑都建立在 UTC 之上，前端和日常 SQL 查询通过显式 `CONVERT_TZ` 或 `formatDateTimeBeijing` 在北京时区下展示；
-                - 不会再出现「有的字段按本地写、有的按 UTC 读、有的前端又当 UTC 转一次」这种多重混合情况；
-                - 以后再新增任何时间字段，只要遵守“写 UTC → 展示时显式转北京”的规范，就可以避免类似的时区 bug。
+                                                                - DB、后端逻辑都建立在 UTC 之上，前端和日常 SQL 查询通过显式 `CONVERT_TZ` 或 `formatDateTimeBeijing` 在北京时区下展示；
+                                                                - 不会再出现「有的字段按本地写、有的按 UTC 读、有的前端又当 UTC 转一次」这种多重混合情况；
+                                                                - 以后再新增任何时间字段，只要遵守“写 UTC → 展示时显式转北京”的规范，就可以避免类似的时区 bug。

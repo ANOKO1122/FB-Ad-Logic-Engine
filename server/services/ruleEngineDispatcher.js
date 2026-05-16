@@ -13,7 +13,11 @@ function isRuleLevelExecutionV2Enabled() {
 
 function normalizeTimeWindowAlias(raw) {
   if (raw === 'last_3d') return 'last_3_days'
+  if (raw === 'last_3d_excluding_today') return 'last_3_days_excluding_today'
+  if (raw === 'last_5d') return 'last_5_days'
+  if (raw === 'last_5d_excluding_today') return 'last_5_days_excluding_today'
   if (raw === 'last_7d') return 'last_7_days'
+  if (raw === 'last_7d_excluding_today') return 'last_7_days_excluding_today'
   if (raw === 'last_30d') return 'last_30_days'
   return raw
 }
@@ -109,20 +113,10 @@ async function resolveTargetAdIdsForRule(accountId, rule, allAdIdsInAccount = nu
   } else if (explicitEmptyForAccount && ruleTargetIds.length === 0) {
     targetAdIds = []
   } else {
-    if (allAdIdsInAccount != null) {
-      targetAdIds = [...allAdIdsInAccount]
-    } else {
-      try {
-        const [rows] = await pool.execute(
-          `SELECT DISTINCT ad_id FROM structure_ads WHERE account_id = ?`,
-          [accountId]
-        )
-        targetAdIds = rows.map(row => String(row.ad_id || '')).filter(Boolean)
-        queryCount = 1
-      } catch (err) {
-        logger.warn(`   [Dispatcher] 查询账户 ${accountId} 全部广告失败:`, err.message)
-      }
-    }
+    logger.warn(
+      `   [Dispatcher] 规则 ${rule.id} use_dynamic_scope=0 但目标对象为空，跳过本规则评估（避免扩大到整个广告账户）`
+    )
+    targetAdIds = []
   }
 
   // 关闭动态时：目标 = target_ids/target_by_account − exclude_ids，与动态规则口径一致
@@ -162,12 +156,9 @@ export async function loadDataForAccount(accountId, rules, ruleEngine) {
   let targetResolutionQueryCount = 0
   let allAdIdsInAccount = null
 
-  // 若存在「未指定 target」的规则，先拉一次「账户下全部 ad_id」复用
-  const needsAllAdIds = rules.some(r => {
-    const level = r.targetLevel || r.target_level
-    const ids = r.targetIds || r.target_ids || []
-    return !level || !Array.isArray(ids) || ids.length === 0
-  })
+  // 安全策略：手动范围为空时 fail-closed，不再把空 target 解释为「全账户」。
+  // 因此这里不再为了空目标预拉全账户广告，避免事故规则产生全量候选集。
+  const needsAllAdIds = false
   if (needsAllAdIds) {
     try {
       const [rows] = await pool.execute(

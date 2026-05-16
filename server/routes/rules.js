@@ -29,10 +29,10 @@ function mapRuleErrorToResponse(error) {
 }
 
 function parseDynamicScopePayload(body = {}) {
-  const hasUse = Object.prototype.hasOwnProperty.call(body, 'useDynamicScope')
-  const hasFilters = Object.prototype.hasOwnProperty.call(body, 'scopeFilters')
-  const hasExclude = Object.prototype.hasOwnProperty.call(body, 'excludeIds')
-  const hasMax = Object.prototype.hasOwnProperty.call(body, 'maxDynamicMatches')
+  const hasUse = body.useDynamicScope !== undefined
+  const hasFilters = body.scopeFilters !== undefined
+  const hasExclude = body.excludeIds !== undefined
+  const hasMax = body.maxDynamicMatches !== undefined
   return {
     hasAny: hasUse || hasFilters || hasExclude || hasMax,
     useDynamicScope: hasUse ? !!body.useDynamicScope : undefined,
@@ -46,6 +46,13 @@ function hasEffectiveScopeFilters(scopeFilters) {
   if (!scopeFilters || typeof scopeFilters !== 'object') return false
   const conditions = Array.isArray(scopeFilters.conditions) ? scopeFilters.conditions : []
   return conditions.some((item) => item && typeof item === 'object')
+}
+
+function hasConditionMetric(conditions, logicOperator, metric) {
+  const normalized = normalizeConditionsToV2(conditions, logicOperator || 'AND')
+  return (normalized.groups || []).some(group =>
+    (group.conditions || []).some(condition => condition?.metric === metric)
+  )
 }
 
 function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
@@ -116,6 +123,45 @@ function validateDynamicScopePayload(dynamicPayload, fallbackTargetLevel) {
   return { valid: errors.length === 0, error: errors[0], updates }
 }
 
+function normalizeTargetIds(raw) {
+  if (Array.isArray(raw)) return raw.map((id) => String(id).trim()).filter(Boolean)
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed.map((id) => String(id).trim()).filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function targetByAccountHasIds(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  return Object.values(raw).some((ids) =>
+    Array.isArray(ids) && ids.some((id) => String(id).trim())
+  )
+}
+
+function hasManualTargetIds(ruleLike = {}) {
+  const targetIds = normalizeTargetIds(ruleLike.targetIds ?? ruleLike.target_ids)
+  return targetIds.length > 0 || targetByAccountHasIds(ruleLike.targetByAccount ?? ruleLike.target_by_account)
+}
+
+function assertManualScopeHasTargets(ruleLike = {}) {
+  const useDynamicScope = ruleLike.useDynamicScope ?? ruleLike.use_dynamic_scope
+  if (useDynamicScope === false || Number(useDynamicScope) === 0) {
+    if (!hasManualTargetIds(ruleLike)) {
+      return {
+        ok: false,
+        error: '关闭动态筛选时，请至少选择一个目标对象，避免规则扩大到整个广告账户执行',
+        code: 'MANUAL_SCOPE_TARGETS_REQUIRED'
+      }
+    }
+  }
+  return { ok: true }
+}
+
 /**
  * GET /api/templates
  * 获取启用的规则模板（普通用户只读，用于规则创建时应用）
@@ -169,7 +215,7 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
       if (ownerIds.length === 0) ownerIds = undefined
     }
 
-    // 解析 includeNoOwner：仅管理员有效，筛出 users.owner_id IS NULL 的规则（管理员创建、未分配负责人的规则）
+    // 解析 includeNoOwner：仅管理员有效，筛出管理员创建的规则（前端显示为“无（管理员创建）”）
     const includeNoOwner = isAdmin && req.query.includeNoOwner === '1'
 
     const options = {
@@ -192,16 +238,26 @@ router.get('/rules', requireAuth, requireActive, async (req, res) => {
     if (dynamicRuleIds.length > 0) {
       const placeholders = dynamicRuleIds.map(() => '?').join(',')
       const [rows] = await pool.execute(
-        `SELECT rule_id, COUNT(*) AS cnt FROM rule_matched_objects WHERE rule_id IN (${placeholders}) GROUP BY rule_id`,
+        `SELECT rule_id, object_type, COUNT(*) AS cnt
+         FROM rule_matched_objects
+         WHERE rule_id IN (${placeholders})
+         GROUP BY rule_id, object_type`,
         dynamicRuleIds
       )
-      const countByRuleId = new Map()
+      const countByRuleType = new Map()
       for (const row of rows || []) {
-        countByRuleId.set(row.rule_id, row.cnt == null ? 0 : Number(row.cnt))
+        countByRuleType.set(
+          `${Number(row.rule_id)}:${String(row.object_type || '').toLowerCase()}`,
+          row.cnt == null ? 0 : Number(row.cnt)
+        )
       }
       for (const rule of userRules) {
-        if (countByRuleId.has(rule.id)) {
-          rule.matched_count = countByRuleId.get(rule.id)
+        const targetType = String(rule.targetLevel || rule.target_level || 'ad').toLowerCase()
+        const typeKey = `${Number(rule.id)}:${targetType}`
+        if (countByRuleType.has(typeKey)) {
+          rule.matched_count = countByRuleType.get(typeKey)
+        } else {
+          rule.matched_count = 0
         }
       }
     }
@@ -535,24 +591,32 @@ router.get('/rules/:id', requireAuth, requireActive, async (req, res) => {
     }
 
     if (Number(rule.useDynamicScope ?? rule.use_dynamic_scope) === 1) {
+      const targetType = String(rule.targetLevel || rule.target_level || 'ad').toLowerCase()
       const [rows] = await pool.execute(
-        'SELECT COUNT(*) AS cnt FROM rule_matched_objects WHERE rule_id = ?',
-        [ruleId]
+        'SELECT COUNT(*) AS cnt FROM rule_matched_objects WHERE rule_id = ? AND object_type = ?',
+        [ruleId, targetType]
       )
       rule.matched_count = rows?.[0]?.cnt ?? 0
       const [matchedRows] = await pool.execute(
-        'SELECT account_id, object_id FROM rule_matched_objects WHERE rule_id = ?',
-        [ruleId]
+        'SELECT account_id, object_id, object_type FROM rule_matched_objects WHERE rule_id = ? AND object_type = ?',
+        [ruleId, targetType]
       )
       const rawTargetIds = rule.targetIds ?? rule.target_ids ?? []
       const targetIds = Array.isArray(rawTargetIds) ? rawTargetIds : (typeof rawTargetIds === 'string' ? (() => { try { return JSON.parse(rawTargetIds) } catch { return [] } })() : [])
-      const matchedSet = new Set((matchedRows || []).map((r) => `${normalizeAccountId(r.account_id)}:${String(r.object_id || '').trim()}`))
-      const configuredSet = new Set()
+      const matchedSet = new Set(
+        (matchedRows || []).map((r) => `${String(r.object_type || '').toLowerCase()}:${normalizeAccountId(r.account_id)}:${String(r.object_id || '').trim()}`)
+      )
+      const configuredByTypedKey = new Map()
       for (const compositeId of targetIds) {
         const p = parseCompositeId(compositeId)
-        if (p) configuredSet.add(`${p.accountId}:${p.objId}`)
+        if (p) {
+          const typedKey = `${targetType}:${p.accountId}:${p.objId}`
+          configuredByTypedKey.set(typedKey, `${p.accountId}:${p.objId}`)
+        }
       }
-      rule.invalid_ids = [...configuredSet].filter((c) => !matchedSet.has(c))
+      rule.invalid_ids = [...configuredByTypedKey.entries()]
+        .filter(([typedKey]) => !matchedSet.has(typedKey))
+        .map(([, legacyCompositeId]) => legacyCompositeId)
       // 可选：最近一次历史中的 manual_count / dynamic_count，便于界面展示「动态 X / 手动 Y」
       const [historyRows] = await pool.execute(
         `SELECT manual_count, dynamic_count, refreshed_at, trigger_type
@@ -663,6 +727,9 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
     if (!twCheck.valid) {
       return res.status(400).json({ error: twCheck.error, code: 'INCONSISTENT_TIME_WINDOW' })
     }
+    if (normalizedTargetLevel !== 'ad' && hasConditionMetric(conditions, logicOp, 'purchases_avg_after_create')) {
+      return res.status(400).json({ error: '多天购买次数平均数仅支持 targetLevel=ad', code: 'INVALID_CONDITIONS' })
+    }
     
     // 验证 targetLevel（如果提供）
     if (targetLevel && !['ad', 'adset', 'campaign'].includes(normalizedTargetLevel)) {
@@ -743,6 +810,15 @@ router.post('/rules', requireAuth, requireActive, async (req, res) => {
     const dynamicCheck = validateDynamicScopePayload(dynamicPayload, targetLevel)
     if (!dynamicCheck.valid) {
       return res.status(400).json({ error: dynamicCheck.error, code: dynamicCheck.code || 'INVALID_DYNAMIC_SCOPE' })
+    }
+
+    const manualScopeCheck = assertManualScopeHasTargets({
+      useDynamicScope: dynamicCheck.updates.useDynamicScope ?? true,
+      targetIds: targetIds ?? [],
+      targetByAccount: targetByAccount ?? null
+    })
+    if (!manualScopeCheck.ok) {
+      return res.status(400).json({ error: manualScopeCheck.error, code: manualScopeCheck.code })
     }
 
     const newRule = await rulesService.createRule(userId, {
@@ -873,6 +949,10 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
       if (!twCheck.valid) {
         return res.status(400).json({ error: twCheck.error, code: 'INCONSISTENT_TIME_WINDOW' })
       }
+      const conditionTargetLevel = String(updates.targetLevel || body.targetLevel || 'ad').toLowerCase()
+      if (conditionTargetLevel !== 'ad' && hasConditionMetric(updates.conditions, logicOp, 'purchases_avg_after_create')) {
+        return res.status(400).json({ error: '多天购买次数平均数仅支持 targetLevel=ad', code: 'INVALID_CONDITIONS' })
+      }
     }
     if (updates.actions) {
       if (!Array.isArray(updates.actions)) {
@@ -977,6 +1057,15 @@ router.put('/rules/:id', requireAuth, requireActive, async (req, res) => {
       })
     }
     const mergedForGate = mergeRuleForEnableCheck(existingForGate, updates)
+    const manualScopeCheck = assertManualScopeHasTargets(mergedForGate)
+    if (!manualScopeCheck.ok) {
+      return res.status(400).json({ error: manualScopeCheck.error, code: manualScopeCheck.code })
+    }
+    const mergedTargetLevel = String(mergedForGate.targetLevel || mergedForGate.target_level || 'ad').toLowerCase()
+    const mergedLogicOp = mergedForGate.logicOperator || mergedForGate.logic_operator || 'AND'
+    if (mergedTargetLevel !== 'ad' && hasConditionMetric(mergedForGate.conditions, mergedLogicOp, 'purchases_avg_after_create')) {
+      return res.status(400).json({ error: '多天购买次数平均数仅支持 targetLevel=ad', code: 'INVALID_CONDITIONS' })
+    }
     const gate = await assertRuleReadyToEnable(mergedForGate, { isAdmin, ownerId: ownerId ?? null })
     if (!gate.ok) {
       return res.status(400).json({ error: gate.error, code: gate.code })

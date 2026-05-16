@@ -212,6 +212,7 @@
             <div class="actions-list">
               <div v-for="(a, idx) in r.actions" :key="idx" class="pill action" :class="getActionClass(a.type)">
                 {{ actionLabel(a.type) }}
+                <span v-if="a.type === 'set_dynamic_budget'" class="val">{{ formatDynamicBudgetValue(a) }}</span>
                 <span v-if="a.value != null && (a.type === 'increase_budget' || a.type === 'decrease_budget' || a.type === 'set_budget')" class="val">{{ formatBudgetValue(a) }}</span>
               </div>
             </div>
@@ -583,7 +584,12 @@
                   <option value="today">今天</option>
                   <option value="yesterday">昨天</option>
                   <option value="last_3_days">近3天</option>
-                  <option value="lifetime">累计</option>
+                  <option value="last_3_days_excluding_today">近3天（不含今天）</option>
+                  <option value="last_5_days">近5天</option>
+                  <option value="last_5_days_excluding_today">近5天（不含今天）</option>
+                  <option value="last_7_days">近7天</option>
+                  <option value="last_7_days_excluding_today">近7天（不含今天）</option>
+                  <option value="lifetime">至今为止</option>
                   <option value="custom_range">自定义范围</option>
                 </select>
                 <template v-if="whenTimeWindow === 'custom_range'">
@@ -618,18 +624,7 @@
                 </select>
                 <span v-else class="join-placeholder"></span>
                 <select v-model="line.metric" class="select metric-select">
-                  <option value="spend">花费</option>
-                  <option value="roas">ROAS</option>
-                  <option value="cpa">单次购买花费（CPA）</option>
-                  <option value="cpc">CPC（花费/链接点击）</option>
-                  <option value="add_to_cart_cost">单次加购花费</option>
-                  <option value="checkout_cost">单次结账花费</option>
-                  <option value="payment_cost">单次添加支付信息花费</option>
-                  <option value="purchases">购买次数</option>
-                  <option value="link_clicks">链接点击</option>
-                  <option value="add_to_cart_count">加购次数</option>
-                  <option value="initiate_checkout_count">结账次数</option>
-                  <option value="add_payment_info_count">添加支付信息次数</option>
+                  <option v-for="opt in conditionMetricOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
                 </select>
                 <select v-model="line.operator" class="select operator-select">
                   <option value="gt">大于 (>)</option>
@@ -658,8 +653,47 @@
                 <option value="increase_budget">💰 增加预算</option>
                 <option value="decrease_budget">💸 减少预算</option>
                 <option value="set_budget">📌 设置预算为固定值</option>
+                <option value="set_dynamic_budget">📈 设置动态预算值</option>
               </select>
               <template v-if="a.type.includes('budget')">
+                <template v-if="a.type === 'set_dynamic_budget'">
+                  <select v-model="a.metric" class="select action-unit-select" title="公式指标">
+                    <option v-for="opt in dynamicBudgetMetricOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+                  </select>
+                  <input
+                    type="number"
+                    v-model.number="a.multiplier"
+                    class="input-number"
+                    placeholder="30"
+                    min="0.01"
+                    max="9999"
+                    step="0.01"
+                  />
+                  <span class="action-unit">× $</span>
+                  <span class="action-hint">（公式结果会直接设置为目标预算）</span>
+                  <label class="budget-cap-label">预算下限（美元，可选）</label>
+                  <input
+                    type="number"
+                    :value="a.min_daily_budget != null ? (a.min_daily_budget / 100) : ''"
+                    @input="onMinBudgetInput($event, a)"
+                    class="input-number budget-cap-input"
+                    placeholder="不填则不限制"
+                    min="1"
+                    step="0.01"
+                  />
+                  <label class="budget-cap-label">预算上限（美元，可选）</label>
+                  <input
+                    type="number"
+                    :value="a.max_daily_budget != null ? (a.max_daily_budget / 100) : ''"
+                    @input="onMaxBudgetInput($event, a)"
+                    class="input-number budget-cap-input"
+                    placeholder="不填则不限制"
+                    min="1"
+                    step="0.01"
+                  />
+                  <span class="action-hint">（实际调整广告组或广告系列预算）</span>
+                </template>
+                <template v-else>
                 <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select action-unit-select" title="调整单位">
                   <option value="percent">百分比</option>
                   <option value="usd">固定金额</option>
@@ -719,6 +753,7 @@
                     min="1"
                     step="0.01"
                   />
+                </template>
                 </template>
               </template>
               <span v-else class="placeholder">-</span>
@@ -868,7 +903,7 @@ export default {
     const ownersList = ref([])
     /** 选中的负责人 ID 列表，空表示「全部负责人」 */
     const selectedOwnerIds = ref([])
-    /** 是否同时筛选「负责人无」的管理员规则（users.owner_id IS NULL） */
+    /** 是否同时筛选「管理员创建」的规则（卡片负责人显示为“无”） */
     const includeNoOwner = ref(false)
     /** 负责人筛选下拉是否展开 */
     const ownerFilterOpen = ref(false)
@@ -1095,6 +1130,31 @@ export default {
     const executionTimeAllDay = ref(true)
     const executionTimeStart = ref('09:00')
     const executionTimeEnd = ref('18:00')
+    const BASE_METRIC_OPTIONS = [
+      { value: 'spend', label: '花费' },
+      { value: 'roas', label: 'ROAS' },
+      { value: 'cpa', label: '单次购买花费（CPA）' },
+      { value: 'cpc', label: 'CPC（花费/链接点击）' },
+      { value: 'add_to_cart_cost', label: '单次加购花费' },
+      { value: 'checkout_cost', label: '单次结账花费' },
+      { value: 'payment_cost', label: '单次添加支付信息花费' },
+      { value: 'purchases', label: '购买次数' },
+      { value: 'link_clicks', label: '链接点击' },
+      { value: 'add_to_cart_count', label: '加购次数' },
+      { value: 'initiate_checkout_count', label: '结账次数' },
+      { value: 'add_payment_info_count', label: '添加支付信息次数' }
+    ]
+    const AVG_PURCHASES_METRIC = { value: 'purchases_avg_after_create', label: '多天购买次数平均数' }
+    const conditionMetricOptions = computed(() =>
+      ruleForm.value.targetLevel === 'ad'
+        ? [...BASE_METRIC_OPTIONS, AVG_PURCHASES_METRIC]
+        : BASE_METRIC_OPTIONS
+    )
+    const dynamicBudgetMetricOptions = computed(() =>
+      ruleForm.value.targetLevel === 'ad'
+        ? [...BASE_METRIC_OPTIONS, AVG_PURCHASES_METRIC]
+        : BASE_METRIC_OPTIONS
+    )
     /** 监控范围条件对应的 API 过滤：后端 SQL 只返回匹配项 */
     const scopeStatusFilter = ref('')   // '' | active_only | paused_only | active_and_paused
     const scopeStatusExcludeFilter = ref('') // 状态「不等于」时传：ACTIVE | PAUSED | ACTIVE,PAUSED
@@ -1111,7 +1171,7 @@ export default {
 
     const isEditing = computed(() => !!editingRuleId.value)
     const hasBudgetAction = computed(() =>
-      (ruleForm.actions || []).some(a => a.type === 'increase_budget' || a.type === 'decrease_budget'))
+      (ruleForm.actions || []).some(a => ['increase_budget', 'decrease_budget', 'set_dynamic_budget'].includes(a.type)))
     const zeroClickTemplate = computed(() => templates.value.find(t => t.slug === 'zero_click') || null)
 
     /** 负责人筛选：触发器显示文案（未选=全部，已选=负责人名 + 可选"无"） */
@@ -1123,7 +1183,7 @@ export default {
           .map(o => o.owner_name || o.ownerName || String(o.id))
         if (names.length > 0) parts.push(names.join(', '))
       }
-      if (includeNoOwner.value) parts.push('无')
+      if (includeNoOwner.value) parts.push('管理员创建')
       return parts.length > 0 ? parts.join(' + ') : '全部 (不选=全部)'
     })
     /** 一键铺底按钮展示口径：仅非管理员、空规则列表时展示（按当前 owner 维度） */
@@ -1541,7 +1601,7 @@ export default {
       loadRules()
     }
 
-    /** 负责人筛选：切换"负责人无"选中状态并重新拉规则 */
+    /** 负责人筛选：切换"管理员创建"选中状态并重新拉规则 */
     const toggleNoOwnerOption = () => {
       includeNoOwner.value = !includeNoOwner.value
       loadRules()
@@ -1575,6 +1635,7 @@ export default {
         checkout_cost: '单次结账花费',
         payment_cost: '单次添加支付信息花费',
         purchases: '购买次数',
+        purchases_avg_after_create: '多天购买次数平均数',
         link_clicks: '链接点击',
         add_to_cart_count: '加购次数',
         initiate_checkout_count: '结账次数',
@@ -1587,7 +1648,7 @@ export default {
       return map[op] || op
     }
     const actionLabel = (t) => {
-      const map = { pause_ad: '暂停目标', activate_ad: '启用目标', increase_budget: '增加预算', decrease_budget: '减少预算', set_budget: '设置预算' }
+      const map = { pause_ad: '暂停目标', activate_ad: '启用目标', increase_budget: '增加预算', decrease_budget: '减少预算', set_budget: '设置预算', set_dynamic_budget: '设置动态预算值' }
       return map[t] || t
     }
     const getActionClass = (type) => {
@@ -1601,7 +1662,12 @@ export default {
         today: '今天',
         yesterday: '昨天',
         last_3_days: '近3天',
-        lifetime: '累计',
+        last_3_days_excluding_today: '近3天（不含今天）',
+        last_5_days: '近5天',
+        last_5_days_excluding_today: '近5天（不含今天）',
+        last_7_days: '近7天',
+        last_7_days_excluding_today: '近7天（不含今天）',
+        lifetime: '至今为止',
         custom_range: '自定义'
       }
       const base = map[w] || w
@@ -1832,6 +1898,10 @@ export default {
             n++
           }
         }
+        if (a?.type !== 'set_dynamic_budget' && a?.min_daily_budget != null && a?.max_daily_budget != null) {
+          a.max_daily_budget = undefined
+          n++
+        }
       }
       return n
     }
@@ -1969,6 +2039,11 @@ export default {
         if (a.value == null || a.value === '' || a.value < 0.01) a.value = 30
         a.max_daily_budget = undefined
         a.min_daily_budget = undefined
+      } else if (a.type === 'set_dynamic_budget') {
+        a.value = undefined
+        a.value_unit = 'usd'
+        a.metric = dynamicBudgetMetricOptions.value.some(opt => opt.value === a.metric) ? a.metric : 'purchases'
+        if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -1988,7 +2063,29 @@ export default {
       if (!selectedAccountIds.value?.length) return alert('请至少选择一个广告账户')
       if (!ruleForm.value.actions.length) return alert('请至少添加一个动作')
       for (const a of ruleForm.value.actions) {
-        if (a.type === 'set_budget') {
+        if (a.type === 'set_dynamic_budget') {
+          if (!dynamicBudgetMetricOptions.value.some(opt => opt.value === a.metric)) {
+            return alert('动态预算指标不支持当前目标层级')
+          }
+          const multiplier = Number(a.multiplier)
+          if (a.multiplier == null || a.multiplier === '' || !Number.isFinite(multiplier) || multiplier <= 0) {
+            return alert('动态预算倍率必须大于 0')
+          }
+          if (Math.abs(multiplier * 100 - Math.round(multiplier * 100)) >= 1e-6) {
+            return alert('动态预算倍率最多两位小数')
+          }
+          if (a.min_daily_budget != null) {
+            const min = Number(a.min_daily_budget)
+            if (!Number.isInteger(min) || min < 100) return alert('预算下限需为 >= 1 美元')
+          }
+          if (a.max_daily_budget != null) {
+            const max = Number(a.max_daily_budget)
+            if (!Number.isInteger(max) || max < 100) return alert('预算上限需为 >= 1 美元')
+          }
+          if (a.min_daily_budget != null && a.max_daily_budget != null && Number(a.min_daily_budget) > Number(a.max_daily_budget)) {
+            return alert('动态预算下限不能大于上限')
+          }
+        } else if (a.type === 'set_budget') {
           const v = Number(a.value)
           if (a.value == null || a.value === '' || !Number.isFinite(v) || v < 0.01 || v > 9999) {
             return alert('设置预算请填写 0.01–9999 的数值（美元）')
@@ -2030,6 +2127,9 @@ export default {
         if (!cr?.since || !cr?.until) return alert('自定义范围请填写起始和截止日期')
         if (cr.since > cr.until) return alert('起始日期不能晚于截止日期')
       }
+      if (ruleForm.value.targetLevel !== 'ad' && whenLines.value.some(line => line.metric === 'purchases_avg_after_create')) {
+        return alert('多天购买次数平均数第一版仅支持广告层规则')
+      }
 
       const maxDynamicMatches = Number(ruleForm.value.maxDynamicMatches ?? 1000)
       if (ruleForm.value.useDynamicScope) {
@@ -2050,7 +2150,14 @@ export default {
 
       const actionsPayload = (ruleForm.value.actions || []).map(a => {
         const out = { type: a.type, value: a.value }
-        if (a.type === 'set_budget') {
+        if (a.type === 'set_dynamic_budget') {
+          out.metric = a.metric || 'purchases'
+          out.multiplier = Number(a.multiplier)
+          out.value_unit = 'usd'
+          delete out.value
+          if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
+          if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
+        } else if (a.type === 'set_budget') {
           out.value_unit = 'usd'
         } else if (a.type === 'increase_budget') {
           out.value_unit = a.value_unit || 'percent'
@@ -2086,6 +2193,9 @@ export default {
         for (const objId of byAccount[acc]) {
           normalizedTargetIds.push(`${acc}:${objId}`)
         }
+      }
+      if (!ruleForm.value.useDynamicScope && normalizedTargetIds.length === 0) {
+        return alert('关闭动态筛选时，请至少选择一个目标对象，避免规则扩大到整个广告账户执行')
       }
       const payload = {
         ruleName: ruleForm.value.name.trim(),
@@ -2858,6 +2968,21 @@ export default {
       }
     )
 
+    watch(
+      () => ruleForm.value.targetLevel,
+      (next) => {
+        if (next === 'ad') return
+        for (const line of whenLines.value || []) {
+          if (line.metric === 'purchases_avg_after_create') line.metric = 'purchases'
+        }
+        for (const action of ruleForm.value.actions || []) {
+          if (action.type === 'set_dynamic_budget' && action.metric === 'purchases_avg_after_create') {
+            action.metric = 'purchases'
+          }
+        }
+      }
+    )
+
     watch(showRuleModal, (v) => {
       if (!v) syncJustDoneMessage.value = ''
     })
@@ -2871,6 +2996,15 @@ export default {
       if (a.value == null) return ''
       if (a.type === 'set_budget') return `=$${Number(a.value)}`
       return (a.value_unit === 'usd') ? `$${Number(a.value)}` : `${a.value}%`
+    }
+
+    const formatDynamicBudgetValue = (a) => {
+      const metric = metricLabel(a.metric || 'purchases')
+      const multiplier = Number(a.multiplier || 0)
+      const parts = [`${metric} × ${multiplier}`]
+      if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
+      if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
+      return parts.join('，')
     }
 
     /** 预算上限输入（美元 → 分）：展示用美元，后端存分；输入 0 视为未设置 */
@@ -2978,7 +3112,7 @@ export default {
       openBatchModal, closeBatchModal, toggleBatchAccount, selectAllBatchAccounts, clearBatchAccounts, submitBatchAddAccounts,
       isRuleCardExpanded, toggleRuleCardExpand, collapseAllRuleCards, expandAllRuleCards,
       visibleConditionsForCard, extraCondGroupsCount,
-      whenLines, whenTimeWindow, whenCustomRange,
+      whenLines, whenTimeWindow, whenCustomRange, conditionMetricOptions, dynamicBudgetMetricOptions,
       linesToV2Groups, v2ToLines, v1ToLines,
       createDefaultWhenLine, ensureWhenLinesNonEmpty, getDefaultWhenCustomRange,
       accounts, selectedAccountIds, accountToAdd, accountsFilteredForAdd, accountLabel, onAddAccount, removeAccount, selectAllAccounts, clearAllAccounts,
@@ -2995,7 +3129,7 @@ export default {
       showBootstrapButton, bootstrapLoading, bootstrapFromTemplates, bootstrapFeedback,
       refreshScopeItems, refreshScopeItemsWithSync, selectAllScope, clearScopeSelection, selectAllExcludeScope, clearExcludeScopeSelection,
       showSyncButton, syncJustDoneMessage, syncConfigFromMatch,
-      addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, onActionTypeChange,
+      addWhenLine, removeWhenLine, onWhenTimeWindowChange, addAction, onMaxBudgetInput, onMinBudgetInput, applyTemplate, formatBudgetValue, formatDynamicBudgetValue, onActionTypeChange,
       scopeConditionRows, SCOPE_CONDITION_MAX_ROWS, addScopeConditionRow, removeScopeConditionRow, onScopeConditionFieldChange, isScopeConditionsDisabled,
       scopeConditionRowError, scopeApplyMessage,
       executionTimeAllDay, executionTimeStart, executionTimeEnd, INTERVAL_PRESETS

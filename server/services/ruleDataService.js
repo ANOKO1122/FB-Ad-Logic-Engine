@@ -5,20 +5,20 @@
 import logger from '../utils/logger.js'
 import pool from '../db/connection.js'
 import { DateTime } from 'luxon'
-import { calculateTimeWindow, getTimeWindowForQuery } from '../utils/timeWindow.js'
+import { calculateTimeWindow } from '../utils/timeWindow.js'
 
-// 注意：DateTime 已在顶部导入，queryMultiDayWithToday 中可以直接使用
+// 注意：DateTime 已在顶部导入，queryMultiDayWindow 中可以直接使用
 
 /**
  * 智能路由：根据时间窗口选择数据源
- * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_7_days' | 'lifetime'
+ * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_3_days_excluding_today' | 'last_5_days' | 'last_5_days_excluding_today' | 'last_7_days' | 'last_7_days_excluding_today' | 'last_30_days' | 'lifetime'
  * @param {string} timezoneName - 账户时区（用于判断是否在 06:00 前）
  * @returns {Object} 路由信息 { source, needAggregation, fallback }
  * 
  * 【为什么需要智能路由？】
  * - today：数据在 ad_snapshots（热数据，实时更新）
  * - yesterday：数据在 daily_stats（冷数据，06:00 归档），但 06:00 前需要降级
- * - last_3_days/last_7_days：数据在 daily_stats（多天聚合），需要动态重算
+ * - 多天窗口：数据在 daily_stats（多天聚合），必要时补今天 ad_snapshots
  */
 function selectDataSource(timeWindow, timezoneName = 'UTC') {
   switch (timeWindow) {
@@ -50,7 +50,11 @@ function selectDataSource(timeWindow, timezoneName = 'UTC') {
       }
     
     case 'last_3_days':  // 统一命名（不是 last_3d）
+    case 'last_3_days_excluding_today':
+    case 'last_5_days':
+    case 'last_5_days_excluding_today':
     case 'last_7_days':   // 统一命名（不是 last_7d）
+    case 'last_7_days_excluding_today':
     case 'last_30_days':  // 优先级2任务：扩展时间窗口支持
     case 'lifetime':
       // 第16-19行：多天窗口 → daily_stats（冷数据，已聚合）
@@ -97,6 +101,179 @@ function isBeforeArchiveTime(timezoneName) {
   // 第3行：如果当前时间早于今日 06:00，返回 true（需要降级）
   // 例如：当前是 05:30，返回 true；当前是 07:00，返回 false
   return now < archiveTime
+}
+
+function doesWindowIncludeToday(start, end, timezoneName) {
+  const today = DateTime.now().setZone(timezoneName).toFormat('yyyy-MM-dd')
+  const startDate = start.toFormat('yyyy-MM-dd')
+  const endDate = end.toFormat('yyyy-MM-dd')
+  return startDate <= today && endDate >= today
+}
+
+function isLifetimeWindow(timeWindow) {
+  return timeWindow === 'lifetime'
+}
+
+function toIsoDateInTimezone(createdTime, timezoneName) {
+  const raw = String(createdTime || '').trim()
+  if (!raw) return null
+  try {
+    const dt = DateTime.fromISO(raw, { setZone: true })
+    if (!dt.isValid) return null
+    return dt.setZone(timezoneName).toFormat('yyyy-MM-dd')
+  } catch {
+    return null
+  }
+}
+
+function buildLifetimeEffectiveRange(createdSinceByAd, timezoneName) {
+  if (!(createdSinceByAd instanceof Map) || createdSinceByAd.size === 0) return null
+
+  const earliestCreatedDate = [...createdSinceByAd.values()].sort()[0]
+  if (!earliestCreatedDate) return null
+
+  const effectiveStart = DateTime.fromISO(earliestCreatedDate, { zone: timezoneName }).startOf('day')
+  if (!effectiveStart.isValid) return null
+
+  return {
+    start_date: earliestCreatedDate,
+    start: {
+      local: effectiveStart.toFormat('yyyy-MM-dd HH:mm:ss'),
+      utc: effectiveStart.toUTC().toFormat('yyyy-MM-dd HH:mm:ss'),
+      iso: effectiveStart.toISO()
+    }
+  }
+}
+
+async function loadCreatedSinceByAd(accountId, adIds, timezoneName, options = {}) {
+  const warnMissingForLifetime = options?.warnMissingForLifetime === true
+  const warnings = []
+  const createdSinceByAd = new Map()
+  const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds]).map(id => String(id || '').trim()).filter(Boolean)
+  const hasAdFilter = adIdArray != null && adIdArray.length > 0
+
+  const sql = `
+    SELECT ad_id, created_time
+    FROM structure_ads
+    WHERE account_id = ?
+      ${hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''}
+  `
+  const [rows] = await pool.execute(sql, [accountId, ...(hasAdFilter ? adIdArray : [])])
+  const rowMap = new Map()
+  for (const row of rows || []) {
+    const adId = String(row.ad_id || '').trim()
+    if (!adId) continue
+    rowMap.set(adId, row)
+    const createdSince = toIsoDateInTimezone(row.created_time, timezoneName)
+    if (createdSince) createdSinceByAd.set(adId, createdSince)
+    else if (warnMissingForLifetime) {
+      warnings.push({
+        code: 'CREATED_TIME_MISSING',
+        message: `广告 ${adId} 缺少有效 created_time，lifetime 已回退为最早可查指标起点`
+      })
+    }
+  }
+
+  if (hasAdFilter) {
+    for (const adId of adIdArray) {
+      if (warnMissingForLifetime && !rowMap.has(adId)) {
+        warnings.push({
+          code: 'CREATED_TIME_MISSING',
+          message: `广告 ${adId} 未在 structure_ads 找到创建时间，lifetime 已回退为最早可查指标起点`
+        })
+      }
+    }
+  }
+  return { createdSinceByAd, warnings }
+}
+
+function normalizeDateOnly(value, timezoneName = 'UTC') {
+  if (value == null) return null
+  if (value instanceof Date) return value.toISOString().slice(0, 10)
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
+  const dt = DateTime.fromISO(raw, { setZone: true })
+  if (dt.isValid) return dt.setZone(timezoneName).toFormat('yyyy-MM-dd')
+  return raw.slice(0, 10)
+}
+
+function addDaysToDate(dateText, days, timezoneName = 'UTC') {
+  const dt = DateTime.fromISO(dateText, { zone: timezoneName }).startOf('day')
+  if (!dt.isValid) return null
+  return dt.plus({ days }).toFormat('yyyy-MM-dd')
+}
+
+function countInclusiveDays(startDate, endDate, timezoneName = 'UTC') {
+  const start = DateTime.fromISO(startDate, { zone: timezoneName }).startOf('day')
+  const end = DateTime.fromISO(endDate, { zone: timezoneName }).startOf('day')
+  if (!start.isValid || !end.isValid || end < start) return 0
+  return Math.floor(end.diff(start, 'days').days) + 1
+}
+
+function augmentPurchasesAverageAfterCreate(rows, sourceDailyRows, {
+  windowStartDate,
+  windowEndDate,
+  createdDateByAd,
+  timezoneName
+}) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows
+  const createdMap = createdDateByAd instanceof Map ? createdDateByAd : new Map()
+  const purchasesByAdDate = new Map()
+
+  for (const row of sourceDailyRows || []) {
+    const adId = String(row?.ad_id || '').trim()
+    const rowDate = normalizeDateOnly(row?.date ?? row?.data_date, timezoneName)
+    if (!adId || !rowDate) continue
+    const key = `${adId}:${rowDate}`
+    purchasesByAdDate.set(key, (purchasesByAdDate.get(key) || 0) + Number(row?.purchases || 0))
+  }
+
+  return rows.map((row) => {
+    const adId = String(row?.ad_id || '').trim()
+    const createdDate = createdMap.get(adId)
+    const effectiveStart = createdDate ? addDaysToDate(createdDate, 1, timezoneName) : null
+    const rangeStart = effectiveStart && effectiveStart > windowStartDate ? effectiveStart : windowStartDate
+    const effectiveDays = createdDate ? countInclusiveDays(rangeStart, windowEndDate, timezoneName) : 0
+
+    if (!adId || !createdDate || effectiveDays <= 0) {
+      return {
+        ...row,
+        purchases_avg_after_create: null,
+        purchases_avg_after_create_days: 0,
+        purchases_avg_after_create_range: {
+          window_start_date: windowStartDate,
+          window_end_date: windowEndDate,
+          created_date: createdDate || null,
+          effective_start_date: null,
+          effective_end_date: windowEndDate
+        }
+      }
+    }
+
+    let effectivePurchases = 0
+    let cursor = DateTime.fromISO(rangeStart, { zone: timezoneName }).startOf('day')
+    const end = DateTime.fromISO(windowEndDate, { zone: timezoneName }).startOf('day')
+    while (cursor.isValid && end.isValid && cursor <= end) {
+      const dateKey = cursor.toFormat('yyyy-MM-dd')
+      effectivePurchases += purchasesByAdDate.get(`${adId}:${dateKey}`) || 0
+      cursor = cursor.plus({ days: 1 })
+    }
+
+    return {
+      ...row,
+      purchases_avg_after_create: effectivePurchases / effectiveDays,
+      purchases_avg_after_create_days: effectiveDays,
+      purchases_avg_after_create_range: {
+        window_start_date: windowStartDate,
+        window_end_date: windowEndDate,
+        created_date: createdDate,
+        effective_start_date: rangeStart,
+        effective_end_date: windowEndDate,
+        purchases: effectivePurchases
+      }
+    }
+  })
 }
 
 /**
@@ -162,7 +339,7 @@ export async function getDataTimezone(accountId, adIds, accountTimezone) {
  * 查询规则数据（主入口函数）
  * @param {string} accountId - Facebook 账户ID
  * @param {string|Array} adIds - 广告ID（单个或数组）
- * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_7_days' | 'last_30_days' | 'lifetime' | 'custom_range'
+ * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_3_days_excluding_today' | 'last_5_days' | 'last_5_days_excluding_today' | 'last_7_days' | 'last_7_days_excluding_today' | 'last_30_days' | 'lifetime' | 'custom_range'
  * @param {string} timezoneName - 账户时区（可选，如果不提供则从数据库查询）
  * @param {Object} customRange - 自定义时间范围（仅当 timeWindow='custom_range' 时使用）：{ since: 'YYYY-MM-DD', until: 'YYYY-MM-DD' }
  * @returns {Promise<{data: Array, warnings: Array}>} 返回对象，包含数据数组和警告信息
@@ -201,7 +378,7 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
     // today 查询：优先使用快照时区
     dataTimezoneUsed = await getDataTimezone(accountId, adIds, timezoneName)
   }
-  // 多天窗口（last_3_days/last_7_days/last_30_days/custom_range）：使用账户时区
+  // 多天窗口（包含不含今天窗口、lifetime、custom_range）：使用账户时区
   // 因为 daily_stats 归档时使用的是账户时区，所以查询时也应该用账户时区
   
   // 第9行：智能路由：根据时间窗口选择数据源
@@ -241,18 +418,31 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
   // route.fallback 表示是否为降级查询（yesterday 在 06:00 前）
   // 阶段A修复：多天窗口也使用 data_timezone_used，确保时区匹配
   let warnings = []  // 初始化 warnings 数组，用于记录降级等信息
+  let createdSinceByAd = null
+  let createdDateByAd = null
+  let effectiveRange = null
+
+  const createdLoad = await loadCreatedSinceByAd(accountId, adIds, dataTimezoneUsed, {
+    warnMissingForLifetime: isLifetimeWindow(timeWindow)
+  })
+  createdDateByAd = createdLoad.createdSinceByAd
+  if (isLifetimeWindow(timeWindow)) {
+    createdSinceByAd = createdDateByAd
+    effectiveRange = buildLifetimeEffectiveRange(createdSinceByAd, dataTimezoneUsed)
+    warnings.push(...createdLoad.warnings)
+  }
   
   if (route.source === 'ad_snapshots') {
     rawData = await queryAdSnapshots(accountId, adIds, timeWindow, dataTimezoneUsed, route.fallback, customRange)
   } else if (route.source === 'daily_stats') {
-    // 阶段B：合并查询（历史+今天）
-    // 对于多天窗口（last_3_days/last_7_days/last_30_days/custom_range），使用合并查询
+    // 阶段B：按窗口查询历史段与可选今天段
+    // 对于多天窗口（含/不含今天）与 lifetime/custom_range，统一使用多天查询
     // 历史段（start → 昨天）：从 daily_stats 查询
-    // 今天段：从 ad_snapshots 查询（今天最后快照）
+    // 今天段（窗口包含今天时）：从 ad_snapshots 查询（今天最后快照）
     // 合并后调用 aggregateMultiDayMetrics 聚合
     if (route.needAggregation) {
       // 多天窗口：使用合并查询
-      const mergedResult = await queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezoneUsed, customRange)
+      const mergedResult = await queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange, createdSinceByAd, createdDateByAd)
       rawData = mergedResult.data
       warnings.push(...mergedResult.warnings)
     } else {
@@ -276,22 +466,32 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
   // 第18-21行：如果需要聚合（多天窗口），进行动态聚合计算
   // 为什么需要聚合？因为多天窗口必须用"总分子/总分母"重算，避免辛普森悖论
   // aggregateMultiDayMetrics 函数会按 ad_id 分组，然后重算所有单价/比率类指标
-  // 注意：queryMultiDayWithToday 已经做了聚合，这里不需要再次聚合
+  // 注意：queryMultiDayWindow 已经做了聚合，这里不需要再次聚合
   let resultData = []
   if (route.needAggregation && rawData.length > 0) {
-    // queryMultiDayWithToday 已经聚合过了，直接使用
+    // queryMultiDayWindow 已经聚合过了，直接使用
     resultData = rawData
   } else {
     // 第22-23行：单天数据直接返回，但需要计算单价/比率类指标（含除零保护）
     // calculateSingleDayMetrics 函数会确保所有除法运算都有分母检查
     resultData = rawData.map(day => calculateSingleDayMetrics(day))
+    if (resultData.length > 0) {
+      const metricWindow = calculateTimeWindow(timeWindow, dataTimezoneUsed, customRange)
+      resultData = augmentPurchasesAverageAfterCreate(resultData, rawData, {
+        windowStartDate: metricWindow.start.toFormat('yyyy-MM-dd'),
+        windowEndDate: metricWindow.end.toFormat('yyyy-MM-dd'),
+        createdDateByAd,
+        timezoneName: dataTimezoneUsed
+      })
+    }
   }
   
   // 阶段A-2：返回数据数组和 warnings
   // 修改返回值结构，支持 warnings 传递到 API 层
   return {
     data: resultData,
-    warnings: warnings
+    warnings: warnings,
+    effective_range: effectiveRange
   }
 }
 
@@ -371,6 +571,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             payment_cost,
             mute_until,
             mute_reason,
+            data_date,
             synced_at,
             ROW_NUMBER() OVER (
               PARTITION BY account_id, ad_id
@@ -425,6 +626,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             payment_cost,
             mute_until,
             mute_reason,
+            data_date,
             synced_at,
             ROW_NUMBER() OVER (
               PARTITION BY account_id, ad_id 
@@ -465,6 +667,8 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
       campaign_id: row.campaign_id ?? null,
       owner_id: row.owner_id,
       status: row.status,
+      date: row.data_date,
+      data_date: row.data_date,
       // 绝对值指标（直接转换）
       spend: parseFloat(row.spend || 0),
       purchases: parseInt(row.purchases || 0),
@@ -498,19 +702,21 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
 }
 
 /**
- * 阶段B：合并查询（历史+今天）
- * 历史段（start → 昨天）：从 daily_stats 查询
- * 今天段：从 ad_snapshots 查询（今天最后快照）
+ * 阶段B：多天窗口合并查询（历史 + 可选今天）
+ * 历史段（start → min(end, 昨天)）：从 daily_stats 查询
+ * 今天段（窗口包含今天时）：从 ad_snapshots 查询（今天最后快照）
  * 合并后调用 aggregateMultiDayMetrics 聚合
  * 
  * @param {string} accountId - 账户ID
  * @param {string|Array} adIds - 广告ID（单个或数组）
- * @param {string} timeWindow - 时间窗口（last_3_days/last_7_days/last_30_days/custom_range）
+ * @param {string} timeWindow - 时间窗口（支持含今天/不含今天/lifetime/custom_range）
  * @param {string} dataTimezoneUsed - 数据时区（用于查询）
  * @param {Object} customRange - 自定义时间范围（仅当 timeWindow='custom_range' 时使用）
+ * @param {Map<string, string>|null} createdSinceByAd - lifetime 模式下 ad_id -> 创建日（YYYY-MM-DD）
+ * @param {Map<string, string>|null} createdDateByAd - 计算创建日后购买均值用的 ad_id -> 创建日
  * @returns {Promise<{data: Array, warnings: Array}>} 返回合并后的数据和 warnings
  */
-async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezoneUsed, customRange = null) {
+async function queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange = null, createdSinceByAd = null, createdDateByAd = null) {
   const warnings = []
   
   // 1. 计算时间窗口（用于确定历史段和今天段）
@@ -522,99 +728,111 @@ async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezone
   // 使用 dataTimezoneUsed 计算"昨天"，确保与数据时区一致
   const now = DateTime.now().setZone(dataTimezoneUsed)
   const yesterday = now.minus({ days: 1 })
+  let startDate = start.toFormat('yyyy-MM-dd')
+  const windowStartDate = startDate
+  const endDate = end.toFormat('yyyy-MM-dd')
   const yesterdayDate = yesterday.toFormat('yyyy-MM-dd')
   const todayDate = now.toFormat('yyyy-MM-dd')
-  
-  // 3. 查询历史段（start → 昨天）：从 daily_stats
-  let historyData = []
-  try {
-    // 检查 daily_stats 中是否有数据，以及时区分布
-    const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds])
-    const hasAdFilter = adIdArray != null && adIdArray.length > 0
-    
-    // 先查询时区分布，检查是否有不匹配
-    const [timezoneRows] = await pool.execute(`
-      SELECT DISTINCT timezone_name, COUNT(*) as count
-      FROM daily_stats
-      WHERE account_id = ?
-        ${hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''}
-        AND date >= ? AND date <= ?
-      GROUP BY timezone_name
-    `, [
-      accountId,
-      ...(hasAdFilter ? adIdArray : []),
-      start.toFormat('yyyy-MM-dd'),
-      yesterdayDate
-    ])
-    
-    // 步骤1：先用 data_timezone_used 查询历史数据（按自然日计算）
-    // daily_stats.date 是 DATE 类型，自然日按 data_timezone_used 计算，不要转 UTC
-    const historyCustomRange = {
-      since: start.toFormat('yyyy-MM-dd'),
-      until: yesterdayDate
+  const includeToday = doesWindowIncludeToday(start, end, dataTimezoneUsed)
+  if (isLifetimeWindow(timeWindow) && createdSinceByAd && createdSinceByAd.size > 0) {
+    const earliestCreatedDate = [...createdSinceByAd.values()].sort()[0]
+    if (earliestCreatedDate && earliestCreatedDate > startDate) {
+      startDate = earliestCreatedDate
     }
-    historyData = await queryDailyStatsForRange(accountId, adIds, historyCustomRange, dataTimezoneUsed)
-    
-    // 步骤2：检查时区不匹配，并确定是否需要二次查询
-    let historyQueryTimezone = dataTimezoneUsed  // 默认使用查询时区
-    if (timezoneRows.length > 0) {
-      const timezones = timezoneRows.map(r => r.timezone_name)
-      const hasMismatch = !timezones.includes(dataTimezoneUsed)
-      if (hasMismatch) {
-        // 时区不匹配：使用数据实际时区查询历史数据（使用第一个时区）
-        // 这样可以确保能查询到历史数据，而不是因为时区过滤导致空结果
-        historyQueryTimezone = timezones[0]
-        warnings.push({
-          code: 'TIMEZONE_MISMATCH',
-          message: `历史数据时区（${timezones.join(', ')}）与查询时区（${dataTimezoneUsed}）不匹配，已使用数据时区（${historyQueryTimezone}）查询历史数据`
-        })
-        
-        // 如果第一次查询（用 data_timezone_used）结果为空，二次尝试用数据实际时区查询
-        if (historyData.length === 0) {
-          historyData = await queryDailyStatsForRange(accountId, adIds, historyCustomRange, historyQueryTimezone)
+  }
+  const includeHistory = startDate <= (includeToday ? yesterdayDate : endDate)
+  
+  // 3. 查询历史段（start → min(end, 昨天)）：从 daily_stats
+  let historyData = []
+  if (includeHistory) {
+    try {
+      // 检查 daily_stats 中是否有数据，以及时区分布
+      const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds])
+      const hasAdFilter = adIdArray != null && adIdArray.length > 0
+      const historyUntil = includeToday ? yesterdayDate : endDate
+
+      // 先查询时区分布，检查是否有不匹配
+      const [timezoneRows] = await pool.execute(`
+        SELECT DISTINCT timezone_name, COUNT(*) as count
+        FROM daily_stats
+        WHERE account_id = ?
+          ${hasAdFilter ? `AND ad_id IN (${adIdArray.map(() => '?').join(', ')})` : ''}
+          AND date >= ? AND date <= ?
+        GROUP BY timezone_name
+      `, [
+        accountId,
+        ...(hasAdFilter ? adIdArray : []),
+        startDate,
+        historyUntil
+      ])
+
+      // 步骤1：先用 data_timezone_used 查询历史数据（按自然日计算）
+      // daily_stats.date 是 DATE 类型，自然日按 data_timezone_used 计算，不要转 UTC
+      const historyCustomRange = { since: startDate, until: historyUntil }
+      historyData = await queryDailyStatsForRange(accountId, adIds, historyCustomRange, dataTimezoneUsed, createdSinceByAd)
+
+      // 步骤2：检查时区不匹配，并确定是否需要二次查询
+      let historyQueryTimezone = dataTimezoneUsed  // 默认使用查询时区
+      if (timezoneRows.length > 0) {
+        const timezones = timezoneRows.map(r => r.timezone_name)
+        const hasMismatch = !timezones.includes(dataTimezoneUsed)
+        if (hasMismatch) {
+          // 时区不匹配：使用数据实际时区查询历史数据（使用第一个时区）
+          historyQueryTimezone = timezones[0]
+          warnings.push({
+            code: 'TIMEZONE_MISMATCH',
+            message: `历史数据时区（${timezones.join(', ')}）与查询时区（${dataTimezoneUsed}）不匹配，已使用数据时区（${historyQueryTimezone}）查询历史数据`
+          })
+
+          // 如果第一次查询（用 data_timezone_used）结果为空，二次尝试用数据实际时区查询
+          if (historyData.length === 0) {
+            historyData = await queryDailyStatsForRange(accountId, adIds, historyCustomRange, historyQueryTimezone, createdSinceByAd)
+          }
         }
       }
-    }
-    
-    // 步骤3：如果历史数据为空，记录 warning（但只有在确实没有数据时才记录）
-    // 判断逻辑：
-    // - 如果 timezoneRows.length === 0：说明时区检查也没有找到数据，确实为空
-    // - 如果 timezoneRows.length > 0 但 historyData.length === 0：说明即使用了数据实际时区查询仍为空
-    // 这两种情况都应该记录 HISTORY_EMPTY
-    if (historyData.length === 0) {
-      if (timezoneRows.length === 0) {
-        // 时区检查也没有找到数据，确实为空
-        warnings.push({
-          code: 'HISTORY_EMPTY',
-          message: '历史数据（daily_stats）为空，仅返回今天的数据'
-        })
-      } else {
-        // 检测到有数据但时区不匹配，且用数据实际时区查询后仍为空
-        // 这种情况可能是：数据存在但日期范围不匹配，或者确实没有数据
-        warnings.push({
-          code: 'HISTORY_EMPTY',
-          message: `历史数据（daily_stats）在指定时间范围内为空，仅返回今天的数据（检测到时区不匹配：${timezoneRows.map(r => r.timezone_name).join(', ')}）`
-        })
+
+      // 步骤3：如果历史数据为空，记录 warning（但只有在确实没有数据时才记录）
+      if (historyData.length === 0) {
+        if (timezoneRows.length === 0) {
+          warnings.push({
+            code: 'HISTORY_EMPTY',
+            message: includeToday ? '历史数据（daily_stats）为空，仅返回今天的数据' : '历史数据（daily_stats）为空'
+          })
+        } else {
+          warnings.push({
+            code: 'HISTORY_EMPTY',
+            message: `${includeToday ? '历史数据（daily_stats）在指定时间范围内为空，仅返回今天的数据' : '历史数据（daily_stats）在指定时间范围内为空'}（检测到时区不匹配：${timezoneRows.map(r => r.timezone_name).join(', ')}）`
+          })
+        }
       }
+    } catch (error) {
+      logger.warn(`⚠️  查询历史数据失败${includeToday ? '，仅使用今天的数据' : ''}:`, error.message)
+      warnings.push({
+        code: 'HISTORY_QUERY_FAILED',
+        message: `查询历史数据失败: ${error.message}${includeToday ? '，仅返回今天的数据' : ''}`
+      })
     }
-  } catch (error) {
-    logger.warn(`⚠️  查询历史数据失败，仅使用今天的数据:`, error.message)
-    warnings.push({
-      code: 'HISTORY_QUERY_FAILED',
-      message: `查询历史数据失败: ${error.message}，仅返回今天的数据`
-    })
   }
   
   // 4. 查询今天段：从 ad_snapshots（今天最后快照）
   let todayData = []
-  try {
-    todayData = await queryAdSnapshots(accountId, adIds, 'today', dataTimezoneUsed, false, null)
-  } catch (error) {
-    logger.warn(`⚠️  查询今天数据失败:`, error.message)
-    warnings.push({
-      code: 'TODAY_QUERY_FAILED',
-      message: `查询今天数据失败: ${error.message}`
-    })
+  if (includeToday) {
+    try {
+      todayData = await queryAdSnapshots(accountId, adIds, 'today', dataTimezoneUsed, false, null)
+      if (createdSinceByAd && createdSinceByAd.size > 0) {
+        todayData = todayData.filter((row) => {
+          const adId = String(row.ad_id || '').trim()
+          const createdSince = createdSinceByAd.get(adId)
+          return !createdSince || createdSince <= todayDate
+        })
+      }
+    } catch (error) {
+      logger.warn(`⚠️  查询今天数据失败:`, error.message)
+      warnings.push({
+        code: 'TODAY_QUERY_FAILED',
+        message: `查询今天数据失败: ${error.message}`
+      })
+    }
   }
   
   // 5. 合并数据（历史 + 今天）
@@ -626,7 +844,12 @@ async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezone
   }
   
   // 7. 聚合合并后的数据（避免辛普森悖论）
-  const aggregated = aggregateMultiDayMetrics(mergedData)
+  const aggregated = augmentPurchasesAverageAfterCreate(aggregateMultiDayMetrics(mergedData), mergedData, {
+    windowStartDate,
+    windowEndDate: endDate,
+    createdDateByAd,
+    timezoneName: dataTimezoneUsed
+  })
   
   return {
     data: aggregated,
@@ -640,9 +863,10 @@ async function queryMultiDayWithToday(accountId, adIds, timeWindow, dataTimezone
  * @param {string|Array} adIds - 广告ID（单个或数组）
  * @param {Object} dateRange - 日期范围：{ since: 'YYYY-MM-DD', until: 'YYYY-MM-DD' }
  * @param {string} timezoneName - 时区
+ * @param {Map<string, string>|null} createdSinceByAd - lifetime 模式下 ad_id -> 创建日（YYYY-MM-DD）
  * @returns {Promise<Array>} 数据数组
  */
-async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName) {
+async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName, createdSinceByAd = null) {
   try {
     const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds])
     const hasAdFilter = adIdArray != null && adIdArray.length > 0
@@ -684,7 +908,7 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
     
     const [rows] = await pool.execute(sql, params)
     
-    return rows.map(row => ({
+    let mapped = rows.map(row => ({
       account_id: row.account_id,
       ad_id: row.ad_id,
       ad_name: row.ad_name,
@@ -704,6 +928,17 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
       cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null
     }))
+    if (createdSinceByAd && createdSinceByAd instanceof Map) {
+      mapped = mapped.filter((row) => {
+        const adId = String(row.ad_id || '').trim()
+        const createdSince = createdSinceByAd.get(adId)
+        const rowDate = row.date instanceof Date
+          ? row.date.toISOString().slice(0, 10)
+          : String(row.date || '').slice(0, 10)
+        return !createdSince || (rowDate && rowDate >= createdSince)
+      })
+    }
+    return mapped
   } catch (error) {
     logger.error(`❌ 查询 daily_stats 失败 (accountId: ${accountId}):`, error.message)
     throw error
@@ -987,6 +1222,8 @@ function calculateSingleDayMetrics(dailyStats) {
     campaign_id: dailyStats.campaign_id ?? null,  // CBO 执行层需要
     owner_id: dailyStats.owner_id,
     status: dailyStats.status,
+    date: dailyStats.date ?? dailyStats.data_date ?? null,
+    data_date: dailyStats.data_date ?? dailyStats.date ?? null,
     mute_until: dailyStats.mute_until,
     mute_reason: dailyStats.mute_reason,
 
@@ -1071,7 +1308,7 @@ export async function getAccountTimezone(accountId) {
  * @param {string} accountId - 广告账户ID
  * @param {string[]} objectIds - 同层对象 ID 列表（ad_id / ad_set_id / campaign_id）
  * @param {string} level - 目标层级：ad | adset | campaign
- * @param {string} timeWindow - 时间窗口：today | yesterday | last_3_days | last_7_days | last_30_days | lifetime | custom_range
+ * @param {string} timeWindow - 时间窗口：today | yesterday | last_3_days | last_3_days_excluding_today | last_5_days | last_5_days_excluding_today | last_7_days | last_7_days_excluding_today | last_30_days | lifetime | custom_range
  * @param {string} timezoneName - 账户时区
  * @param {Object} [customRange] - 自定义时间范围 { since, until }
  * @returns {Promise<{data: Array, warnings: Array}>} 聚合后的数据数组
@@ -1094,16 +1331,31 @@ export async function queryRuleDataByLevel(accountId, objectIds, level, timeWind
   const todayDate = nowInZone.toFormat('yyyy-MM-dd')
   const yesterdayDate = nowInZone.minus({ days: 1 }).toFormat('yyyy-MM-dd')
   const includeToday = startDate <= todayDate && endDate >= todayDate
-  const historySince = startDate
-  const historyUntil = endDate < yesterdayDate ? endDate : yesterdayDate
-  const includeHistory = historySince <= historyUntil
   const levelColumn = validLevel === 'adset' ? 'ad_set_id' : 'campaign_id'
   const statusSourceRef = validLevel === 'adset'
     ? 'structure_adsets.effective_status'
     : 'structure_campaigns.effective_status'
 
   const warnings = []
-  const objectMetaById = await loadObjectMetaByLevel(accountId, validLevel, allIds)
+  const objectMetaById = await loadObjectMetaByLevel(accountId, validLevel, allIds, timezoneName)
+  const lifetimeCreatedSinceList = []
+  for (const objectId of allIds) {
+    const createdSince = objectMetaById.get(objectId)?.createdSince || null
+    if (isLifetimeWindow(timeWindow)) {
+      if (createdSince) lifetimeCreatedSinceList.push(createdSince)
+      else warnings.push({
+        code: 'CREATED_TIME_MISSING',
+        message: `${validLevel} ${objectId} 缺少有效 created_time，lifetime 已回退为最早可查指标起点`
+      })
+    }
+  }
+
+  let historySince = startDate
+  if (isLifetimeWindow(timeWindow) && lifetimeCreatedSinceList.length > 0) {
+    historySince = lifetimeCreatedSinceList.sort()[0]
+  }
+  const historyUntil = endDate < yesterdayDate ? endDate : yesterdayDate
+  const includeHistory = historySince <= historyUntil
 
   const aggregateRows = await queryLevelAggregateRows({
     accountId,
@@ -1177,12 +1429,16 @@ export async function queryRuleDataByLevel(accountId, objectIds, level, timeWind
         ? {
             adset_id: objectId,
             adset_name: objectMeta?.name || null,
-            campaign_id: objectMeta?.campaignId || null
+            campaign_id: objectMeta?.campaignId || null,
+            adset_status: objectMeta?.status || null
           }
         : {
             campaign_id: objectId,
-            campaign_name: objectMeta?.name || null
+            campaign_name: objectMeta?.name || null,
+            campaign_status: objectMeta?.status || null
           }),
+      status: objectMeta?.status || null,
+      object_status: objectMeta?.status || null,
       ad_id: null,
       ad_name: null,
       spend,
@@ -1204,7 +1460,8 @@ export async function queryRuleDataByLevel(accountId, objectIds, level, timeWind
         window: {
           timeWindow,
           timezoneName,
-          customRange: customRange || null
+          customRange: customRange || null,
+          createdSince: objectMeta?.createdSince || null
         },
         children,
         aggregate: {
@@ -1231,7 +1488,7 @@ export async function queryRuleDataByLevel(accountId, objectIds, level, timeWind
   return { data: results, warnings }
 }
 
-async function loadObjectMetaByLevel(accountId, level, objectIds) {
+async function loadObjectMetaByLevel(accountId, level, objectIds, timezoneName = 'UTC') {
   const metaMap = new Map()
   const safeIds = [...new Set((objectIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
   if (safeIds.length === 0 || level === 'ad') return metaMap
@@ -1239,7 +1496,7 @@ async function loadObjectMetaByLevel(accountId, level, objectIds) {
   const placeholders = safeIds.map(() => '?').join(',')
   if (level === 'adset') {
     const [rows] = await pool.execute(
-      `SELECT adset_id, name, campaign_id
+      `SELECT adset_id, name, campaign_id, COALESCE(effective_status, status) AS status, created_time
        FROM structure_adsets
        WHERE account_id = ?
          AND adset_id IN (${placeholders})`,
@@ -1250,14 +1507,16 @@ async function loadObjectMetaByLevel(accountId, level, objectIds) {
       if (!adsetId) continue
       metaMap.set(adsetId, {
         name: row.name || null,
-        campaignId: row.campaign_id ? String(row.campaign_id) : null
+        campaignId: row.campaign_id ? String(row.campaign_id) : null,
+        status: row.status ? String(row.status).toUpperCase() : null,
+        createdSince: toIsoDateInTimezone(row.created_time, timezoneName)
       })
     }
     return metaMap
   }
 
   const [rows] = await pool.execute(
-    `SELECT campaign_id, name
+    `SELECT campaign_id, name, COALESCE(effective_status, status) AS status, created_time
      FROM structure_campaigns
      WHERE account_id = ?
        AND campaign_id IN (${placeholders})`,
@@ -1267,7 +1526,9 @@ async function loadObjectMetaByLevel(accountId, level, objectIds) {
     const campaignId = String(row.campaign_id || '').trim()
     if (!campaignId) continue
     metaMap.set(campaignId, {
-      name: row.name || null
+      name: row.name || null,
+      status: row.status ? String(row.status).toUpperCase() : null,
+      createdSince: toIsoDateInTimezone(row.created_time, timezoneName)
     })
   }
   return metaMap

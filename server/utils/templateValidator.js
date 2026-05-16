@@ -3,17 +3,29 @@
  * 校验 when_lines、when_time_window、when_custom_range、actions
  */
 
-const VALID_TIME_WINDOWS = ['today', 'yesterday', 'last_3_days', 'last_7_days', 'last_30_days', 'lifetime', 'custom_range']
+const VALID_TIME_WINDOWS = [
+  'today',
+  'yesterday',
+  'last_3_days',
+  'last_3_days_excluding_today',
+  'last_5_days',
+  'last_5_days_excluding_today',
+  'last_7_days',
+  'last_7_days_excluding_today',
+  'last_30_days',
+  'lifetime',
+  'custom_range'
+]
 // M1 合同：持久化动作枚举不变（旧枚举继续入库，执行层按 targetLevel 解释）
 // pause_ad/activate_ad 在数据库中保持不变，执行时根据 targetLevel 决定实际目标层级
-const VALID_ACTION_TYPES = ['pause_ad', 'activate_ad', 'increase_budget', 'decrease_budget', 'set_budget']
+const VALID_ACTION_TYPES = ['pause_ad', 'activate_ad', 'increase_budget', 'decrease_budget', 'set_budget', 'set_dynamic_budget']
 /** value_unit：percent=百分比增减，usd=固定美元增减 */
 const VALID_VALUE_UNITS = ['percent', 'usd']
 /** 与 RuleManager/AdminTemplates 前端下拉、ruleDataService 读侧口径对齐，见 docs/0指标清单，字段清单.md */
 const VALID_METRICS = [
   'spend', 'roas', 'cpa', 'cpc', 'purchases', 'link_clicks',
   'add_to_cart_count', 'add_to_cart_cost', 'initiate_checkout_count', 'checkout_cost',
-  'add_payment_info_count', 'payment_cost'
+  'add_payment_info_count', 'payment_cost', 'purchases_avg_after_create'
 ]
 const VALID_OPERATORS = ['gt', 'lt', 'gte', 'lte', 'eq']
 
@@ -41,13 +53,14 @@ export function validateTemplateBody(body, isUpdate = false) {
     }
   }
 
-  const wl = validateWhenLines(body.when_lines)
+  const targetLevel = body.target_level || body.targetLevel || 'ad'
+  const wl = validateWhenLines(body.when_lines, targetLevel)
   if (!wl.valid) return wl
 
   const tw = validateWhenTimeWindow(body.when_time_window, body.when_custom_range)
   if (!tw.valid) return tw
 
-  const act = validateActions(body.actions, body.target_level || body.targetLevel || 'ad')
+  const act = validateActions(body.actions, targetLevel)
   if (!act.valid) return act
 
   if (body.sort_order != null && (typeof body.sort_order !== 'number' || !Number.isFinite(body.sort_order))) {
@@ -60,7 +73,8 @@ export function validateTemplateBody(body, isUpdate = false) {
 /**
  * 校验 when_lines
  */
-function validateWhenLines(whenLines) {
+function validateWhenLines(whenLines, targetLevel = 'ad') {
+  const safeTargetLevel = String(targetLevel || 'ad').toLowerCase()
   if (!Array.isArray(whenLines) || whenLines.length === 0) {
     return { valid: false, error: 'when_lines 须为非空数组', field: 'when_lines' }
   }
@@ -77,6 +91,9 @@ function validateWhenLines(whenLines) {
     }
     if (!VALID_METRICS.includes(line.metric)) {
       return { valid: false, error: `when_lines[${i}] metric 不支持: ${line.metric}`, field: 'when_lines' }
+    }
+    if (line.metric === 'purchases_avg_after_create' && safeTargetLevel !== 'ad') {
+      return { valid: false, error: `when_lines[${i}] 多天购买次数平均数仅支持 targetLevel=ad`, field: 'when_lines' }
     }
     if (!VALID_OPERATORS.includes(line.operator)) {
       return { valid: false, error: `when_lines[${i}] operator 不支持: ${line.operator}`, field: 'when_lines' }
@@ -146,10 +163,42 @@ function _validateActions(actions, targetLevel = 'ad') {
     if (budgetTypes.includes(a.type) && safeTargetLevel !== 'ad') {
       return { valid: false, error: `actions[${i}] 预算动作仅支持 targetLevel=ad`, field: 'actions' }
     }
-    if (hasMaxDailyBudget && hasMinDailyBudget) {
+    if (a.type !== 'set_dynamic_budget' && hasMaxDailyBudget && hasMinDailyBudget) {
       return { valid: false, error: `actions[${i}] 不允许同时配置 max_daily_budget 与 min_daily_budget`, field: 'actions' }
     }
-    if (a.type === 'set_budget') {
+    if (a.type === 'set_dynamic_budget') {
+      if (!a.metric || !VALID_METRICS.includes(a.metric)) {
+        return { valid: false, error: `actions[${i}] set_dynamic_budget metric 不支持: ${a.metric}`, field: 'actions' }
+      }
+      if (a.metric === 'purchases_avg_after_create' && safeTargetLevel !== 'ad') {
+        return { valid: false, error: `actions[${i}] 多天购买次数平均数仅支持 targetLevel=ad`, field: 'actions' }
+      }
+      if (a.value_unit != null && a.value_unit !== 'usd') {
+        return { valid: false, error: `actions[${i}] set_dynamic_budget 仅支持 value_unit=usd 或不传`, field: 'actions' }
+      }
+      const multiplier = Number(a.multiplier)
+      if (!Number.isFinite(multiplier) || multiplier <= 0) {
+        return { valid: false, error: `actions[${i}] set_dynamic_budget multiplier 须为大于 0 的数字`, field: 'actions' }
+      }
+      if (/\.\d{3,}$/.test(String(a.multiplier))) {
+        return { valid: false, error: `actions[${i}] set_dynamic_budget multiplier 最多两位小数`, field: 'actions' }
+      }
+      if (hasMinDailyBudget) {
+        const min = Number(a.min_daily_budget)
+        if (!Number.isInteger(min) || min < 100) {
+          return { valid: false, error: `actions[${i}] min_daily_budget 须为整数且 >= 100 分（1 美元）`, field: 'actions' }
+        }
+      }
+      if (hasMaxDailyBudget) {
+        const max = Number(a.max_daily_budget)
+        if (!Number.isInteger(max) || max < 100) {
+          return { valid: false, error: `actions[${i}] max_daily_budget 须为整数且 >= 100 分（1 美元）`, field: 'actions' }
+        }
+      }
+      if (hasMinDailyBudget && hasMaxDailyBudget && Number(a.min_daily_budget) > Number(a.max_daily_budget)) {
+        return { valid: false, error: `actions[${i}] min_daily_budget 须小于等于 max_daily_budget`, field: 'actions' }
+      }
+    } else if (a.type === 'set_budget') {
       // set_budget 仅允许 value_unit='usd' 或不传（undefined/null），其它一律报错
       if (a.value_unit != null && a.value_unit !== 'usd') {
         return { valid: false, error: `actions[${i}] set_budget 仅支持 value_unit=usd 或不传`, field: 'actions' }

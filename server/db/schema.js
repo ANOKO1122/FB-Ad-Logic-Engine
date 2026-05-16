@@ -18,10 +18,11 @@ import {
 // ============================================
 // 旧表只读定义（仅联表用，列名与 MySQL 真实表一致）
 // ============================================
-/** users 表（旧表）：仅 id、owner_id，供 rules → users → owners 联表。owner_id 映射到 Drizzle 的 ownerId */
+/** users 表（旧表）：仅规则列表联表所需列。owner_id 映射到 Drizzle 的 ownerId */
 export const users = mysqlTable('users', {
   id: int('id').primaryKey(),
-  ownerId: int('owner_id')  // 映射到 MySQL 列 owner_id，联表时用 users.ownerId
+  ownerId: int('owner_id'),  // 映射到 MySQL 列 owner_id，联表时用 users.ownerId
+  role: varchar('role', { length: 32 })
 })
 
 /** owners 表（旧表）：仅 id、owner_name，供联表带出负责人名称。owner_name 映射到 ownerName */

@@ -39,6 +39,13 @@ function isTruthyEnabled(v) {
   return v === true || v === 1
 }
 
+function hasConditionMetric(conditions, logicOperator, metric) {
+  const normalized = normalizeConditionsToV2(conditions, logicOperator || 'AND')
+  return (normalized.groups || []).some(group =>
+    (group.conditions || []).some(condition => condition?.metric === metric)
+  )
+}
+
 /**
  * 将库行与 PUT/PATCH 增量合并为「保存后」快照（仅用于开闸判断）
  */
@@ -71,12 +78,16 @@ export async function assertRuleReadyToEnable(merged, ctx) {
   if (!twCheck.valid) {
     return { ok: false, error: twCheck.error, code: 'INCONSISTENT_TIME_WINDOW' }
   }
+  const targetLevel = String(merged.targetLevel || merged.target_level || 'ad').toLowerCase()
+  if (targetLevel !== 'ad' && hasConditionMetric(conditions, logicOp, 'purchases_avg_after_create')) {
+    return { ok: false, error: '多天购买次数平均数仅支持 targetLevel=ad', code: 'INVALID_CONDITIONS' }
+  }
 
   const actions = merged.actions
   if (!Array.isArray(actions)) {
     return { ok: false, error: 'actions 必须是数组', code: 'INVALID_ACTIONS' }
   }
-  const actCheck = validateActions(actions)
+  const actCheck = validateActions(actions, targetLevel)
   if (!actCheck.valid) {
     return { ok: false, error: actCheck.error, code: 'INVALID_ACTIONS' }
   }

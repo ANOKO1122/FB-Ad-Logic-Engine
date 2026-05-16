@@ -181,6 +181,42 @@ describe('规则 API 测试', () => {
       expect(res.body.rule.isSimulation).toBe(false) // 默认值
     })
 
+    it('关闭动态筛选时应该拒绝空目标，防止扩大到整个广告账户', async () => {
+      const res = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: '手动范围空目标',
+          accountId: TEST_ACCOUNT_ID,
+          targetLevel: 'ad',
+          targetIds: [],
+          useDynamicScope: false,
+          conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
+          actions: [{ type: 'pause_ad' }]
+        })
+
+      expect(res.status).toBe(400)
+      expect(res.body.code).toBe('MANUAL_SCOPE_TARGETS_REQUIRED')
+    })
+
+    it('关闭动态筛选且提供目标时应该允许创建', async () => {
+      const res = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: '手动范围指定目标',
+          accountId: TEST_ACCOUNT_ID,
+          targetLevel: 'ad',
+          targetIds: [`${TEST_ACCOUNT_ID}:ad_123`],
+          useDynamicScope: false,
+          conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
+          actions: [{ type: 'pause_ad' }]
+        })
+
+      expect(res.status).toBe(201)
+      expect(res.body.rule.targetIds).toEqual([`${TEST_ACCOUNT_ID}:ad_123`])
+    })
+
     it('应该拒绝无效的 targetLevel', async () => {
       const res = await request(app)
         .post('/api/rules')
@@ -338,6 +374,161 @@ describe('规则 API 测试', () => {
       expect(testRule).toHaveProperty('timezoneName')
       expect(testRule).toHaveProperty('isSimulation')
     })
+
+    it('动态规则 matched_count 应按 target_level 对应 object_type 统计', async () => {
+      const compositeCampaignId = `${TEST_ACCOUNT_ID}:cmp_dynamic_counter_1`
+      const [ruleRes] = await pool.execute(
+        `INSERT INTO rules (
+          user_id, account_id, rule_name, target_level, target_ids,
+          conditions, actions, enabled, use_dynamic_scope
+        ) VALUES (?, ?, ?, 'campaign', ?, ?, ?, 1, 1)`,
+        [
+          testUserId,
+          TEST_ACCOUNT_ID,
+          `动态计数口径-${Date.now()}`,
+          JSON.stringify([compositeCampaignId]),
+          JSON.stringify([{ metric: 'spend', operator: 'gt', value: 1 }]),
+          JSON.stringify([{ type: 'pause_ad' }])
+        ]
+      )
+      const dynamicRuleId = ruleRes.insertId
+      try {
+        await pool.execute(
+          `INSERT INTO rule_matched_objects (rule_id, account_id, object_id, object_type)
+           VALUES (?, ?, ?, 'campaign'), (?, ?, ?, 'ad')`,
+          [dynamicRuleId, TEST_ACCOUNT_ID, 'cmp_dynamic_counter_1', dynamicRuleId, TEST_ACCOUNT_ID, 'ad_dynamic_counter_1']
+        )
+
+        const listRes = await request(app)
+          .get('/api/rules')
+          .set('Cookie', `token=${authToken}`)
+        expect(listRes.status).toBe(200)
+        const dynamicRule = listRes.body.rules.find((r) => Number(r.id) === Number(dynamicRuleId))
+        expect(dynamicRule).toBeDefined()
+        expect(Number(dynamicRule.matched_count)).toBe(1)
+
+        const detailRes = await request(app)
+          .get(`/api/rules/${dynamicRuleId}`)
+          .set('Cookie', `token=${authToken}`)
+        expect(detailRes.status).toBe(200)
+        expect(Number(detailRes.body.rule.matched_count)).toBe(1)
+        expect(detailRes.body.rule.invalid_ids || []).toEqual([])
+      } finally {
+        await pool.execute('DELETE FROM rule_matched_objects WHERE rule_id = ?', [dynamicRuleId])
+        await pool.execute('DELETE FROM rules WHERE id = ?', [dynamicRuleId])
+      }
+    })
+
+    it('管理员筛选中 includeNoOwner 应返回管理员创建的规则', async () => {
+      let adminOwnerId = null
+      let fallbackOwnerId = null
+      let adminUserId = null
+      let creatorWithFallbackOwnerId = null
+      let creatorNoOwnerId = null
+      let adminToken = null
+      let fallbackRuleId = null
+      let staffNoOwnerRuleId = null
+      let adminCreatedRuleId = null
+
+      try {
+        const [ownerARes] = await pool.execute(
+          'INSERT INTO owners (owner_key, owner_name, is_active) VALUES (?, ?, 1)',
+          [`owner_admin_scope_${Date.now()}`, '管理员筛选负责人A']
+        )
+        adminOwnerId = ownerARes.insertId
+        const [ownerBRes] = await pool.execute(
+          'INSERT INTO owners (owner_key, owner_name, is_active) VALUES (?, ?, 1)',
+          [`owner_fallback_scope_${Date.now()}`, '管理员筛选负责人B']
+        )
+        fallbackOwnerId = ownerBRes.insertId
+
+        const adminPwd = await bcrypt.hash('admin123', 10)
+        const [adminUserRes] = await pool.execute(
+          'INSERT INTO users (username, password_hash, role, status, owner_id) VALUES (?, ?, ?, ?, ?)',
+          [`admin_rules_${Date.now()}`, adminPwd, 'admin', 'active', adminOwnerId]
+        )
+        adminUserId = adminUserRes.insertId
+        adminToken = signToken(adminUserId)
+
+        const creatorPwd = await bcrypt.hash('creator123', 10)
+        const [creatorWithOwnerRes] = await pool.execute(
+          'INSERT INTO users (username, password_hash, role, status, owner_id) VALUES (?, ?, ?, ?, ?)',
+          [`creator_owner_${Date.now()}`, creatorPwd, 'staff', 'active', fallbackOwnerId]
+        )
+        creatorWithFallbackOwnerId = creatorWithOwnerRes.insertId
+        const [creatorNoOwnerRes] = await pool.execute(
+          'INSERT INTO users (username, password_hash, role, status, owner_id) VALUES (?, ?, ?, ?, NULL)',
+          [`creator_none_${Date.now()}`, creatorPwd, 'staff', 'active']
+        )
+        creatorNoOwnerId = creatorNoOwnerRes.insertId
+
+        const [ruleFallbackRes] = await pool.execute(
+          `INSERT INTO rules (user_id, owner_id, account_id, rule_name, target_level, conditions, actions, enabled)
+           VALUES (?, ?, ?, ?, 'ad', ?, ?, 1)`,
+          [
+            creatorWithFallbackOwnerId,
+            adminOwnerId,
+            TEST_ACCOUNT_ID,
+            `筛选规则-owner-priority-${Date.now()}`,
+            JSON.stringify([{ metric: 'spend', operator: 'gt', value: 1 }]),
+            JSON.stringify([{ type: 'pause_ad' }])
+          ]
+        )
+        fallbackRuleId = ruleFallbackRes.insertId
+
+        const [staffNoOwnerRuleRes] = await pool.execute(
+          `INSERT INTO rules (user_id, owner_id, account_id, rule_name, target_level, conditions, actions, enabled)
+           VALUES (?, NULL, ?, ?, 'ad', ?, ?, 1)`,
+          [
+            creatorNoOwnerId,
+            TEST_ACCOUNT_ID,
+            `筛选规则-staff-no-owner-${Date.now()}`,
+            JSON.stringify([{ metric: 'spend', operator: 'gt', value: 1 }]),
+            JSON.stringify([{ type: 'pause_ad' }])
+          ]
+        )
+        staffNoOwnerRuleId = staffNoOwnerRuleRes.insertId
+
+        const [adminCreatedRuleRes] = await pool.execute(
+          `INSERT INTO rules (user_id, owner_id, account_id, rule_name, target_level, conditions, actions, enabled)
+           VALUES (?, NULL, ?, ?, 'ad', ?, ?, 1)`,
+          [
+            adminUserId,
+            TEST_ACCOUNT_ID,
+            `筛选规则-admin-created-${Date.now()}`,
+            JSON.stringify([{ metric: 'spend', operator: 'gt', value: 1 }]),
+            JSON.stringify([{ type: 'pause_ad' }])
+          ]
+        )
+        adminCreatedRuleId = adminCreatedRuleRes.insertId
+
+        const ownerFilterRes = await request(app)
+          .get(`/api/rules?ownerIds=${adminOwnerId}`)
+          .set('Cookie', `token=${adminToken}`)
+        expect(ownerFilterRes.status).toBe(200)
+        const ownerFilteredIds = new Set(ownerFilterRes.body.rules.map(r => Number(r.id)))
+        expect(ownerFilteredIds.has(fallbackRuleId)).toBe(true)
+        expect(ownerFilteredIds.has(staffNoOwnerRuleId)).toBe(false)
+
+        const includeNoneRes = await request(app)
+          .get('/api/rules?includeNoOwner=1')
+          .set('Cookie', `token=${adminToken}`)
+        expect(includeNoneRes.status).toBe(200)
+        const noOwnerIds = new Set(includeNoneRes.body.rules.map(r => Number(r.id)))
+        expect(noOwnerIds.has(adminCreatedRuleId)).toBe(true)
+        expect(noOwnerIds.has(staffNoOwnerRuleId)).toBe(false)
+        expect(noOwnerIds.has(fallbackRuleId)).toBe(false)
+      } finally {
+        if (fallbackRuleId) await pool.execute('DELETE FROM rules WHERE id = ?', [fallbackRuleId])
+        if (staffNoOwnerRuleId) await pool.execute('DELETE FROM rules WHERE id = ?', [staffNoOwnerRuleId])
+        if (adminCreatedRuleId) await pool.execute('DELETE FROM rules WHERE id = ?', [adminCreatedRuleId])
+        if (creatorWithFallbackOwnerId) await pool.execute('DELETE FROM users WHERE id = ?', [creatorWithFallbackOwnerId])
+        if (creatorNoOwnerId) await pool.execute('DELETE FROM users WHERE id = ?', [creatorNoOwnerId])
+        if (adminUserId) await pool.execute('DELETE FROM users WHERE id = ?', [adminUserId])
+        if (adminOwnerId) await pool.execute('DELETE FROM owners WHERE id = ?', [adminOwnerId])
+        if (fallbackOwnerId) await pool.execute('DELETE FROM owners WHERE id = ?', [fallbackOwnerId])
+      }
+    })
   })
 
   describe('GET /api/rules/:id - 获取单个规则', () => {
@@ -414,6 +605,9 @@ describe('规则 API 测试', () => {
         .send({
           ruleName: '原始规则名称',
           accountId: TEST_ACCOUNT_ID,
+          targetLevel: 'ad',
+          targetIds: [`${TEST_ACCOUNT_ID}:ad_update_name`],
+          useDynamicScope: false,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })
@@ -441,6 +635,9 @@ describe('规则 API 测试', () => {
         .send({
           ruleName: '原始规则',
           accountId: TEST_ACCOUNT_ID,
+          targetLevel: 'ad',
+          targetIds: [`${TEST_ACCOUNT_ID}:ad_update_fields`],
+          useDynamicScope: false,
           conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
           actions: [{ type: 'pause_ad' }]
         })
@@ -475,6 +672,63 @@ describe('规则 API 测试', () => {
       expect(res.body.rule.logicOperator).toBe('OR')
       expect(res.body.rule.timezoneName).toBe('America/New_York')
       expect(res.body.rule.isSimulation).toBe(true)
+    })
+
+    it('更新为关闭动态筛选且目标为空时应该拒绝', async () => {
+      const createRes = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: '待关闭动态的规则',
+          accountId: TEST_ACCOUNT_ID,
+          conditions: [{ metric: 'ctr', operator: 'lt', value: 0.8 }],
+          actions: [{ type: 'pause_ad' }]
+        })
+
+      const ruleId = createRes.body.rule.id
+      const res = await request(app)
+        .put(`/api/rules/${ruleId}`)
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          useDynamicScope: false,
+          targetIds: []
+        })
+
+      expect(res.status).toBe(400)
+      expect(res.body.code).toBe('MANUAL_SCOPE_TARGETS_REQUIRED')
+    })
+
+    it('仅更新 targetLevel 时也应拒绝与存量 purchases_avg_after_create 条件冲突', async () => {
+      const createRes = await request(app)
+        .post('/api/rules')
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          ruleName: '平均购买条件规则',
+          accountId: TEST_ACCOUNT_ID,
+          targetLevel: 'ad',
+          targetIds: [`${TEST_ACCOUNT_ID}:ad_avg_guard`],
+          useDynamicScope: false,
+          conditions: {
+            version: 2,
+            groups: [{
+              operator: 'AND',
+              conditions: [{ metric: 'purchases_avg_after_create', operator: 'gt', value: 0, time_window: 'last_7_days' }]
+            }]
+          },
+          actions: [{ type: 'pause_ad' }]
+        })
+
+      const ruleId = createRes.body.rule.id
+      const res = await request(app)
+        .put(`/api/rules/${ruleId}`)
+        .set('Cookie', `token=${authToken}`)
+        .send({
+          targetLevel: 'campaign',
+          targetIds: [`${TEST_ACCOUNT_ID}:campaign_avg_guard`]
+        })
+
+      expect(res.status).toBe(400)
+      expect(res.body.code).toBe('INVALID_CONDITIONS')
     })
   })
 

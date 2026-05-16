@@ -122,6 +122,30 @@ const MIN_BUDGET_CENTS = 100
 const VALID_VALUE_UNITS = ['percent', 'usd']
 const PREFLIGHT_STALE_MS = 30 * 60 * 1000
 
+function buildAuditDedupeKey({ runId, ruleId, objectType, objectId, actionType }) {
+  return [
+    String(runId || ''),
+    String(ruleId || ''),
+    String(objectType || '').toLowerCase(),
+    String(objectId || ''),
+    String(actionType || '').toUpperCase()
+  ].join(':')
+}
+
+function resolveObjectDedupKey(matchedAd, targetLevel) {
+  if (!matchedAd || !targetLevel) return ''
+  if (targetLevel === 'adset') {
+    const adsetId = String(matchedAd.objectId || matchedAd.ad_set_id || matchedAd.adset_id || '').trim()
+    return adsetId ? `adset:${adsetId}` : ''
+  }
+  if (targetLevel === 'campaign') {
+    const campaignId = String(matchedAd.objectId || matchedAd.campaign_id || '').trim()
+    return campaignId ? `campaign:${campaignId}` : ''
+  }
+  const adId = String(matchedAd.objectId || matchedAd.ad_id || '').trim()
+  return adId ? `ad:${adId}` : ''
+}
+
 async function loadPreflightStatusByLevel({ accountId, targetLevel, targetObjectId, fallbackStatus = null }) {
   if (targetLevel === 'ad' && fallbackStatus) {
     return { preflightMode: 'preflight', status: fallbackStatus }
@@ -286,6 +310,173 @@ export function computeNewBudgetCentsOnce(currentBudgetCents, action) {
   return newCents
 }
 
+export function computeDynamicBudgetCents(matchedObject, action) {
+  const metric = String(action?.metric || '').trim()
+  const metricRawValue = matchedObject?.[metric]
+  if (!metric || metricRawValue == null) {
+    return { ok: false, reason: 'dynamic_metric_missing', metric, metricValue: null }
+  }
+
+  const metricValue = Number(metricRawValue)
+  if (!Number.isFinite(metricValue) || metricValue <= 0) {
+    return { ok: false, reason: 'dynamic_metric_invalid', metric, metricValue: Number.isFinite(metricValue) ? metricValue : null }
+  }
+
+  const multiplier = Number(action?.multiplier)
+  if (!Number.isFinite(multiplier) || multiplier <= 0) {
+    return { ok: false, reason: 'dynamic_multiplier_invalid', metric, metricValue, multiplier: null }
+  }
+
+  const rawUsd = metricValue * multiplier
+  const roundedUsd = Math.round(rawUsd * 100) / 100
+  const targetCentsBeforeClamp = Math.round(roundedUsd * 100)
+  const minDailyBudget = action?.min_daily_budget != null ? Math.max(Math.round(Number(action.min_daily_budget)), MIN_BUDGET_CENTS) : null
+  const maxDailyBudget = action?.max_daily_budget != null ? Math.max(Math.round(Number(action.max_daily_budget)), MIN_BUDGET_CENTS) : null
+  let finalBudgetCents = Math.max(targetCentsBeforeClamp, MIN_BUDGET_CENTS)
+
+  if (minDailyBudget != null) finalBudgetCents = Math.max(finalBudgetCents, minDailyBudget)
+  if (maxDailyBudget != null) finalBudgetCents = Math.min(finalBudgetCents, maxDailyBudget)
+
+  return {
+    ok: true,
+    metric,
+    metricValue,
+    multiplier,
+    rawUsd,
+    roundedUsd,
+    targetCentsBeforeClamp,
+    minDailyBudget,
+    maxDailyBudget,
+    finalBudgetCents
+  }
+}
+
+function resolveBudgetCents(detail) {
+  const daily = Math.round(Number(detail?.daily_budget || 0))
+  const lifetime = Math.round(Number(detail?.lifetime_budget || 0))
+  if (daily > 0) return { hasBudget: true, currentCents: daily, isDaily: true }
+  if (lifetime > 0) return { hasBudget: true, currentCents: lifetime, isDaily: false }
+  return { hasBudget: false, currentCents: 0, isDaily: true }
+}
+
+function getUniqueChildAdsetIds(matchedObject) {
+  const ids = []
+  const add = (value) => {
+    const id = String(value || '').trim()
+    if (id && !ids.includes(id)) ids.push(id)
+  }
+  add(matchedObject?.ad_set_id || matchedObject?.adset_id)
+  const children = Array.isArray(matchedObject?.aggregationTrace?.children)
+    ? matchedObject.aggregationTrace.children
+    : []
+  for (const child of children) {
+    add(child?.adsetId || child?.ad_set_id || child?.adset_id)
+  }
+  return ids
+}
+
+export async function resolveBudgetTargetContext(rule, matchedObject, api) {
+  const targetLevel = String(rule?.targetLevel || rule?.target_level || matchedObject?.objectType || 'ad').toLowerCase()
+  const objectId = String(matchedObject?.objectId || '').trim()
+
+  if (targetLevel === 'campaign') {
+    const campaignId = String(objectId || matchedObject?.campaign_id || '').trim()
+    if (!campaignId) return { ok: false, reason: 'missing_campaign_id' }
+    const campaignDetail = await api.getCampaignBudgetDetail(campaignId)
+    const campaignBudget = resolveBudgetCents(campaignDetail)
+    if (campaignBudget.hasBudget) {
+      return {
+        ok: true,
+        budgetNodeType: 'campaign',
+        budgetNodeId: campaignId,
+        label: '广告系列(CBO)',
+        isDaily: campaignBudget.isDaily,
+        currentCents: campaignBudget.currentCents,
+        cooldownKey: `budget_campaign:${campaignId}`
+      }
+    }
+    const childAdsetIds = getUniqueChildAdsetIds(matchedObject)
+    if (childAdsetIds.length === 1) {
+      const adsetId = childAdsetIds[0]
+      const adsetDetail = await api.getAdsetBudgetDetail(adsetId)
+      const adsetBudget = resolveBudgetCents(adsetDetail)
+      if (adsetBudget.hasBudget) {
+        return {
+          ok: true,
+          budgetNodeType: 'adset',
+          budgetNodeId: adsetId,
+          label: '广告组(ABO)',
+          isDaily: adsetBudget.isDaily,
+          currentCents: adsetBudget.currentCents,
+          cooldownKey: `budget_adset:${adsetId}`
+        }
+      }
+    }
+    if (childAdsetIds.length > 1) {
+      return {
+        ok: false,
+        severity: 'skipped',
+        reason: 'campaign_abo_multiple_adsets_requires_adset_level',
+        campaignId,
+        childAdsetIds,
+        cooldownKey: `budget_campaign:${campaignId}`
+      }
+    }
+    return {
+      ok: false,
+      severity: 'skipped',
+      reason: 'campaign_has_no_budget',
+      campaignId,
+      cooldownKey: `budget_campaign:${campaignId}`
+    }
+  }
+
+  const adsetId = String(
+    targetLevel === 'adset'
+      ? (objectId || matchedObject?.ad_set_id || matchedObject?.adset_id || '')
+      : (matchedObject?.ad_set_id || matchedObject?.adset_id || '')
+  ).trim()
+  if (!adsetId) return { ok: false, reason: 'missing_adset_id' }
+
+  const adsetDetail = await api.getAdsetBudgetDetail(adsetId)
+  const adsetBudget = resolveBudgetCents(adsetDetail)
+  if (adsetBudget.hasBudget) {
+    return {
+      ok: true,
+      budgetNodeType: 'adset',
+      budgetNodeId: adsetId,
+      label: '广告组',
+      isDaily: adsetBudget.isDaily,
+      currentCents: adsetBudget.currentCents,
+      cooldownKey: `budget_adset:${adsetId}`
+    }
+  }
+
+  const campaignId = String(matchedObject?.campaign_id || '').trim()
+  if (!campaignId) return { ok: false, reason: 'missing_campaign_id' }
+  const campaignDetail = await api.getCampaignBudgetDetail(campaignId)
+  const campaignBudget = resolveBudgetCents(campaignDetail)
+  if (!campaignBudget.hasBudget) {
+    return {
+      ok: false,
+      severity: 'skipped',
+      reason: 'budget_node_has_no_budget',
+      campaignId,
+      adsetId,
+      cooldownKey: `budget_campaign:${campaignId}`
+    }
+  }
+  return {
+    ok: true,
+    budgetNodeType: 'campaign',
+    budgetNodeId: campaignId,
+    label: '广告系列(CBO)',
+    isDaily: campaignBudget.isDaily,
+    currentCents: campaignBudget.currentCents,
+    cooldownKey: `budget_campaign:${campaignId}`
+  }
+}
+
 /**
  * M4 3.2 预算幂等：由调用方「只 GET 一次 + 算一次」，得到 newBudgetCents 后传 action 副本 _resolvedBudgetCents，重试时不再 GET。
  * set_budget 不依赖当前预算，直接计算返回，无需 GET。
@@ -396,7 +587,7 @@ export function mergeBudgetPendingActions(pendingActions) {
  * @param {Array} [params.actionsOverride] - 若传则只执行该数组（仲裁后单动作）；不传则用 rule.actions
  * @returns {Promise<Array>} 执行结果数组
  */
-export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId, runId = null, actionsOverride = null }) {
+export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId, runId = null, actionsOverride = null, auditDedupeSet = null }) {
   const results = []
   const pendingActions = []
 
@@ -428,6 +619,9 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     roas: matchedAd.roas ?? null,
     cpa: matchedAd.cpa ?? null,
     purchases: matchedAd.purchases || 0,
+    purchases_avg_after_create: matchedAd.purchases_avg_after_create ?? null,
+    purchases_avg_after_create_days: matchedAd.purchases_avg_after_create_days ?? null,
+    purchases_avg_after_create_range: matchedAd.purchases_avg_after_create_range ?? null,
     link_clicks: matchedAd.link_clicks ?? 0,
     unique_link_clicks: matchedAd.unique_link_clicks ?? 0,
     add_to_cart_count: matchedAd.add_to_cart_count ?? 0,
@@ -452,12 +646,25 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     let apiResponse = null
     let cooldownKey = null  // 冷却键：供 cron 写 rule_ad_execution_state(scope_key)
     let logPreflightMode = null
+    let resolvedBudgetLogObject = null
 
     try {
       if (isSimulation) {
         // ===== Dry Run 模式：Pre-Flight 仍生效，目标已达成则 skipped =====
         const adStatus = (matchedAd.status || '').toUpperCase()
-        if (action.type === 'pause_ad' && ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)) {
+        if (action.type === 'set_dynamic_budget') {
+          const dynamicBudget = computeDynamicBudgetCents(matchedAd, action)
+          apiRequest = JSON.stringify({ dryRun: true, action, dynamicBudget })
+          if (!dynamicBudget.ok) {
+            status = 'skipped'
+            errorMessage = `动态预算跳过：${dynamicBudget.reason}`
+            apiResponse = JSON.stringify({ dryRun: true, skipped: true, reason: dynamicBudget.reason })
+          } else {
+            logger.info(`    [Dry Run] 动态预算: ${dynamicBudget.metric}=${dynamicBudget.metricValue} × ${dynamicBudget.multiplier} → ${dynamicBudget.finalBudgetCents} 分`)
+            apiResponse = JSON.stringify({ dryRun: true, finalBudgetCents: dynamicBudget.finalBudgetCents })
+            status = 'success'
+          }
+        } else if (action.type === 'pause_ad' && ['PAUSED', 'DISABLED', 'ARCHIVED', 'DELETED'].includes(adStatus)) {
           logger.info(`    [Dry Run] Pre-Flight: 广告 ${matchedAd.ad_id} 已 ${adStatus}，无需 pause，跳过`)
           status = 'skipped'
           errorMessage = `目标已达成（status=${adStatus}）`
@@ -595,6 +802,116 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
             break
           }
           
+          case 'set_dynamic_budget': {
+            const dynamicBudget = computeDynamicBudgetCents(matchedAd, action)
+            if (!dynamicBudget.ok) {
+              status = 'skipped'
+              errorMessage = `动态预算跳过：${dynamicBudget.reason}`
+              cooldownKey = null
+              apiRequest = JSON.stringify({ preFlight: true, action, dynamicBudget })
+              apiResponse = JSON.stringify({ skipped: true, reason: dynamicBudget.reason })
+              break
+            }
+
+            const cachedTargetContext = matchedAd?._resolvedDynamicBudgetTargetContext
+            const targetContext = cachedTargetContext?.ruleId === rule?.id
+              ? cachedTargetContext
+              : await resolveBudgetTargetContext(rule, matchedAd, api)
+            if (!targetContext.ok) {
+              status = targetContext.severity === 'skipped' ? 'skipped' : 'fail'
+              errorMessage = status === 'skipped'
+                ? `动态预算跳过：${targetContext.reason}`
+                : `动态预算目标解析失败：${targetContext.reason}`
+              cooldownKey = targetContext.cooldownKey || getMatchedObjectScopeKey(rule, matchedAd)
+              apiRequest = JSON.stringify({ action, dynamicBudget, targetContext })
+              apiResponse = JSON.stringify(status === 'skipped'
+                ? { skipped: true, reason: targetContext.reason, targetContext }
+                : { error: targetContext.reason, targetContext })
+              break
+            }
+
+            cooldownKey = targetContext.cooldownKey
+            resolvedBudgetLogObject = {
+              objectType: targetContext.budgetNodeType,
+              objectId: targetContext.budgetNodeId,
+              objectName: null
+            }
+
+            const intervalMin = rule.executionIntervalMinutes ?? rule.execution_interval_minutes ?? 15
+            if (intervalMin > 0) {
+              const due = await isCooldownDue(rule.id, cooldownKey, intervalMin)
+              if (!due) {
+                status = 'skipped'
+                errorMessage = '预算冷却未到期'
+                apiRequest = JSON.stringify({ preFlight: true, cooldownKey, reason: 'cooldown_not_reached', dynamicBudget })
+                apiResponse = JSON.stringify({ skipped: true, reason: 'cooldown_not_reached' })
+                break
+              }
+            }
+
+            if (targetContext.currentCents === dynamicBudget.finalBudgetCents) {
+              status = 'skipped'
+              errorMessage = '目标已达成（budget_already_at_target）'
+              apiRequest = JSON.stringify({
+                preFlight: true,
+                cooldownKey,
+                currentCents: targetContext.currentCents,
+                newBudgetCents: dynamicBudget.finalBudgetCents,
+                reason: 'budget_already_at_target',
+                dynamicBudget
+              })
+              apiResponse = JSON.stringify({ skipped: true, reason: 'budget_already_at_target' })
+              break
+            }
+
+            logger.info(`    🔧 执行: 设置${targetContext.label}动态预算 ${targetContext.budgetNodeId} → ${dynamicBudget.finalBudgetCents} 分`)
+            if (targetContext.budgetNodeType === 'adset') {
+              await api.updateAdsetBudget(targetContext.budgetNodeId, dynamicBudget.finalBudgetCents, targetContext.isDaily)
+            } else {
+              await api.updateCampaignBudget(targetContext.budgetNodeId, dynamicBudget.finalBudgetCents, targetContext.isDaily)
+            }
+
+            pendingActions.push({
+              kind: 'budget',
+              scope: targetContext.budgetNodeType,
+              accountId,
+              nodeId: targetContext.budgetNodeId,
+              isDaily: targetContext.isDaily,
+              newBudgetCents: dynamicBudget.finalBudgetCents,
+              sourceRuleId: rule.id,
+              runId,
+              rawAction: action
+            })
+
+            apiRequest = JSON.stringify({
+              method: 'POST',
+              endpoint: `/${targetContext.budgetNodeId}`,
+              budgetTarget: targetContext.label,
+              adjustType: action.type,
+              dynamicBudget,
+              currentCents: targetContext.currentCents,
+              newBudgetCents: dynamicBudget.finalBudgetCents
+            })
+            apiResponse = JSON.stringify({
+              success: true,
+              budgetTarget: targetContext.label,
+              budgetNodeType: targetContext.budgetNodeType,
+              budgetNodeId: targetContext.budgetNodeId,
+              newBudgetCents: dynamicBudget.finalBudgetCents
+            })
+            logFbActionSuccess({
+              runId: runId || null,
+              ruleId: rule.id || null,
+              accountId: String(accountId),
+              objectType: targetContext.budgetNodeType,
+              objectId: String(targetContext.budgetNodeId || ''),
+              adId: String(matchedAd?.ad_id || ''),
+              actionType: action.type,
+              httpStatus: 200
+            })
+            break
+          }
+
           case 'increase_budget':
           case 'decrease_budget':
           case 'set_budget': {
@@ -830,11 +1147,13 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     const now = new Date()
     // M5 通用对象字段：从 intent 或 matchedAd 推断
     const statusActionTypes = ['pause_ad', 'activate_ad']
-    const logObjectType = statusActionTypes.includes(action.type)
-      ? (matchedAd?.objectType || rule?.targetLevel || rule?.target_level || 'ad')
-      : (matchedAd?.objectType || 'ad')
+    const logObjectType = resolvedBudgetLogObject?.objectType
+      || (statusActionTypes.includes(action.type)
+        ? (matchedAd?.objectType || rule?.targetLevel || rule?.target_level || 'ad')
+        : (matchedAd?.objectType || 'ad'))
     const logObjectId = String(
-      matchedAd?.objectId
+      resolvedBudgetLogObject?.objectId
+      || matchedAd?.objectId
       || (statusActionTypes.includes(action.type)
         ? (logObjectType === 'adset' ? (matchedAd.ad_set_id || matchedAd.adset_id || matchedAd.ad_id)
           : logObjectType === 'campaign' ? (matchedAd.campaign_id || matchedAd.ad_id)
@@ -842,7 +1161,8 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
         : matchedAd.ad_id)
       || ''
     )
-    const logObjectName = matchedAd?.objectName
+    const logObjectName = resolvedBudgetLogObject?.objectName
+      || matchedAd?.objectName
       || (statusActionTypes.includes(action.type)
         ? (logObjectType === 'adset' ? (matchedAd.adset_name || null)
           : logObjectType === 'campaign' ? (matchedAd.campaign_name || null)
@@ -866,7 +1186,17 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
     }
 
     try {
-      const insertResult = await db.insert(automationLogs).values({
+      const dedupeKey = buildAuditDedupeKey({
+        runId: runId || null,
+        ruleId: rule.id || null,
+        objectType: logObjectType,
+        objectId: String(logObjectId || ''),
+        actionType: action.type
+      })
+      if (auditDedupeSet && dedupeKey && auditDedupeSet.has(dedupeKey)) {
+        logger.info(`    ⏭️  审计去重：跳过重复日志 ${dedupeKey}`)
+      } else {
+        const insertResult = await db.insert(automationLogs).values({
         runId: runId || null,
         accountId: String(accountId),
         adId: String(matchedAd?.ad_id || ''),        // 旧字段保留兼容：campaign/adset 目标避免写入字符串 'null'
@@ -889,14 +1219,16 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
         status: status,
         errorMessage: errorMessage,
         triggeredAt: now
-      })
-      const auditLogId = Array.isArray(insertResult)
-        ? insertResult?.[0]?.insertId ?? null
-        : insertResult?.insertId ?? null
-      logAuditInsertSuccess({
-        ...auditLogContext,
-        auditLogId
-      })
+        })
+        if (auditDedupeSet && dedupeKey) auditDedupeSet.add(dedupeKey)
+        const auditLogId = Array.isArray(insertResult)
+          ? insertResult?.[0]?.insertId ?? null
+          : insertResult?.insertId ?? null
+        logAuditInsertSuccess({
+          ...auditLogContext,
+          auditLogId
+        })
+      }
     } catch (logError) {
       // 审计日志写入失败不应该中断主流程
       logAuditInsertFailure({
@@ -950,24 +1282,39 @@ export async function executeActionsForObject({ rule, matchedObject, accountId, 
  * @returns {Promise<Object>} 批量执行统计结果
  */
 export async function executeActionsForRule({ rule, matchedAds, accountId, ownerId, runId = null }) {
+  const targetLevel = String(rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
+  const dedupeInputByObject = targetLevel === 'ad'
+    ? matchedAds
+    : (() => {
+        const seen = new Set()
+        const deduped = []
+        for (const matchedAd of matchedAds || []) {
+          const objectKey = resolveObjectDedupKey(matchedAd, targetLevel)
+          if (!objectKey || seen.has(objectKey)) continue
+          seen.add(objectKey)
+          deduped.push(matchedAd)
+        }
+        return deduped
+      })()
+
   const stats = {
-    totalAds: matchedAds.length,
+    totalAds: dedupeInputByObject.length,
     successCount: 0,
     failCount: 0,
     skippedCount: 0,
     results: []
   }
+  const auditDedupeSet = new Set()
 
   const isSimulation = rule.isSimulation || rule.is_simulation || false
   const modeLabel = isSimulation ? '[Dry Run]' : '[执行]'
   const enableActionBatch = process.env.ENABLE_ACTION_BATCH === '1' || process.env.ENABLE_ACTION_BATCH === 'true'
   
-  logger.info(`  ${modeLabel} 规则 "${rule.ruleName}" 将处理 ${matchedAds.length} 个广告`)
+  logger.info(`  ${modeLabel} 规则 "${rule.ruleName}" 将处理 ${dedupeInputByObject.length} 个对象`)
 
   const ruleActions = Array.isArray(rule.actions) ? rule.actions : []
   const singleAction = ruleActions.length === 1 ? ruleActions[0] : null
   const isSingleStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction.type)
-  const targetLevel = String(rule?.targetLevel || rule?.target_level || 'ad').toLowerCase()
   const canBatchSingleRuleStatus = enableActionBatch && !isSimulation && !!FACEBOOK_ACCESS_TOKEN && isSingleStatusAction && targetLevel === 'ad'
   if (!canBatchSingleRuleStatus && !isSimulation) {
     const maybeStatusAction = singleAction && ['pause_ad', 'activate_ad'].includes(singleAction?.type)
@@ -992,6 +1339,9 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
         roas: matchedAd?.roas ?? null,
         cpa: matchedAd?.cpa ?? null,
         purchases: matchedAd?.purchases || 0,
+        purchases_avg_after_create: matchedAd?.purchases_avg_after_create ?? null,
+        purchases_avg_after_create_days: matchedAd?.purchases_avg_after_create_days ?? null,
+        purchases_avg_after_create_range: matchedAd?.purchases_avg_after_create_range ?? null,
         link_clicks: matchedAd?.link_clicks ?? 0,
         unique_link_clicks: matchedAd?.unique_link_clicks ?? 0,
         add_to_cart_count: matchedAd?.add_to_cart_count ?? 0,
@@ -1023,6 +1373,17 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
           actionType: actionType,
           auditStatus: status
         }
+        const dedupeKey = buildAuditDedupeKey({
+          runId: runId || null,
+          ruleId: rule?.id || null,
+          objectType: logObjectType,
+          objectId: String(logObjectId || ''),
+          actionType
+        })
+        if (dedupeKey && auditDedupeSet.has(dedupeKey)) {
+          logger.info(`    ⏭️  审计去重：跳过重复日志 ${dedupeKey}`)
+          return
+        }
         const insertResult = await db.insert(automationLogs).values({
           runId: runId || null,
           accountId: String(accountId),
@@ -1032,7 +1393,7 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
           objectType: logObjectType,
           objectId: String(logObjectId),
           objectName: logObjectName,
-          preflightMode: status === 'skipped' ? 'preflight' : 'preflight',
+          preflightMode: status === 'skipped' ? 'preflight' : 'direct_api_fallback',
           ruleId: rule?.id || null,
           ruleName: rule?.ruleName || rule?.rule_name || null,
           ownerId: ownerId ?? 0,
@@ -1047,6 +1408,7 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
           errorMessage,
           triggeredAt: new Date()
         })
+        if (dedupeKey) auditDedupeSet.add(dedupeKey)
         const auditLogId = Array.isArray(insertResult)
           ? insertResult?.[0]?.insertId ?? null
           : insertResult?.insertId ?? null
@@ -1077,7 +1439,7 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
       }
     }
 
-    for (const matchedAd of matchedAds) {
+    for (const matchedAd of dedupeInputByObject) {
       const adId = String(matchedAd?.ad_id || '').trim()
       if (!adId) continue
       const adStatus = String(matchedAd?.status || '').toUpperCase()
@@ -1212,14 +1574,15 @@ export async function executeActionsForRule({ rule, matchedAds, accountId, owner
     return stats
   }
 
-  for (const matchedAd of matchedAds) {
+  for (const matchedAd of dedupeInputByObject) {
     try {
       const results = await executeActionsForAd({
         rule,
         matchedAd,
         accountId,
         ownerId,
-        runId
+        runId,
+        auditDedupeSet
       })
 
       // 统计结果

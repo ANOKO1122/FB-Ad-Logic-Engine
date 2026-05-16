@@ -78,6 +78,35 @@ describe('时间窗口工具模块', () => {
       expect(start.year).toBe(expectedStart.year)
     })
 
+    it('应该正确计算 last_3_days_excluding_today 时间窗口', () => {
+      const { start, end } = calculateTimeWindow('last_3_days_excluding_today', 'UTC')
+      const now = DateTime.now().setZone('UTC')
+      const expectedStart = now.minus({ days: 3 }).startOf('day')
+      const expectedEnd = now.minus({ days: 1 }).endOf('day')
+
+      expect(start.toFormat('yyyy-MM-dd')).toBe(expectedStart.toFormat('yyyy-MM-dd'))
+      expect(end.toFormat('yyyy-MM-dd')).toBe(expectedEnd.toFormat('yyyy-MM-dd'))
+    })
+
+    it('应该正确计算 last_5_days 与 last_5_days_excluding_today 时间窗口', () => {
+      const now = DateTime.now().setZone('UTC')
+      const includeToday = calculateTimeWindow('last_5_days', 'UTC')
+      const excludeToday = calculateTimeWindow('last_5_days_excluding_today', 'UTC')
+
+      expect(includeToday.start.toFormat('yyyy-MM-dd')).toBe(now.minus({ days: 4 }).toFormat('yyyy-MM-dd'))
+      expect(includeToday.end.toFormat('yyyy-MM-dd')).toBe(now.toFormat('yyyy-MM-dd'))
+      expect(excludeToday.start.toFormat('yyyy-MM-dd')).toBe(now.minus({ days: 5 }).toFormat('yyyy-MM-dd'))
+      expect(excludeToday.end.toFormat('yyyy-MM-dd')).toBe(now.minus({ days: 1 }).toFormat('yyyy-MM-dd'))
+    })
+
+    it('应该正确计算 last_7_days_excluding_today 时间窗口', () => {
+      const { start, end } = calculateTimeWindow('last_7_days_excluding_today', 'UTC')
+      const now = DateTime.now().setZone('UTC')
+
+      expect(start.toFormat('yyyy-MM-dd')).toBe(now.minus({ days: 7 }).toFormat('yyyy-MM-dd'))
+      expect(end.toFormat('yyyy-MM-dd')).toBe(now.minus({ days: 1 }).toFormat('yyyy-MM-dd'))
+    })
+
     it('应该正确计算 lifetime 时间窗口', () => {
       const { start, end } = calculateTimeWindow('lifetime', 'UTC')
       

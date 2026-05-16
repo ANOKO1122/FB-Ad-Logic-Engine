@@ -38,11 +38,10 @@ describe('RuleEngineDispatcher', () => {
       { ad_id: 'ad_2', ad_name: 'B', ad_set_id: 'as_1', status: 'ACTIVE', spend: 5, link_clicks: 0, cpc: null, roas: null, purchases: 0, mute_until: null, mute_reason: null }
     ]
     mockQueryRuleData.mockResolvedValue({ data: sharedData })
-    mockPoolExecute.mockResolvedValue([[{ ad_id: 'ad_1' }, { ad_id: 'ad_2' }]])
 
     const rules = [
-      { id: 1, ruleName: 'R1', enabled: true, targetLevel: null, targetIds: [], conditions: [{ metric: 'spend', operator: 'gt', value: 8, time_window: 'today' }], logicOperator: 'AND' },
-      { id: 2, ruleName: 'R2', enabled: true, targetLevel: null, targetIds: [], conditions: [{ metric: 'link_clicks', operator: 'eq', value: 0, time_window: 'today' }], logicOperator: 'AND' }
+      { id: 1, ruleName: 'R1', enabled: true, targetLevel: 'ad', targetIds: ['ad_1', 'ad_2'], conditions: [{ metric: 'spend', operator: 'gt', value: 8, time_window: 'today' }], logicOperator: 'AND' },
+      { id: 2, ruleName: 'R2', enabled: true, targetLevel: 'ad', targetIds: ['ad_1', 'ad_2'], conditions: [{ metric: 'link_clicks', operator: 'eq', value: 0, time_window: 'today' }], logicOperator: 'AND' }
     ]
 
     const loadResult = await loadDataForAccount(accountId, rules, ruleEngine)
@@ -56,9 +55,8 @@ describe('RuleEngineDispatcher', () => {
       { ad_id: 'ad_2', ad_name: 'B', ad_set_id: 'as_1', status: 'ACTIVE', spend: 5, link_clicks: 0, cpc: null, roas: null, purchases: 0, mute_until: null, mute_reason: null }
     ]
     mockQueryRuleData.mockResolvedValue({ data: sharedData })
-    mockPoolExecute.mockResolvedValue([[{ ad_id: 'ad_1' }, { ad_id: 'ad_2' }]])
 
-    const rule = { id: 1, ruleName: 'R1', enabled: true, targetLevel: null, targetIds: [], conditions: [{ metric: 'spend', operator: 'gt', value: 8, time_window: 'today' }], logicOperator: 'AND' }
+    const rule = { id: 1, ruleName: 'R1', enabled: true, targetLevel: 'ad', targetIds: ['ad_1', 'ad_2'], conditions: [{ metric: 'spend', operator: 'gt', value: 8, time_window: 'today' }], logicOperator: 'AND' }
     const rules = [rule]
 
     const loadResult = await loadDataForAccount(accountId, rules, ruleEngine)
@@ -68,6 +66,25 @@ describe('RuleEngineDispatcher', () => {
     expect(matchedByCache.length).toBe(1)
     expect(matchedByCache[0].ad_id).toBe('ad_1')
     expect(matchedByData[0].ad_id).toBe('ad_1')
+  })
+
+  it('use_dynamic_scope=0 且 targetIds 为空时应跳过，避免扩大到全账户', async () => {
+    const rule = {
+      id: 99,
+      ruleName: 'empty manual target',
+      enabled: true,
+      useDynamicScope: false,
+      targetLevel: 'ad',
+      targetIds: [],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 0, time_window: 'today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(mockQueryRuleData).not.toHaveBeenCalled()
+    expect(matched).toEqual([])
   })
 
   it('use_dynamic_scope=1 时应优先使用快照目标（覆盖 targetIds）', async () => {
@@ -239,6 +256,31 @@ describe('RuleEngineDispatcher', () => {
     expect(mockQueryRuleDataByLevel).toHaveBeenCalledTimes(0)
     expect(mockQueryRuleData).toHaveBeenCalledTimes(1)
     expect(loadResult.cacheKeysByRule.get(rule.id)).toBe('ad:today')
+    expect(matched.length).toBe(1)
+  })
+
+  it('新时间窗口应参与缓存键并正常查询', async () => {
+    mockPoolExecute.mockResolvedValue([[{ ad_id: 'ad_1' }]])
+    mockQueryRuleData.mockResolvedValue({
+      data: [
+        { ad_id: 'ad_1', ad_name: 'A', ad_set_id: 'as_1', status: 'ACTIVE', spend: 8, link_clicks: 2, purchases: 1 }
+      ]
+    })
+    const rule = {
+      id: 7,
+      ruleName: 'R7',
+      enabled: true,
+      targetLevel: 'ad',
+      targetIds: ['ad_1'],
+      conditions: [{ metric: 'spend', operator: 'gt', value: 1, time_window: 'last_5_days_excluding_today' }],
+      logicOperator: 'AND'
+    }
+
+    const loadResult = await loadDataForAccount(accountId, [rule], ruleEngine)
+    const matched = evaluateRuleWithCache(ruleEngine, rule, loadResult)
+
+    expect(mockQueryRuleData).toHaveBeenCalledTimes(1)
+    expect(loadResult.cacheKeysByRule.get(rule.id)).toBe('ad:last_5_days_excluding_today')
     expect(matched.length).toBe(1)
   })
 })

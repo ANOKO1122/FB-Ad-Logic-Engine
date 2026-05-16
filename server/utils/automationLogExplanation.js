@@ -55,6 +55,11 @@ export function buildAutomationLogExplanation({ rule, matchedObject, accountId }
       children
     },
     aggregate,
+    derivedMetrics: {
+      purchases_avg_after_create: matchedObject?.purchases_avg_after_create ?? null,
+      purchases_avg_after_create_days: matchedObject?.purchases_avg_after_create_days ?? null,
+      purchases_avg_after_create_range: matchedObject?.purchases_avg_after_create_range ?? null
+    },
     conditionTrace,
     logic: {
       logicOperator: String(rule?.logicOperator || rule?.logic_operator || 'AND').toUpperCase(),

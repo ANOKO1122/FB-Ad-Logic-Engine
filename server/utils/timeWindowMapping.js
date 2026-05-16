@@ -24,6 +24,7 @@ export function mapToFacebookPreset(internalWindow) {
     'today': 'today',
     'yesterday': 'yesterday',
     'last_3_days': 'last_3d',
+    'last_5_days': 'last_5d',
     'last_7_days': 'last_7d',
     'last_30_days': 'last_30d',
     'lifetime': 'lifetime'
@@ -51,6 +52,7 @@ export function mapFromFacebookPreset(fbPreset) {
     'today': 'today',
     'yesterday': 'yesterday',
     'last_3d': 'last_3_days',
+    'last_5d': 'last_5_days',
     'last_7d': 'last_7_days',
     'last_30d': 'last_30_days',
     'lifetime': 'lifetime'
@@ -66,7 +68,19 @@ export function mapFromFacebookPreset(fbPreset) {
  * @returns {boolean} 是否有效
  */
 export function isValidInternalWindow(timeWindow) {
-  const validWindows = ['today', 'yesterday', 'last_3_days', 'last_7_days', 'last_30_days', 'lifetime', 'custom_range']
+  const validWindows = [
+    'today',
+    'yesterday',
+    'last_3_days',
+    'last_3_days_excluding_today',
+    'last_5_days',
+    'last_5_days_excluding_today',
+    'last_7_days',
+    'last_7_days_excluding_today',
+    'last_30_days',
+    'lifetime',
+    'custom_range'
+  ]
   return validWindows.includes(timeWindow)
 }
 

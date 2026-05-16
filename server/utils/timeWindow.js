@@ -6,7 +6,7 @@ import { DateTime } from 'luxon'
 
 /**
  * 计算时间窗口的起止时间
- * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_7_days' | 'last_30_days' | 'lifetime' | 'custom_range'
+ * @param {string} timeWindow - 时间窗口类型：'today' | 'yesterday' | 'last_3_days' | 'last_3_days_excluding_today' | 'last_5_days' | 'last_5_days_excluding_today' | 'last_7_days' | 'last_7_days_excluding_today' | 'last_30_days' | 'lifetime' | 'custom_range'
  * @param {string} timezoneName - 时区名称，如 'Asia/Shanghai' 或 'America/New_York'
  * @param {Object} customRange - 自定义时间范围（仅当 timeWindow='custom_range' 时使用）：{ since: 'YYYY-MM-DD', until: 'YYYY-MM-DD' }
  * @returns {Object} { start: DateTime, end: DateTime, warnings?: Array<string> } 起止时间（Luxon DateTime 对象）和可选的警告信息
@@ -51,6 +51,24 @@ export function calculateTimeWindow(timeWindow, timezoneName = 'UTC', customRang
       start = now.minus({ days: 2 }).startOf('day')
       end = now.endOf('day')
       break
+
+    case 'last_3_days_excluding_today':
+      // 近 3 天（不含今天）：从 3 天前 00:00:00 到昨天 23:59:59.999
+      start = now.minus({ days: 3 }).startOf('day')
+      end = now.minus({ days: 1 }).endOf('day')
+      break
+
+    case 'last_5_days':
+      // 近 5 天（含今天）：从 4 天前 00:00:00 到今天 23:59:59.999
+      start = now.minus({ days: 4 }).startOf('day')
+      end = now.endOf('day')
+      break
+
+    case 'last_5_days_excluding_today':
+      // 近 5 天（不含今天）：从 5 天前 00:00:00 到昨天 23:59:59.999
+      start = now.minus({ days: 5 }).startOf('day')
+      end = now.minus({ days: 1 }).endOf('day')
+      break
       
     case 'last_7_days':
       // 过去 7 天：从 6 天前 00:00:00 到今日 23:59:59.999（包含今天，共 7 天）
@@ -62,6 +80,12 @@ export function calculateTimeWindow(timeWindow, timezoneName = 'UTC', customRang
       // 为什么需要这个？ruleDataService.js 已经在使用 last_7_days，但 timeWindow.js 还没有实现
       start = now.minus({ days: 6 }).startOf('day')
       end = now.endOf('day')
+      break
+
+    case 'last_7_days_excluding_today':
+      // 近 7 天（不含今天）：从 7 天前 00:00:00 到昨天 23:59:59.999
+      start = now.minus({ days: 7 }).startOf('day')
+      end = now.minus({ days: 1 }).endOf('day')
       break
       
     case 'last_30_days':
@@ -77,8 +101,8 @@ export function calculateTimeWindow(timeWindow, timezoneName = 'UTC', customRang
       break
       
     case 'lifetime':
-      // 累计至今：从广告创建日到当前（这里简化处理，从 1970-01-01 开始）
-      // 实际使用时，应该传入广告创建时间
+      // 至今为止：结束时间固定为今天结束，起点在查询层按对象 created_time 覆盖
+      // 这里保留 epoch 仅用于兼容调用方的默认窗口计算
       start = DateTime.fromMillis(0).setZone(timezoneName)  // 1970-01-01
       end = now.endOf('day')
       break

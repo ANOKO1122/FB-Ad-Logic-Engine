@@ -87,4 +87,41 @@ describe('evaluateRule 真实链路（logicOperator 驼峰）', () => {
     expect(matched[0].objectId).toBe('cmp_1')
     expect(matched[0].objectName).toBe('Campaign-1')
   })
+
+  it('purchases_avg_after_create 为 null 时大于条件不应命中', () => {
+    const rule = {
+      enabled: true,
+      targetLevel: 'ad',
+      conditions: [{ metric: 'purchases_avg_after_create', operator: 'gt', value: 2 }],
+      logicOperator: 'AND'
+    }
+    const matched = ruleEngine.evaluateRuleWithData(rule, [
+      {
+        ad_id: 'ad_1',
+        ad_set_id: 'as_1',
+        purchases_avg_after_create: null
+      }
+    ])
+    expect(matched.length).toBe(0)
+  })
+
+  it('purchases_avg_after_create 有数值时可参与条件判断并传入执行对象', () => {
+    const rule = {
+      enabled: true,
+      targetLevel: 'ad',
+      conditions: [{ metric: 'purchases_avg_after_create', operator: 'gt', value: 2 }],
+      logicOperator: 'AND'
+    }
+    const matched = ruleEngine.evaluateRuleWithData(rule, [
+      {
+        ad_id: 'ad_1',
+        ad_set_id: 'as_1',
+        purchases_avg_after_create: 3,
+        purchases_avg_after_create_days: 2
+      }
+    ])
+    expect(matched.length).toBe(1)
+    expect(matched[0].purchases_avg_after_create).toBe(3)
+    expect(matched[0].purchases_avg_after_create_days).toBe(2)
+  })
 })

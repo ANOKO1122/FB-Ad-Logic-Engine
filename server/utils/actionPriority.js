@@ -15,6 +15,7 @@
 export const ACTION_PRIORITY = {
   pause_ad: 1,
   activate_ad: 2,
+  set_dynamic_budget: 2.5,
   decrease_budget: 3,
   increase_budget: 4,
   set_budget: 5

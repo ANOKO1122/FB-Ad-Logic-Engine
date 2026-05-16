@@ -146,7 +146,12 @@
                   <option value="today">今天</option>
                   <option value="yesterday">昨天</option>
                   <option value="last_3_days">近3天</option>
-                  <option value="lifetime">累计</option>
+                  <option value="last_3_days_excluding_today">近3天（不含今天）</option>
+                  <option value="last_5_days">近5天</option>
+                  <option value="last_5_days_excluding_today">近5天（不含今天）</option>
+                  <option value="last_7_days">近7天</option>
+                  <option value="last_7_days_excluding_today">近7天（不含今天）</option>
+                  <option value="lifetime">至今为止</option>
                   <option value="custom_range">自定义范围</option>
                 </select>
                 <template v-if="form.when_time_window === 'custom_range'">
@@ -179,6 +184,7 @@
                   <option value="checkout_cost">单次结账花费</option>
                   <option value="payment_cost">单次添加支付信息花费</option>
                   <option value="purchases">购买次数</option>
+                  <option value="purchases_avg_after_create">多天购买次数平均数</option>
                   <option value="link_clicks">链接点击</option>
                   <option value="add_to_cart_count">加购次数</option>
                   <option value="initiate_checkout_count">结账次数</option>
@@ -212,8 +218,54 @@
                   <option value="increase_budget">增加预算</option>
                   <option value="decrease_budget">减少预算</option>
                   <option value="set_budget">设置预算为固定值</option>
+                  <option value="set_dynamic_budget">设置动态预算值</option>
                 </select>
                 <template v-if="a.type.includes('budget')">
+                  <template v-if="a.type === 'set_dynamic_budget'">
+                    <select v-model="a.metric" class="select-clean select-unit" title="公式指标">
+                      <option value="spend">花费</option>
+                      <option value="purchases">购买次数</option>
+                      <option value="purchases_avg_after_create">多天购买次数平均数</option>
+                      <option value="link_clicks">链接点击</option>
+                    </select>
+                    <input
+                      type="number"
+                      v-model.number="a.multiplier"
+                      class="input-clean input-value"
+                      placeholder="30"
+                      min="0.01"
+                      max="9999"
+                      step="0.01"
+                    />
+                    <span class="unit">× $</span>
+                    <span class="budget-cap-wrap">
+                      <span class="budget-cap-label">预算下限</span>
+                      <input
+                        type="number"
+                        :value="a.min_daily_budget != null ? (a.min_daily_budget / 100) : ''"
+                        @input="onMinBudgetInput($event, a)"
+                        class="input-clean input-budget-cap"
+                        placeholder="可选"
+                        min="1"
+                        step="0.01"
+                      />
+                      <span class="unit-hint">美元</span>
+                    </span>
+                    <span class="budget-cap-wrap">
+                      <span class="budget-cap-label">预算上限</span>
+                      <input
+                        type="number"
+                        :value="a.max_daily_budget != null ? (a.max_daily_budget / 100) : ''"
+                        @input="onMaxBudgetInput($event, a)"
+                        class="input-clean input-budget-cap"
+                        placeholder="可选"
+                        min="1"
+                        step="0.01"
+                      />
+                      <span class="unit-hint">美元</span>
+                    </span>
+                  </template>
+                  <template v-else>
                   <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select-clean select-unit" title="调整单位">
                     <option value="percent">百分比</option>
                     <option value="usd">固定金额</option>
@@ -275,6 +327,7 @@
                     />
                     <span class="unit-hint">美元</span>
                   </span>
+                  </template>
                 </template>
               </div>
             </div>
@@ -305,6 +358,7 @@ const METRIC_LABELS = {
   checkout_cost: '单次结账花费',
   payment_cost: '单次添加支付信息花费',
   purchases: '购买次数',
+  purchases_avg_after_create: '多天购买次数平均数',
   link_clicks: '链接点击',
   add_to_cart_count: '加购次数',
   initiate_checkout_count: '结账次数',
@@ -315,7 +369,12 @@ const TIME_WINDOW_LABELS = {
   today: 'TODAY',
   yesterday: 'YESTERDAY',
   last_3_days: 'LAST 3 DAYS',
-  lifetime: 'LIFETIME',
+  last_3_days_excluding_today: 'LAST 3 DAYS (EXCLUDING TODAY)',
+  last_5_days: 'LAST 5 DAYS',
+  last_5_days_excluding_today: 'LAST 5 DAYS (EXCLUDING TODAY)',
+  last_7_days: 'LAST 7 DAYS',
+  last_7_days_excluding_today: 'LAST 7 DAYS (EXCLUDING TODAY)',
+  lifetime: 'TO DATE',
   custom_range: '自定义'
 }
 const ACTION_LABELS = {
@@ -323,7 +382,8 @@ const ACTION_LABELS = {
   activate_ad: '启用广告',
   increase_budget: '增加预算',
   decrease_budget: '减少预算',
-  set_budget: '设置预算'
+  set_budget: '设置预算',
+  set_dynamic_budget: '设置动态预算值'
 }
 
 export default {
@@ -353,6 +413,12 @@ export default {
     const timeWindowLabel = (tw) => TIME_WINDOW_LABELS[tw] || tw
     const actionLabel = (a) => {
       const label = ACTION_LABELS[a.type] || a.type
+      if (a.type === 'set_dynamic_budget') {
+        const parts = [`${label}：${metricLabel(a.metric || 'purchases')} × ${Number(a.multiplier || 0)}`]
+        if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
+        if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
+        return parts.join('，')
+      }
       if (a.value == null) return label
       if (a.type === 'set_budget') return `${label} $${Number(a.value)}`
       const unit = a.value_unit === 'usd' ? 'usd' : 'percent'
@@ -458,6 +524,10 @@ export default {
             n++
           }
         }
+        if (a?.type !== 'set_dynamic_budget' && a?.min_daily_budget != null && a?.max_daily_budget != null) {
+          a.max_daily_budget = undefined
+          n++
+        }
       }
       return n
     }
@@ -515,6 +585,11 @@ export default {
         if (a.value == null || a.value === '' || a.value < 0.01) a.value = 30
         a.max_daily_budget = undefined
         a.min_daily_budget = undefined
+      } else if (a.type === 'set_dynamic_budget') {
+        a.value = undefined
+        a.value_unit = 'usd'
+        a.metric = a.metric || 'purchases'
+        if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -575,7 +650,27 @@ export default {
       if (form.when_lines.length === 0) return alert('请至少添加一个条件')
       if (form.actions.length === 0) return alert('请至少添加一个动作')
       for (const a of form.actions) {
-        if (a.type === 'set_budget') {
+        if (a.type === 'set_dynamic_budget') {
+          const multiplier = Number(a.multiplier)
+          if (!a.metric) return alert('动态预算请选择指标')
+          if (a.multiplier == null || a.multiplier === '' || !Number.isFinite(multiplier) || multiplier <= 0) {
+            return alert('动态预算倍率必须大于 0')
+          }
+          if (Math.abs(multiplier * 100 - Math.round(multiplier * 100)) >= 1e-6) {
+            return alert('动态预算倍率最多两位小数')
+          }
+          if (a.min_daily_budget != null) {
+            const min = Number(a.min_daily_budget)
+            if (!Number.isInteger(min) || min < 100) return alert('预算下限需为 >= 1 美元')
+          }
+          if (a.max_daily_budget != null) {
+            const max = Number(a.max_daily_budget)
+            if (!Number.isInteger(max) || max < 100) return alert('预算上限需为 >= 1 美元')
+          }
+          if (a.min_daily_budget != null && a.max_daily_budget != null && Number(a.min_daily_budget) > Number(a.max_daily_budget)) {
+            return alert('动态预算下限不能大于上限')
+          }
+        } else if (a.type === 'set_budget') {
           const v = Number(a.value)
           if (a.value == null || a.value === '' || !Number.isFinite(v) || v < 0.01 || v > 9999) {
             return alert('设置预算请填写 0.01–9999 的数值（美元）')
@@ -625,7 +720,14 @@ export default {
         when_custom_range: form.when_time_window === 'custom_range' ? { since: customRange.since, until: customRange.until } : null,
         actions: form.actions.map(a => {
           const out = { type: a.type, value: a.value }
-          if (a.type === 'set_budget') {
+          if (a.type === 'set_dynamic_budget') {
+            out.metric = a.metric || 'purchases'
+            out.multiplier = Number(a.multiplier)
+            out.value_unit = 'usd'
+            delete out.value
+            if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
+            if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
+          } else if (a.type === 'set_budget') {
             out.value_unit = 'usd'
           } else if (a.type === 'increase_budget') {
             out.value_unit = a.value_unit || 'percent'

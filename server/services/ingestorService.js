@@ -1017,6 +1017,28 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     
     logger.info(`📊 从数据库查询到 ${targetAdIds.length} 个活跃广告（近 ${daysBack} 天内有 spend>0）`)
     
+    // [修复] 凌晨滑动窗口无法发现新广告：补一个账户级 Insights 嗅探
+    // filterActiveAds 只查 DB 已知 ad_id，首次产生花费的新广告不在其中
+    // 通过账户级 getAdInsights 嗅探补齐，嗅探失败不中断主流程
+    try {
+      const discovered = await facebookApi.getAdInsights(accountId, { preset: 'today' }, {
+        level: 'ad',
+        useAccountAttributionSetting: true,
+        spendGreaterThanZero: true,
+        signal
+      })
+      const discoveredIds = [...new Set(
+        (discovered || []).map(i => String(i.ad_id || '')).filter(Boolean)
+      )]
+      const newIds = discoveredIds.filter(id => !targetAdIds.includes(id))
+      if (newIds.length > 0) {
+        logger.info(`🔍 发现 ${newIds.length} 个新广告（DB 未记录），合并到同步列表`)
+        targetAdIds = [...targetAdIds, ...newIds]
+      }
+    } catch (err) {
+      logger.warn(`⚠️ 新广告嗅探失败，跳过（不影响已知广告同步）: ${err.message}`)
+    }
+    
     // 6. 获取广告状态（优化：只获取目标广告的状态，使用批量查询 API）
     logger.info(`📋 获取账户 ${accountId} 的目标广告状态（批量查询，${targetAdIds.length} 个）...`)
     // 使用 resolveObjectsByIds 批量查询，避免拉取所有广告（包括废弃的）

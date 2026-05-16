@@ -2,7 +2,7 @@
 // 注意：这是新功能，使用 Drizzle；旧功能（用户管理）继续使用原生 SQL
 import { db } from '../db/drizzle.js'
 import { rules, users, owners } from '../db/schema.js'
-import { eq, and, desc, inArray, isNull, or } from 'drizzle-orm'
+import { eq, and, desc, inArray, or, sql } from 'drizzle-orm'
 import { getTableColumns } from 'drizzle-orm'
 import { getAccountTimezone } from './ruleDataService.js'
 import pool from '../db/connection.js'
@@ -129,17 +129,18 @@ export async function createRule(userId, ruleData, ownerId = null) {
  * @param {object} options - 查询选项
  * @param {boolean} options.isAdmin - 是否为管理员（管理员可查看所有规则）
  * @param {number[]} [options.ownerIds] - 仅当 isAdmin 时有效；有值时只查这些负责人下的规则，空/未传表示不按负责人过滤
- * @param {boolean} [options.includeNoOwner] - 仅当 isAdmin 时有效；为 true 时包含 users.owner_id IS NULL 的规则（管理员创建、未分配负责人的规则）
+ * @param {boolean} [options.includeNoOwner] - 仅当 isAdmin 时有效；为 true 时包含管理员创建的规则（卡片负责人显示为“无”）
  * @param {number|null} [options.viewerOwnerId] - 非管理员必填：当前登录用户所属负责人 ID，列表按「同一负责人下所有用户创建的规则」过滤
  * @returns {Promise<Array>} 规则列表（每项为扁平对象，含 ownerId、ownerName，与旧结构兼容）
  */
 export async function getUserRules(userId, options = {}) {
   const { isAdmin, ownerIds, includeNoOwner, onlyEnabled, orderBy, limit, offset, viewerOwnerId } = options
+  const ruleOwnerExpr = sql`COALESCE(${rules.rulesOwnerId}, ${users.ownerId})`
 
   // 显式扁平化 select：规则表全部列 + 负责人 id/name，避免 Drizzle 默认返回嵌套 { rules, users, owners }
   const selectColumns = {
     ...getTableColumns(rules),
-    ownerId: owners.id,
+    ownerId: ruleOwnerExpr,
     ownerName: owners.ownerName
   }
 
@@ -147,7 +148,7 @@ export async function getUserRules(userId, options = {}) {
     .select(selectColumns)
     .from(rules)
     .leftJoin(users, eq(rules.userId, users.id))
-    .leftJoin(owners, eq(users.ownerId, owners.id))
+    .leftJoin(owners, sql`${owners.id} = ${ruleOwnerExpr}`)
 
   const filters = []
   if (!isAdmin) {
@@ -157,13 +158,13 @@ export async function getUserRules(userId, options = {}) {
     }
     filters.push(eq(users.ownerId, Number(viewerOwnerId)))
   } else {
-    // 管理员：支持三分支筛选 —— 真实负责人 / 负责人无(NULL) / 两者并集
+    // 管理员：支持三分支筛选 —— 真实负责人 / 管理员创建 / 两者并集
     const adminOwnerFilters = []
     if (ownerIds && ownerIds.length > 0) {
-      adminOwnerFilters.push(inArray(users.ownerId, ownerIds))
+      adminOwnerFilters.push(inArray(ruleOwnerExpr, ownerIds))
     }
     if (includeNoOwner) {
-      adminOwnerFilters.push(isNull(users.ownerId))
+      adminOwnerFilters.push(inArray(users.role, ['admin', 'super_admin']))
     }
     if (adminOwnerFilters.length === 1) {
       filters.push(adminOwnerFilters[0])

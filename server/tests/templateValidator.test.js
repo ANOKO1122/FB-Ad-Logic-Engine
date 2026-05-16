@@ -3,7 +3,7 @@
  * 覆盖：set_budget value_unit 严格化、percent 整数、usd 两位小数
  */
 import { describe, it, expect } from 'vitest'
-import { validateActions } from '../utils/templateValidator.js'
+import { validateActions, validateTemplateBody } from '../utils/templateValidator.js'
 
 describe('validateActions', () => {
   it('campaign 级规则配置预算动作应失败', () => {
@@ -93,5 +93,48 @@ describe('validateActions', () => {
     expect(r2.valid).toBe(false)
     expect(r1.error).toMatch(/min_daily_budget.*>= 100/)
     expect(r2.error).toMatch(/min_daily_budget.*整数/)
+  })
+
+  it('set_dynamic_budget 应校验公式、上下限和目标层级指标', () => {
+    const ok = validateActions([{
+      type: 'set_dynamic_budget',
+      metric: 'purchases',
+      multiplier: 30,
+      min_daily_budget: 1000,
+      max_daily_budget: 20000
+    }], 'campaign')
+    expect(ok.valid).toBe(true)
+
+    const badLimit = validateActions([{
+      type: 'set_dynamic_budget',
+      metric: 'purchases',
+      multiplier: 30,
+      min_daily_budget: 20000,
+      max_daily_budget: 1000
+    }], 'ad')
+    expect(badLimit.valid).toBe(false)
+    expect(badLimit.error).toMatch(/min_daily_budget/)
+
+    const badMetric = validateActions([{
+      type: 'set_dynamic_budget',
+      metric: 'purchases_avg_after_create',
+      multiplier: 30
+    }], 'adset')
+    expect(badMetric.valid).toBe(false)
+    expect(badMetric.error).toMatch(/多天购买次数平均数/)
+  })
+
+  it('模板条件中 purchases_avg_after_create 仅允许广告层', () => {
+    const body = {
+      name: 'avg',
+      slug: 'avg',
+      target_level: 'campaign',
+      when_lines: [{ join: null, metric: 'purchases_avg_after_create', operator: 'gt', value: 2 }],
+      when_time_window: 'last_3_days',
+      actions: [{ type: 'pause_ad' }]
+    }
+    const result = validateTemplateBody(body)
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/多天购买次数平均数/)
   })
 })

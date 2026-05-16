@@ -311,6 +311,7 @@ const METRIC_LABEL = {
   checkout_cost: '单次结账花费',
   payment_cost: '单次添加支付信息花费',
   purchases: '购买次数',
+  purchases_avg_after_create: '多天购买次数平均数',
   link_clicks: '链接点击',
   add_to_cart_count: '加购次数',
   initiate_checkout_count: '结账次数',
@@ -323,7 +324,12 @@ const TIME_WINDOW_LABEL = {
   today: '今天',
   yesterday: '昨天',
   last_3_days: '近3天',
-  lifetime: '累计',
+  last_3_days_excluding_today: '近3天（不含今天）',
+  last_5_days: '近5天',
+  last_5_days_excluding_today: '近5天（不含今天）',
+  last_7_days: '近7天',
+  last_7_days_excluding_today: '近7天（不含今天）',
+  lifetime: '至今为止',
   custom_range: '自定义'
 }
 
@@ -333,7 +339,8 @@ const ACTION_LABEL = {
   activate_ad: '启用目标',
   increase_budget: '增加预算',
   decrease_budget: '减少预算',
-  set_budget: '设置预算'
+  set_budget: '设置预算',
+  set_dynamic_budget: '设置动态预算值'
 }
 
 /**
@@ -482,6 +489,18 @@ function formatOneActionHuman(a) {
   }
   if (type === 'set_budget') {
     return `${base} 为 $${Number(a.value)}`
+  }
+  if (type === 'set_dynamic_budget') {
+    let s = `${base}：${METRIC_LABEL[a.metric] || a.metric || '购买次数'} × ${Number(a.multiplier || 0)}`
+    if (a.min_daily_budget != null) {
+      const d = dollarsFromCents(a.min_daily_budget)
+      if (d != null) s += `（日预算下限 $${d}）`
+    }
+    if (a.max_daily_budget != null) {
+      const d = dollarsFromCents(a.max_daily_budget)
+      if (d != null) s += `（日预算上限 $${d}）`
+    }
+    return s
   }
   if (type === 'increase_budget' || type === 'decrease_budget') {
     const isUsd = a.value_unit === 'usd'

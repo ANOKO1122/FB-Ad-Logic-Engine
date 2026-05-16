@@ -46,7 +46,7 @@ vi.mock('../db/connection.js', () => ({
   }
 }))
 
-import { executeActionsForAd } from '../services/actionExecutorService.js'
+import { executeActionsForAd, executeActionsForRule } from '../services/actionExecutorService.js'
 
 describe('executeActionsForAd 审计日志结构化错误', () => {
   beforeEach(() => {
@@ -131,6 +131,43 @@ describe('executeActionsForAd 审计日志结构化错误', () => {
     expect(payload.adId).toBe('')
     expect(payload.objectType).toBe('campaign')
     expect(payload.objectId).toBe('cmp_123')
+  })
+
+  it('同层对象重复输入时应去重，避免重复写入审计日志', async () => {
+    mockInsertValues.mockResolvedValue([{ insertId: 1 }])
+
+    const stats = await executeActionsForRule({
+      rule: {
+        id: 1204,
+        ruleName: 'test-campaign-dedupe',
+        targetLevel: 'campaign',
+        actions: [{ type: 'pause_ad' }],
+        isSimulation: true
+      },
+      matchedAds: [
+        {
+          objectType: 'campaign',
+          objectId: 'cmp_88',
+          objectName: 'Campaign 88',
+          campaign_id: 'cmp_88'
+        },
+        {
+          objectType: 'campaign',
+          objectId: 'cmp_88',
+          objectName: 'Campaign 88',
+          campaign_id: 'cmp_88'
+        }
+      ],
+      accountId: 'act_3',
+      ownerId: 9,
+      runId: 'run_3'
+    })
+
+    expect(stats.totalAds).toBe(1)
+    expect(mockInsertValues).toHaveBeenCalledTimes(1)
+    const payload = mockInsertValues.mock.calls[0][0]
+    expect(payload.objectType).toBe('campaign')
+    expect(payload.objectId).toBe('cmp_88')
   })
 })
 

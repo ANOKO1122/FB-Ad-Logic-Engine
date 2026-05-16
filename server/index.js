@@ -6,6 +6,7 @@ import https from 'https'
 import http from 'http'
 import tls from 'tls'
 import net from 'net'
+import { DateTime } from 'luxon'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
 import { parseProxyUrl, isSocksProxy } from './utils/proxyUtils.js'
@@ -128,6 +129,25 @@ function isAbortLikeError(error) {
     error?.name === 'CanceledError' ||
     error?.code === 'ABORT_ERR' ||
     error?.code === 'ERR_CANCELED'
+}
+
+function formatFacebookErrorPayload(payload) {
+  const err = payload?.error
+  if (!err || typeof err !== 'object') return ''
+  const parts = []
+  if (err.message) parts.push(String(err.message))
+  if (err.type) parts.push(`type=${err.type}`)
+  if (err.code != null) parts.push(`code=${err.code}`)
+  if (err.error_subcode != null) parts.push(`subcode=${err.error_subcode}`)
+  if (err.error_user_title) parts.push(`title=${err.error_user_title}`)
+  if (err.error_user_msg) parts.push(`user_msg=${err.error_user_msg}`)
+  if (err.fbtrace_id) parts.push(`fbtrace_id=${err.fbtrace_id}`)
+  return parts.join(' | ')
+}
+
+function formatRequestError(error) {
+  const fbDetail = formatFacebookErrorPayload(error?.response?.data) || formatFacebookErrorPayload(error?.facebookError)
+  return fbDetail || error?.message || 'unknown_error'
 }
 
 function throwIfAborted(signal, message = '请求已取消') {
@@ -942,7 +962,10 @@ class FacebookMarketingAPI {
             if (!response.ok) {
               const errorData = await response.json().catch(() => ({}))
               checkTokenError(errorData)
-              throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+              const detail = formatFacebookErrorPayload(errorData)
+              const err = new Error(detail || `HTTP ${response.status}: ${response.statusText}`)
+              err.facebookError = errorData
+              throw err
             }
             
             const data = await response.json()
@@ -2021,7 +2044,7 @@ class FacebookMarketingAPI {
       if (error.message.includes('Facebook API Error')) {
         throw error
       }
-      throw new Error(`更新广告组预算失败: ${error.message}`)
+      throw new Error(`更新广告组预算失败: ${formatRequestError(error)}`)
     }
   }
 
@@ -2090,7 +2113,7 @@ class FacebookMarketingAPI {
       if (error.message.includes('Facebook API Error')) {
         throw error
       }
-      throw new Error(`更新广告系列预算失败: ${error.message}`)
+      throw new Error(`更新广告系列预算失败: ${formatRequestError(error)}`)
     }
   }
 }
@@ -2279,6 +2302,9 @@ class RuleEngine {
           // 直接复制指标到顶层（扁平结构）
           spend: adData.spend,
           purchases: adData.purchases,
+          purchases_avg_after_create: adData.purchases_avg_after_create ?? null,
+          purchases_avg_after_create_days: adData.purchases_avg_after_create_days ?? null,
+          purchases_avg_after_create_range: adData.purchases_avg_after_create_range ?? null,
           cpc: adData.cpc,
           ucpc: adData.ucpc,
           roas: adData.roas,
@@ -2347,6 +2373,9 @@ class RuleEngine {
           mute_reason: adData.mute_reason,
           spend: adData.spend,
           purchases: adData.purchases,
+          purchases_avg_after_create: adData.purchases_avg_after_create ?? null,
+          purchases_avg_after_create_days: adData.purchases_avg_after_create_days ?? null,
+          purchases_avg_after_create_range: adData.purchases_avg_after_create_range ?? null,
           cpc: adData.cpc,
           ucpc: adData.ucpc,
           roas: adData.roas,
@@ -2534,6 +2563,9 @@ class RuleEngine {
   evaluateCondition(condition, adData) {
     // 第1行：获取指标值（从 adData 中提取）
     const metricValue = this.getMetricValue(condition.metric, adData)
+    if (metricValue == null || Number.isNaN(Number(metricValue))) {
+      return condition.operator === 'ne' ? metricValue !== condition.value : false
+    }
     
     // 第2-15行：根据操作符评估条件
     // 支持的操作符：gt, lt, eq, gte, lte, ne（不等于）
@@ -2577,6 +2609,8 @@ class RuleEngine {
         return parseFloat(adData.spend || 0)
       case 'purchases':
         return parseInt(adData.purchases || 0)
+      case 'purchases_avg_after_create':
+        return adData.purchases_avg_after_create != null ? parseFloat(adData.purchases_avg_after_create) : null
       case 'purchase_value':
         return parseFloat(adData.purchase_value || 0)
       case 'link_clicks':
@@ -3606,6 +3640,10 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
     const result = await queryRuleData(account_id, adIds, timeWindow, null, customRange)
     const data = result.data || result  // 兼容旧格式（如果返回的是数组）
     const serviceWarnings = result.warnings || []  // 从 queryRuleData 获取 warnings
+    const effectiveRangeStart = result.effective_range?.start?.iso
+      ? DateTime.fromISO(result.effective_range.start.iso, { setZone: true })
+      : null
+    const rangeStart = effectiveRangeStart?.isValid ? effectiveRangeStart : timeWindowResult.start
     
     // 构建 meta 字段
     // 合并 timeWindowResult.warnings 和 serviceWarnings（降级策略产生的 warnings）
@@ -3617,16 +3655,16 @@ app.get('/api/rule-data', requireAuth, requireActive, async (req, res) => {
       data_timezone_used: dataTimezoneUsed,
       range: {
         start: {
-          local: timeWindowResult.start.toFormat('yyyy-MM-dd HH:mm:ss'),
-          utc: timeWindowResult.start.toUTC().toFormat('yyyy-MM-dd HH:mm:ss'),
-          iso: timeWindowResult.start.toISO()
+          local: rangeStart.toFormat('yyyy-MM-dd HH:mm:ss'),
+          utc: rangeStart.toUTC().toFormat('yyyy-MM-dd HH:mm:ss'),
+          iso: rangeStart.toISO()
         },
         end: {
           local: timeWindowResult.end.toFormat('yyyy-MM-dd HH:mm:ss'),
           utc: timeWindowResult.end.toUTC().toFormat('yyyy-MM-dd HH:mm:ss'),
           iso: timeWindowResult.end.toISO()
         },
-        days: Math.ceil(timeWindowResult.end.diff(timeWindowResult.start, 'days').days)
+        days: Math.ceil(timeWindowResult.end.diff(rangeStart, 'days').days)
       },
       warnings: allWarnings
     }
