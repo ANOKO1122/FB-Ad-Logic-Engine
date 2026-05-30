@@ -187,6 +187,68 @@ async function loadCreatedSinceByAd(accountId, adIds, timezoneName, options = {}
   return { createdSinceByAd, warnings }
 }
 
+/**
+ * 查询每个广告「首次产生花费」的日期（用于 purchases_avg_after_create 计算）
+ * 优先查 daily_stats，兜底查 ad_snapshots（当天新建的广告可能只有快照有数据）
+ * @param {string} accountId
+ * @param {string[]} adIds
+ * @returns {Promise<Map<string, string>>} ad_id -> 'YYYY-MM-DD'
+ */
+async function loadFirstSpendDateByAd(accountId, adIds) {
+  const map = new Map()
+  const adIdArray = adIds == null ? null : (Array.isArray(adIds) ? adIds : [adIds]).map(id => String(id || '').trim()).filter(Boolean)
+  if (!adIdArray || adIdArray.length === 0) return map
+  const placeholders = adIdArray.map(() => '?').join(',')
+
+  // 主查询：daily_stats 中每个广告最早有花费的日期
+  try {
+    const [rows] = await pool.execute(
+      `SELECT ad_id, MIN(date) AS first_date
+       FROM daily_stats
+       WHERE account_id = ? AND ad_id IN (${placeholders}) AND spend > 0
+       GROUP BY ad_id`,
+      [accountId, ...adIdArray]
+    )
+    for (const row of rows || []) {
+      const adId = String(row.ad_id || '').trim()
+      const d = row.first_date
+      if (adId && d) {
+        const dateStr = d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)
+        map.set(adId, dateStr)
+      }
+    }
+  } catch (err) {
+    logger.warn(`   ⚠️  loadFirstSpendDateByAd 查 daily_stats 失败:`, err.message)
+  }
+
+  // 兜底：daily_stats 没有的，查 ad_snapshots（当天新建广告可能只有快照）
+  const missingIds = adIdArray.filter(id => !map.has(id))
+  if (missingIds.length > 0) {
+    try {
+      const missPlaceholders = missingIds.map(() => '?').join(',')
+      const [snapRows] = await pool.execute(
+        `SELECT ad_id, MIN(data_date) AS first_date
+         FROM ad_snapshots
+         WHERE account_id = ? AND ad_id IN (${missPlaceholders}) AND spend > 0
+         GROUP BY ad_id`,
+        [accountId, ...missingIds]
+      )
+      for (const row of snapRows || []) {
+        const adId = String(row.ad_id || '').trim()
+        const d = row.first_date
+        if (adId && d) {
+          const dateStr = d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)
+          map.set(adId, dateStr)
+        }
+      }
+    } catch (err) {
+      logger.warn(`   ⚠️  loadFirstSpendDateByAd 兜底查 ad_snapshots 失败:`, err.message)
+    }
+  }
+
+  return map
+}
+
 function normalizeDateOnly(value, timezoneName = 'UTC') {
   if (value == null) return null
   if (value instanceof Date) return value.toISOString().slice(0, 10)
@@ -215,10 +277,13 @@ function augmentPurchasesAverageAfterCreate(rows, sourceDailyRows, {
   windowStartDate,
   windowEndDate,
   createdDateByAd,
+  firstSpendDateByAd,
   timezoneName
 }) {
   if (!Array.isArray(rows) || rows.length === 0) return rows
-  const createdMap = createdDateByAd instanceof Map ? createdDateByAd : new Map()
+  // ★ 改为按「首次花费日期」计算有效天数，而非「广告创建日期」
+  // 旧逻辑（按创建日期）已注释保留在下面
+  const spendMap = firstSpendDateByAd instanceof Map ? firstSpendDateByAd : null
   const purchasesByAdDate = new Map()
 
   for (const row of sourceDailyRows || []) {
@@ -231,12 +296,20 @@ function augmentPurchasesAverageAfterCreate(rows, sourceDailyRows, {
 
   return rows.map((row) => {
     const adId = String(row?.ad_id || '').trim()
-    const createdDate = createdMap.get(adId)
-    const effectiveStart = createdDate ? addDaysToDate(createdDate, 1, timezoneName) : null
-    const rangeStart = effectiveStart && effectiveStart > windowStartDate ? effectiveStart : windowStartDate
-    const effectiveDays = createdDate ? countInclusiveDays(rangeStart, windowEndDate, timezoneName) : 0
 
-    if (!adId || !createdDate || effectiveDays <= 0) {
+    // --- 新逻辑：按首次花费日期计算 ---
+    const firstSpendDate = spendMap ? spendMap.get(adId) : null
+    const rangeStart = firstSpendDate && firstSpendDate > windowStartDate ? firstSpendDate : windowStartDate
+    const effectiveDays = firstSpendDate ? countInclusiveDays(rangeStart, windowEndDate, timezoneName) : 0
+
+    // --- 旧逻辑（按广告创建日期计算，已注释）---
+    // const createdMap = createdDateByAd instanceof Map ? createdDateByAd : new Map()
+    // const createdDate = createdMap.get(adId)
+    // const effectiveStart = createdDate ? addDaysToDate(createdDate, 1, timezoneName) : null
+    // const rangeStart = effectiveStart && effectiveStart > windowStartDate ? effectiveStart : windowStartDate
+    // const effectiveDays = createdDate ? countInclusiveDays(rangeStart, windowEndDate, timezoneName) : 0
+
+    if (!adId || !firstSpendDate || effectiveDays <= 0) {
       return {
         ...row,
         purchases_avg_after_create: null,
@@ -244,7 +317,8 @@ function augmentPurchasesAverageAfterCreate(rows, sourceDailyRows, {
         purchases_avg_after_create_range: {
           window_start_date: windowStartDate,
           window_end_date: windowEndDate,
-          created_date: createdDate || null,
+          first_spend_date: firstSpendDate || null,
+          source: 'first_spend_date',
           effective_start_date: null,
           effective_end_date: windowEndDate
         }
@@ -267,7 +341,8 @@ function augmentPurchasesAverageAfterCreate(rows, sourceDailyRows, {
       purchases_avg_after_create_range: {
         window_start_date: windowStartDate,
         window_end_date: windowEndDate,
-        created_date: createdDate,
+        first_spend_date: firstSpendDate,
+        source: 'first_spend_date',
         effective_start_date: rangeStart,
         effective_end_date: windowEndDate,
         purchases: effectivePurchases
@@ -421,11 +496,14 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
   let createdSinceByAd = null
   let createdDateByAd = null
   let effectiveRange = null
+  let firstSpendDateByAd = null
 
   const createdLoad = await loadCreatedSinceByAd(accountId, adIds, dataTimezoneUsed, {
     warnMissingForLifetime: isLifetimeWindow(timeWindow)
   })
   createdDateByAd = createdLoad.createdSinceByAd
+  // ★ 加载首次花费日期，用于 purchases_avg_after_create 计算
+  firstSpendDateByAd = await loadFirstSpendDateByAd(accountId, adIds)
   if (isLifetimeWindow(timeWindow)) {
     createdSinceByAd = createdDateByAd
     effectiveRange = buildLifetimeEffectiveRange(createdSinceByAd, dataTimezoneUsed)
@@ -442,7 +520,7 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
     // 合并后调用 aggregateMultiDayMetrics 聚合
     if (route.needAggregation) {
       // 多天窗口：使用合并查询
-      const mergedResult = await queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange, createdSinceByAd, createdDateByAd)
+      const mergedResult = await queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange, createdSinceByAd, createdDateByAd, firstSpendDateByAd)
       rawData = mergedResult.data
       warnings.push(...mergedResult.warnings)
     } else {
@@ -481,6 +559,7 @@ export async function queryRuleData(accountId, adIds, timeWindow, timezoneName =
         windowStartDate: metricWindow.start.toFormat('yyyy-MM-dd'),
         windowEndDate: metricWindow.end.toFormat('yyyy-MM-dd'),
         createdDateByAd,
+        firstSpendDateByAd,
         timezoneName: dataTimezoneUsed
       })
     }
@@ -562,6 +641,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             add_to_cart_count,
             initiate_checkout_count,
             add_payment_info_count,
+            cpm,
             cpc,
             roas,
             ucpc,
@@ -617,6 +697,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
             add_to_cart_count,
             initiate_checkout_count,
             add_payment_info_count,
+            cpm,
             cpc,
             roas,
             ucpc,
@@ -680,6 +761,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
       initiate_checkout_count: parseInt(row.initiate_checkout_count || 0),
       add_payment_info_count: parseInt(row.add_payment_info_count || 0),
       // 单价/比率类指标：映射层不做本地兜底，统一交给 calculateSingleDayMetrics 计算
+      cpm: row.cpm != null ? parseFloat(row.cpm) : null,
       cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null,
       ucpc: null,
@@ -716,7 +798,7 @@ async function queryAdSnapshots(accountId, adIds, timeWindow, timezoneName, isFa
  * @param {Map<string, string>|null} createdDateByAd - 计算创建日后购买均值用的 ad_id -> 创建日
  * @returns {Promise<{data: Array, warnings: Array}>} 返回合并后的数据和 warnings
  */
-async function queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange = null, createdSinceByAd = null, createdDateByAd = null) {
+async function queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUsed, customRange = null, createdSinceByAd = null, createdDateByAd = null, firstSpendDateByAd = null) {
   const warnings = []
   
   // 1. 计算时间窗口（用于确定历史段和今天段）
@@ -848,6 +930,7 @@ async function queryMultiDayWindow(accountId, adIds, timeWindow, dataTimezoneUse
     windowStartDate,
     windowEndDate: endDate,
     createdDateByAd,
+    firstSpendDateByAd,
     timezoneName: dataTimezoneUsed
   })
   
@@ -889,6 +972,7 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
         add_to_cart_count,
         initiate_checkout_count,
         add_payment_info_count,
+        cpm,
         cpc,
         roas,
         add_to_cart as add_to_cart_count_legacy
@@ -925,6 +1009,7 @@ async function queryDailyStatsForRange(accountId, adIds, dateRange, timezoneName
       add_to_cart_count: parseInt(row.add_to_cart_count || row.add_to_cart_count_legacy || 0),
       initiate_checkout_count: parseInt(row.initiate_checkout_count || 0),
       add_payment_info_count: parseInt(row.add_payment_info_count || 0),
+      cpm: row.cpm != null ? parseFloat(row.cpm) : null,
       cpc: null,
       roas: row.roas != null ? parseFloat(row.roas) : null
     }))
@@ -1157,6 +1242,9 @@ function aggregateMultiDayMetrics(dailyStatsArray) {
         ? null
         : (totals.totalPurchaseValue > 0 ? totals.totalPurchaseValue / totals.totalSpend : 0),
       
+      // CPM：多天聚合无法重算（缺少 impressions），返回 null
+      cpm: null,
+      
       // 其余成本类：分母为 0 返回 null（无数据）
       cpa: totals.totalPurchases > 0 ? totals.totalSpend / totals.totalPurchases : null,
       cpc: totals.totalLinkClicks > 0 ? totals.totalSpend / totals.totalLinkClicks : null,
@@ -1241,6 +1329,7 @@ function calculateSingleDayMetrics(dailyStats) {
 
     // 单价/比率类指标：除 ROAS 外，分母为 0 时返回 null（表示无数据）
     roas: roas,
+    cpm: dailyStats.cpm != null ? parseFloat(dailyStats.cpm) : null,
     cpa: purchases > 0 ? spend / purchases : null,
     cpc: linkClicks > 0 ? spend / linkClicks : null,
     ucpc: uniqueLinkClicks > 0 ? spend / uniqueLinkClicks : null,

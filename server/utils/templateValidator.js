@@ -23,7 +23,7 @@ const VALID_ACTION_TYPES = ['pause_ad', 'activate_ad', 'increase_budget', 'decre
 const VALID_VALUE_UNITS = ['percent', 'usd']
 /** 与 RuleManager/AdminTemplates 前端下拉、ruleDataService 读侧口径对齐，见 docs/0指标清单，字段清单.md */
 const VALID_METRICS = [
-  'spend', 'roas', 'cpa', 'cpc', 'purchases', 'link_clicks',
+  'spend', 'roas', 'cpa', 'cpc', 'cpm', 'purchases', 'link_clicks',
   'add_to_cart_count', 'add_to_cart_cost', 'initiate_checkout_count', 'checkout_cost',
   'add_payment_info_count', 'payment_cost', 'purchases_avg_after_create'
 ]

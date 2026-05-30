@@ -102,6 +102,10 @@ export async function upsertRuleAdExecutionStateBatch(entries) {
   const validStatus = ['success', 'fail', 'suppressed', 'outside_window']
   try {
     for (const { ruleId, scopeKey, lastStatus } of entries) {
+      // outside_window / suppressed 不计入冷却，不写入此表
+      // 冷却表只记录真正执行过（success/fail）的状态
+      if (lastStatus === 'outside_window' || lastStatus === 'suppressed') continue
+
       const status = validStatus.includes(lastStatus) ? lastStatus : null
       // 表 ad_id 为 NOT NULL：仅 ad/status_ad 前缀回填 ad_id，其余写空串
       let adIdVal = ''

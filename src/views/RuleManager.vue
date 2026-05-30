@@ -692,6 +692,10 @@
                     step="0.01"
                   />
                   <span class="action-hint">（实际调整广告组或广告系列预算）</span>
+                  <label class="skip-higher-wrap">
+                    <input type="checkbox" v-model="a.skip_when_current_higher" />
+                    <span>如果当前预算更高，不做下调</span>
+                  </label>
                 </template>
                 <template v-else>
                 <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select action-unit-select" title="调整单位">
@@ -1135,6 +1139,7 @@ export default {
       { value: 'roas', label: 'ROAS' },
       { value: 'cpa', label: '单次购买花费（CPA）' },
       { value: 'cpc', label: 'CPC（花费/链接点击）' },
+      { value: 'cpm', label: 'CPM（千次展示费用）' },
       { value: 'add_to_cart_cost', label: '单次加购花费' },
       { value: 'checkout_cost', label: '单次结账花费' },
       { value: 'payment_cost', label: '单次添加支付信息花费' },
@@ -1150,11 +1155,12 @@ export default {
         ? [...BASE_METRIC_OPTIONS, AVG_PURCHASES_METRIC]
         : BASE_METRIC_OPTIONS
     )
-    const dynamicBudgetMetricOptions = computed(() =>
-      ruleForm.value.targetLevel === 'ad'
+    const dynamicBudgetMetricOptions = computed(() => {
+      const base = ruleForm.value.targetLevel === 'ad'
         ? [...BASE_METRIC_OPTIONS, AVG_PURCHASES_METRIC]
         : BASE_METRIC_OPTIONS
-    )
+      return base.filter(opt => opt.value !== 'cpm')  // CPM 不适合做预算公式指标
+    })
     /** 监控范围条件对应的 API 过滤：后端 SQL 只返回匹配项 */
     const scopeStatusFilter = ref('')   // '' | active_only | paused_only | active_and_paused
     const scopeStatusExcludeFilter = ref('') // 状态「不等于」时传：ACTIVE | PAUSED | ACTIVE,PAUSED
@@ -2044,6 +2050,7 @@ export default {
         a.value_unit = 'usd'
         a.metric = dynamicBudgetMetricOptions.value.some(opt => opt.value === a.metric) ? a.metric : 'purchases'
         if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
+        a.skip_when_current_higher = a.skip_when_current_higher ?? false
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -2155,6 +2162,7 @@ export default {
           out.multiplier = Number(a.multiplier)
           out.value_unit = 'usd'
           delete out.value
+          if (a.skip_when_current_higher) out.skip_when_current_higher = true
           if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
           if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
         } else if (a.type === 'set_budget') {
@@ -3002,6 +3010,7 @@ export default {
       const metric = metricLabel(a.metric || 'purchases')
       const multiplier = Number(a.multiplier || 0)
       const parts = [`${metric} × ${multiplier}`]
+      if (a.skip_when_current_higher) parts.push('当前预算更高时跳过')
       if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
       if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
       return parts.join('，')

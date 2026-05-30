@@ -180,6 +180,7 @@
                   <option value="roas">ROAS</option>
                   <option value="cpa">单次购买花费（CPA）</option>
                   <option value="cpc">CPC（花费/链接点击）</option>
+                  <option value="cpm">CPM（千次展示费用）</option>
                   <option value="add_to_cart_cost">单次加购花费</option>
                   <option value="checkout_cost">单次结账花费</option>
                   <option value="payment_cost">单次添加支付信息花费</option>
@@ -264,6 +265,10 @@
                       />
                       <span class="unit-hint">美元</span>
                     </span>
+                    <label class="skip-higher-wrap">
+                      <input type="checkbox" v-model="a.skip_when_current_higher" />
+                      <span>如果当前预算更高，不做下调</span>
+                    </label>
                   </template>
                   <template v-else>
                   <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select-clean select-unit" title="调整单位">
@@ -354,6 +359,7 @@ const METRIC_LABELS = {
   roas: 'ROAS',
   cpa: '单次购买花费（CPA）',
   cpc: 'CPC（花费/链接点击）',
+  cpm: 'CPM（千次展示费用）',
   add_to_cart_cost: '单次加购花费',
   checkout_cost: '单次结账花费',
   payment_cost: '单次添加支付信息花费',
@@ -415,6 +421,7 @@ export default {
       const label = ACTION_LABELS[a.type] || a.type
       if (a.type === 'set_dynamic_budget') {
         const parts = [`${label}：${metricLabel(a.metric || 'purchases')} × ${Number(a.multiplier || 0)}`]
+        if (a.skip_when_current_higher) parts.push('当前预算更高时跳过')
         if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
         if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
         return parts.join('，')
@@ -590,6 +597,7 @@ export default {
         a.value_unit = 'usd'
         a.metric = a.metric || 'purchases'
         if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
+        a.skip_when_current_higher = a.skip_when_current_higher ?? false
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -725,6 +733,7 @@ export default {
             out.multiplier = Number(a.multiplier)
             out.value_unit = 'usd'
             delete out.value
+            if (a.skip_when_current_higher) out.skip_when_current_higher = true
             if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
             if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
           } else if (a.type === 'set_budget') {

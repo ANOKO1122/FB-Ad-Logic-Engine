@@ -864,6 +864,22 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               break
             }
 
+            // 可选项：当前预算高于公式结果时，不做下调
+            if (action.skip_when_current_higher && targetContext.currentCents > dynamicBudget.finalBudgetCents) {
+              status = 'skipped'
+              errorMessage = '跳过下调：当前预算高于公式结果'
+              apiRequest = JSON.stringify({
+                preFlight: true,
+                cooldownKey,
+                currentCents: targetContext.currentCents,
+                newBudgetCents: dynamicBudget.finalBudgetCents,
+                reason: 'current_budget_higher',
+                dynamicBudget
+              })
+              apiResponse = JSON.stringify({ skipped: true, reason: 'current_budget_higher' })
+              break
+            }
+
             logger.info(`    🔧 执行: 设置${targetContext.label}动态预算 ${targetContext.budgetNodeId} → ${dynamicBudget.finalBudgetCents} 分`)
             if (targetContext.budgetNodeType === 'adset') {
               await api.updateAdsetBudget(targetContext.budgetNodeId, dynamicBudget.finalBudgetCents, targetContext.isDaily)
@@ -939,6 +955,15 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
             const adjustDirection = isSetBudget ? '设置' : (isIncrease ? '增加' : '减少')
 
             // AdsPolar 智能路由：先查 AdSet 是否有预算，有则调 AdSet(ABO)，无则向上调 Campaign(CBO)
+            // 提前设置 apiRequest 以便在 getAdsetBudgetDetail 阶段异常时也能追溯
+            apiRequest = JSON.stringify({
+              method: 'GET',
+              endpoint: `/${adsetId}`,
+              purpose: 'getAdsetBudgetDetail',
+              actionType: action.type,
+              actionValue: adjustVal,
+              actionUnit: unit
+            })
             let adsetDetail = null
             if (api) {
               adsetDetail = await api.getAdsetBudgetDetail(adsetId)
@@ -1119,7 +1144,12 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
       logger.error(`    ❌ 执行动作失败: ${action.type}`, error.message)
       status = 'fail'
       errorMessage = error.message
-      apiResponse = JSON.stringify({ error: error.message })
+      // 保留完整错误信息：优先 Facebook API 原始错误，其次 axios response data，最后 message
+      const fbErrorDetail = error?.facebookError?.error || error?.response?.data?.error || null
+      apiResponse = JSON.stringify({
+        error: error.message,
+        ...(fbErrorDetail ? { fb_error: fbErrorDetail } : {})
+      })
       const fallbackObjectType = String(rule?.targetLevel || rule?.target_level || matchedAd?.objectType || 'ad').toLowerCase()
       const fallbackObjectId = String(
         fallbackObjectType === 'campaign'

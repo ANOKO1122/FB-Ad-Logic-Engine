@@ -21,7 +21,9 @@ const rawPool = mysql.createPool({
   keepAliveInitialDelay: 0,
   // 关键：告诉 mysql2 在 JS Date <-> 字符串 编解码时使用 UTC，
   // 与我们在会话里 SET time_zone = '+00:00' 的策略保持一致
-  timezone: '+00:00'
+  timezone: '+00:00',
+  // 限制每个连接的 Prepared Statement 缓存数量，超出后自动 deallocate 最旧的
+  maxPreparedStatements: 100
 })
 
 /**

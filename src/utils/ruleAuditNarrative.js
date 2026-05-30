@@ -307,6 +307,7 @@ const METRIC_LABEL = {
   roas: 'ROAS',
   cpa: '单次购买花费（CPA）',
   cpc: 'CPC（花费/链接点击）',
+  cpm: 'CPM（千次展示费用）',
   add_to_cart_cost: '单次加购花费',
   checkout_cost: '单次结账花费',
   payment_cost: '单次添加支付信息花费',
@@ -492,6 +493,7 @@ function formatOneActionHuman(a) {
   }
   if (type === 'set_dynamic_budget') {
     let s = `${base}：${METRIC_LABEL[a.metric] || a.metric || '购买次数'} × ${Number(a.multiplier || 0)}`
+    if (a.skip_when_current_higher) s += '（当前预算更高时跳过）'
     if (a.min_daily_budget != null) {
       const d = dollarsFromCents(a.min_daily_budget)
       if (d != null) s += `（日预算下限 $${d}）`

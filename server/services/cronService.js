@@ -1181,7 +1181,11 @@ export async function executeRulesForAccount(accountId, options = {}) {
             status: 'fail',
             errorMessage: err.message,
             apiRequest: null,
-            apiResponse: JSON.stringify({ error: err.message })
+            apiResponse: JSON.stringify({
+              error: err.message,
+              ...(err?.facebookError?.error ? { fb_error: err.facebookError.error } : {}),
+              ...(err?.response?.data?.error ? { fb_error: err.response.data.error } : {})
+            })
           })
           continue
         }
