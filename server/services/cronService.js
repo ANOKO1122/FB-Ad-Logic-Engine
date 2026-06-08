@@ -26,6 +26,8 @@ import {
   upsertRuleAdExecutionStateBatch
 } from './ruleExecutionStateService.js'
 import { getRuleExecutionAccountIds } from './ruleEnableGateService.js'
+// [临时禁用] 定时任务模块有语法错误待修复
+// import { executeDueScheduledTasks, isScheduledTaskRunning } from './scheduledTaskService.js'
 
 // M4 Pre-Flight 刷新：执行前批量拉取 FB effective_status，解决 ad_snapshots 滞后导致误 POST
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -980,6 +982,8 @@ export async function executeRulesForAccount(accountId, options = {}) {
           const reason = skipPause
             ? 'already_paused'
             : (skipActivateDone ? 'already_active' : 'cannot_activate')
+          // 目标状态已达成：跳过执行，但更新冷却时钟（避免每分钟重复检查）
+          // 安全：下次 Cron 走到冷却未到期分支时不会再次重置时钟
           executionResultsByScope[scopeKey] = { success: 0, fail: 0, skipped: 1 }
           accountMatched++
           accountExecuted++
@@ -1090,10 +1094,10 @@ export async function executeRulesForAccount(accountId, options = {}) {
           if (intervalMin > 0) {
             const due = await isCooldownDue(meta.winnerRule.id, cooldownKey, intervalMin)
             if (!due) {
+              // 冷却未到期：跳过执行，不更新 rule_ad_execution_state（避免重置冷却时钟）
               executionResultsByScope[scopeKey] = { success: 0, fail: 0, skipped: 1 }
               accountMatched++
               accountExecuted++
-              stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: 'success' })
               await writeBatchStatusAuditLog({
                 runId: currentRunId,
                 accountId: lockedAccountId,
@@ -1117,6 +1121,8 @@ export async function executeRulesForAccount(accountId, options = {}) {
                 ? actionToPass._resolvedBudgetCents
                 : computeNewBudgetCentsOnce(currentCents, actionToPass))
           if (currentCents === newBudgetCents) {
+            // 预算已达目标：跳过执行，但更新冷却时钟（避免每分钟重复 GET 预算）
+            // 安全：下次 Cron 走到 L1098 时冷却未到期 → 不会再次重置时钟
             executionResultsByScope[scopeKey] = { success: 0, fail: 0, skipped: 1 }
             accountMatched++
             accountExecuted++
@@ -1218,10 +1224,13 @@ export async function executeRulesForAccount(accountId, options = {}) {
       }
       executionResultsByScope[scopeKey] = { success, fail, skipped }
       if (fromScheduler) {
-        // 使用执行层返回的 cooldownKey（预算为 budget_adset:/budget_campaign:，状态为 status_ad:/status_adset:/status_campaign:）；所有 skipped（含 Pre-Flight、预算幂等、FB already in state）均按 success 占冷却
-        const statusForCooldown = fail > 0 ? 'fail' : 'success'
-        const cooldownKey = (Array.isArray(results) && results[0]?.cooldownKey) ? results[0].cooldownKey : buildStatusCooldownKey(meta.winnerRule, meta.matchedAd, actionToPass)
-        stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: statusForCooldown })
+        // 仅当有实际执行（success 或 fail）时才更新冷却表
+        // 全 skipped（如冷却未到期/预算已达目标/Pre-Flight跳过）不更新冷却时钟，避免冷却被无限重置
+        if (success > 0 || fail > 0) {
+          const statusForCooldown = fail > 0 ? 'fail' : 'success'
+          const cooldownKey = (Array.isArray(results) && results[0]?.cooldownKey) ? results[0].cooldownKey : buildStatusCooldownKey(meta.winnerRule, meta.matchedAd, actionToPass)
+          stateUpdates.push({ ruleId: meta.winnerRule.id, scopeKey: cooldownKey, lastStatus: statusForCooldown })
+        }
       }
     }
 
@@ -1638,6 +1647,8 @@ export function startCronJob() {
   logger.info(`  5. Track1 结构轮转（近3天）: 每小时 :12 (Cron: 12 * * * *) [每次 6 账户，账户并发 5，usage 高跳过，unifiedBatch=${enableUnifiedStructureBatch ? 'on' : 'off'}]`)
   logger.info('  6. 热表清理: 每日 04:00 (Cron: 0 4 * * *) [删除 ad_snapshots 超过 2 天的快照]')
   logger.info('  7. 历史表清理: 每日 04:30 (Cron: 30 4 * * *) [rule_matched_objects_history 30 天、structure_ads_history/rule_history 60 天，分批+sleep]')
+  logger.info('  8. 定时任务调度: 每分钟 (Cron: * * * * *) [scheduled_tasks 表，独立互斥锁]')
+  logger.info('  9. 夜间滑动窗口: 每15分钟 UTC 15-23 (Cron: */15 * * * *) [方案A：覆盖 Asia 凌晨，防新广告盲视]')
   logger.info('')
   logger.info('🔒 锁机制: 账户级锁（rule:account:xxx）+ 5分钟超时保险丝')
   logger.info('⚡ 优势: 零空转、高并发、无僵尸锁')
@@ -1685,6 +1696,52 @@ export function startCronJob() {
       }
     } catch (error) {
       logger.error('❌ 统一心跳同步失败:', error.message)
+    }
+  })
+
+  // ==========================================
+  // 🆕 方案A：夜间滑动窗口高频同步
+  // 覆盖 UTC 15:00-23:00（Asia 时区凌晨 00:00-06:00）
+  // 解决凌晨新广告盲视：通过 filterActiveAds + 嗅探修复确保新广告及时被发现
+  // 独立于心跳，有自己的 DB 锁（sync:sliding_window），不干扰心跳运行
+  // ==========================================
+  cron.schedule('*/15 * * * *', async () => {
+    const utcHour = new Date().getUTCHours()
+    if (utcHour < 15 || utcHour > 23) return
+
+    // 检查 Token 熔断器
+    const breakerStatus = getCircuitBreakerStatus()
+    if (breakerStatus?.isLocked) {
+      logger.info('[夜间滑动窗口] 跳过：Token 熔断中')
+      return
+    }
+
+    // 检查 API 使用率（避免在配额紧张时火上浇油）
+    const usage = getLastUsageRate()
+    const nightWindowUsageSkipThreshold = 85  // 比 Track2 的阈值略低，优先保证夜间覆盖
+    if (usage != null && Number.isFinite(Number(usage)) && Number(usage) >= nightWindowUsageSkipThreshold) {
+      logger.info(`[夜间滑动窗口] 跳过：API 使用率 ${Number(usage)}% >= ${nightWindowUsageSkipThreshold}%`)
+      return
+    }
+
+    try {
+      logger.info('')
+      logger.info('='.repeat(50))
+      logger.info('🌙 夜间滑动窗口同步（方案A：新广告盲视修复）')
+      logger.info(`⏰ UTC 时间: ${new Date().toISOString()}`)
+      logger.info('='.repeat(50))
+
+      const result = await syncAllAccountsSlidingWindow(7, true)
+
+      if (result?.success) {
+        const todayTotal = result.totalTodayCount ?? 0
+        const dailyTotal = result.totalDailyStatsCount ?? 0
+        logger.info(`✅ 夜间滑动窗口完成: ${result.successCount ?? 0}/${result.totalAccounts ?? 0} 账户`)
+        logger.info(`   - Today 快照: ${todayTotal} 条`)
+        logger.info(`   - 按日回补: ${dailyTotal} 条`)
+      }
+    } catch (error) {
+      logger.error('❌ 夜间滑动窗口同步失败:', error.message)
     }
   })
 
@@ -1856,7 +1913,7 @@ export function startCronJob() {
         retentionDaysRule
       })
       if (result.totalDeleted > 0) {
-        logger.info(`[历史表清理] 完成，rule_matched_objects_history=${result.matchedDeleted}, structure_ads_history=${result.adsDeleted}, rule_history=${result.ruleDeleted}`)
+        logger.info(`[历史表清理] 完成，rule_matched_objects_history=${result.matchedDeleted}, structure_ads_history=${result.adsDeleted}, rule_history=${result.ruleDeleted}, scheduled_tasks=${result.scheduledCleaned ?? 0}`)
       }
     } catch (err) {
       logger.warn('[历史表清理] 失败:', err.message)
@@ -1903,7 +1960,26 @@ export function startCronJob() {
     }
   })
 
-  logger.info('✅ 定时任务已启动')
+  // [临时禁用] 8. 定时任务调度 — scheduledTaskService.js 有语法错误待修复
+  // cron.schedule('* * * * *', async () => {
+  //   if (isScheduledTaskRunning()) {
+  //     return
+  //   }
+  //   try {
+  //     const result = await executeDueScheduledTasks()
+  //     if (result.skippedDueToLock) return
+  //     if (result.executed > 0 || result.errors > 0) {
+  //       logger.info(
+  //         `[ScheduledTask Cron] 本次处理 ${result.executed + result.skipped + result.errors} 条，` +
+  //         `执行 ${result.executed}，跳过 ${result.skipped}，失败 ${result.errors}`
+  //       )
+  //     }
+  //   } catch (err) {
+  //     logger.error('[ScheduledTask Cron] 异常:', err.message)
+  //   }
+  // })
+
+  logger.info('✅ 定时任务已启动（定时任务模块临时禁用）')
 }
 
 /**
@@ -2038,11 +2114,24 @@ export async function runNightlyHistoryCleanup(opts = {}) {
     await sleep(HISTORY_CLEANUP_SLEEP_MS)
   }
 
+  // scheduled_tasks: 清理 90 天前已禁用的 once 类型任务（方案 R2#7）
+  let scheduledCleaned = 0
+  while (true) {
+    const [res] = await pool.execute(
+      `DELETE FROM scheduled_tasks WHERE enabled = 0 AND schedule_type = 'once' AND updated_at < NOW() - INTERVAL 90 DAY LIMIT ${HISTORY_CLEANUP_BATCH_SIZE}`
+    )
+    const n = res?.affectedRows ?? 0
+    scheduledCleaned += n
+    if (n < HISTORY_CLEANUP_BATCH_SIZE) break
+    await sleep(HISTORY_CLEANUP_SLEEP_MS)
+  }
+
   return {
     matchedDeleted,
     adsDeleted,
     ruleDeleted,
-    totalDeleted: matchedDeleted + adsDeleted + ruleDeleted
+    scheduledCleaned,
+    totalDeleted: matchedDeleted + adsDeleted + ruleDeleted + scheduledCleaned
   }
 }
 

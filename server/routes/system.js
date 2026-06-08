@@ -156,6 +156,7 @@ router.get('/automation-logs/stats/summary', requireAuth, requireActive, async (
  *   - rule_id: 规则ID（可选）
  *   - rule_name: 规则名称（可选，精确匹配）
  *   - status: 状态（success/fail/skipped，可选）
+ *   - object_id: 搜索对象ID（模糊匹配 ad_id / object_id，可选）
  *   - start_date: 开始日期（可选，格式 YYYY-MM-DD）
  *   - end_date: 结束日期（可选，格式 YYYY-MM-DD）
  *   - page: 页码（默认 1）
@@ -172,6 +173,7 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
       rule_id,
       rule_name,
       status,
+      object_id,
       start_date,
       end_date,
       page = 1,
@@ -238,6 +240,12 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     if (end_date) {
       whereClause += ' AND al.triggered_at <= ?'
       params.push(`${end_date} 23:59:59`)
+    }
+    
+    if (object_id) {
+      whereClause += ' AND (al.object_id = ? OR al.ad_id = ?)'
+      const exactId = String(object_id).trim()
+      params.push(exactId, exactId)
     }
     
     // 查询总数

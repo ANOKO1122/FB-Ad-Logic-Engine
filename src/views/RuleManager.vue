@@ -80,11 +80,23 @@
             </div>
           </Transition>
         </div>
-        <template v-if="rules.length > 0">
+
+        <!-- 显示/隐藏已关闭规则切换 -->
+        <label class="toggle-disabled-rules">
+          <input
+            type="checkbox"
+            v-model="showDisabledRules"
+            @change="onToggleDisabledRules"
+          />
+          <span class="toggle-label">显示已关闭规则</span>
+          <span v-if="hiddenDisabledCount > 0" class="hidden-count">已隐藏 {{ hiddenDisabledCount }} 条</span>
+        </label>
+
+        <template v-if="displayedRules.length > 0">
           <button type="button" class="btn secondary small" @click="collapseAllRuleCards">全部折叠</button>
           <button type="button" class="btn secondary small" @click="expandAllRuleCards">全部展开</button>
         </template>
-        <template v-if="!bulkMode && rules.length > 0">
+        <template v-if="!bulkMode && displayedRules.length > 0">
           <button type="button" class="btn secondary" @click="enterBulkMode">
             <span class="icon">☐</span> 批量添加账户
           </button>
@@ -92,7 +104,7 @@
         <template v-if="bulkMode">
           <span class="bulk-counter">已选 {{ selectedCount }} 条</span>
           <button type="button" class="btn secondary small" @click="toggleSelectAllRules">
-            {{ selectedCount === rules.length ? '取消全选' : '全选' }}
+            {{ selectedCount === displayedRules.length ? '取消全选' : '全选' }}
           </button>
           <button type="button" class="btn secondary small" @click="exitBulkMode">取消选择</button>
           <button type="button" class="btn" :disabled="selectedCount === 0" @click="openBatchModal">
@@ -106,7 +118,7 @@
     </div>
 
     <!-- 规则列表 (Grid 布局) -->
-    <div v-if="rules.length === 0" class="empty-rules">
+    <div v-if="displayedRules.length === 0" class="empty-rules">
       <div class="empty-icon">⚡</div>
       <h3>暂无自动化规则</h3>
       <p>规则可以帮你 24 小时监控广告，自动止损或扩量。</p>
@@ -129,7 +141,7 @@
 
     <div v-else class="rules-grid">
       <div 
-        v-for="r in rules" 
+        v-for="r in displayedRules" 
         :key="r.id" 
         class="rule-card"
         :class="{ disabled: !r.enabled }"
@@ -696,6 +708,10 @@
                     <input type="checkbox" v-model="a.skip_when_current_higher" />
                     <span>如果当前预算更高，不做下调</span>
                   </label>
+                  <label class="skip-lower-wrap">
+                    <input type="checkbox" v-model="a.skip_when_current_lower" />
+                    <span>如果当前预算更低，不做上调</span>
+                  </label>
                 </template>
                 <template v-else>
                 <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select action-unit-select" title="调整单位">
@@ -956,13 +972,19 @@ export default {
       }
     }
 
-    /** 全选 / 取消全选：已全部选中时清空，否则选入当前列表所有规则 */
+    /** 全选 / 取消全选：已全部选中时清空，否则选入当前可见列表所有规则 */
     const toggleSelectAllRules = () => {
-      if (selectedCount.value === rules.value.length) {
+      const visible = displayedRules.value
+      if (selectedCount.value === visible.length) {
         selectedRuleIds.value = []
       } else {
-        selectedRuleIds.value = rules.value.map(r => r.id)
+        selectedRuleIds.value = visible.map(r => r.id)
       }
+    }
+
+    /** 切换显示/隐藏已关闭规则时，退出批量模式避免选中状态混乱 */
+    const onToggleDisabledRules = () => {
+      if (bulkMode.value) exitBulkMode()
     }
 
     /** 批量模式下点击整张卡片切换选中；排除按钮/开关/输入框等交互元素 */
@@ -1054,6 +1076,8 @@ export default {
     const bootstrapLoading = ref(false)
     const bootstrapFeedback = ref({ type: 'info', text: '' })
     const rulesLoaded = ref(false)
+    /** 是否在列表中显示已关闭（enabled=false）的规则；默认关闭（隐藏已关闭规则） */
+    const showDisabledRules = ref(false)
     
     const levelOptions = [
       { label: '广告 (Ad)', value: 'ad' },
@@ -1193,7 +1217,19 @@ export default {
       return parts.length > 0 ? parts.join(' + ') : '全部 (不选=全部)'
     })
     /** 一键铺底按钮展示口径：仅非管理员、空规则列表时展示（按当前 owner 维度） */
-    const showBootstrapButton = computed(() => rulesLoaded.value && !isAdminFromRules.value && rules.value.length === 0)
+    const showBootstrapButton = computed(() => rulesLoaded.value && !isAdminFromRules.value && displayedRules.value.length === 0)
+
+    /** 根据 showDisabledRules 开关过滤后的规则列表，用于模板渲染 */
+    const displayedRules = computed(() => {
+      if (showDisabledRules.value) return rules.value
+      return rules.value.filter(r => r.enabled !== false)
+    })
+
+    /** 当前被隐藏的已关闭规则数量 */
+    const hiddenDisabledCount = computed(() => {
+      if (showDisabledRules.value) return 0
+      return rules.value.filter(r => r.enabled === false).length
+    })
 
     const persistExpandedRuleIds = () => {
       const uid = currentUserId.value
@@ -1247,7 +1283,7 @@ export default {
     }
 
     const expandAllRuleCards = () => {
-      expandedRuleIds.value = rules.value
+      expandedRuleIds.value = displayedRules.value
         .map((r) => Number(r.id))
         .filter((id) => Number.isFinite(id) && id > 0)
     }
@@ -2051,6 +2087,7 @@ export default {
         a.metric = dynamicBudgetMetricOptions.value.some(opt => opt.value === a.metric) ? a.metric : 'purchases'
         if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
         a.skip_when_current_higher = a.skip_when_current_higher ?? false
+        a.skip_when_current_lower = a.skip_when_current_lower ?? false
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -2163,6 +2200,7 @@ export default {
           out.value_unit = 'usd'
           delete out.value
           if (a.skip_when_current_higher) out.skip_when_current_higher = true
+          if (a.skip_when_current_lower) out.skip_when_current_lower = true
           if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
           if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
         } else if (a.type === 'set_budget') {
@@ -3011,6 +3049,7 @@ export default {
       const multiplier = Number(a.multiplier || 0)
       const parts = [`${metric} × ${multiplier}`]
       if (a.skip_when_current_higher) parts.push('当前预算更高时跳过')
+      if (a.skip_when_current_lower) parts.push('当前预算更低时跳过')
       if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
       if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
       return parts.join('，')
@@ -3117,6 +3156,7 @@ export default {
       isAdminFromRules, ownersList, selectedOwnerIds, includeNoOwner,
       ownerFilterOpen, ownerFilterDisplayValue, ownerDropdownRef, clearOwnerFilter, toggleOwnerOption, toggleNoOwnerOption,
       bulkMode, selectedRuleIds, selectedCount, enterBulkMode, exitBulkMode, toggleRuleSelection, toggleSelectAllRules, onCardClick,
+      showDisabledRules, displayedRules, hiddenDisabledCount, onToggleDisabledRules,
       showBatchModal, batchAccounts, batchAccountIds, batchSaving, batchResult, batchError,
       openBatchModal, closeBatchModal, toggleBatchAccount, selectAllBatchAccounts, clearBatchAccounts, submitBatchAddAccounts,
       isRuleCardExpanded, toggleRuleCardExpand, collapseAllRuleCards, expandAllRuleCards,
@@ -3890,6 +3930,39 @@ input:checked + .slider:before { transform: translateX(16px); }
 .batch-stat-pending {
   color: #d97706;
   font-style: italic;
+}
+
+/* 显示/隐藏已关闭规则切换 */
+.toggle-disabled-rules {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  user-select: none;
+  white-space: nowrap;
+}
+
+.toggle-disabled-rules input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--primary-color, #4A90D9);
+}
+
+.toggle-disabled-rules .toggle-label {
+  cursor: pointer;
+}
+
+/* 已隐藏计数标签 */
+.toggle-disabled-rules .hidden-count {
+  font-size: 12px;
+  color: #999;
+  background: #f0f0f0;
+  padding: 1px 8px;
+  border-radius: 10px;
+  margin-left: 2px;
 }
 </style>
 

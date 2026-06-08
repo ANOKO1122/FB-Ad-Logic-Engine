@@ -880,6 +880,22 @@ export async function executeActionsForAd({ rule, matchedAd, accountId, ownerId,
               break
             }
 
+            // 可选项：当前预算低于公式结果时，不做上调
+            if (action.skip_when_current_lower && targetContext.currentCents < dynamicBudget.finalBudgetCents) {
+              status = 'skipped'
+              errorMessage = '跳过上调：当前预算低于公式结果（已被人为降低）'
+              apiRequest = JSON.stringify({
+                preFlight: true,
+                cooldownKey,
+                currentCents: targetContext.currentCents,
+                newBudgetCents: dynamicBudget.finalBudgetCents,
+                reason: 'current_budget_lower',
+                dynamicBudget
+              })
+              apiResponse = JSON.stringify({ skipped: true, reason: 'current_budget_lower' })
+              break
+            }
+
             logger.info(`    🔧 执行: 设置${targetContext.label}动态预算 ${targetContext.budgetNodeId} → ${dynamicBudget.finalBudgetCents} 分`)
             if (targetContext.budgetNodeType === 'adset') {
               await api.updateAdsetBudget(targetContext.budgetNodeId, dynamicBudget.finalBudgetCents, targetContext.isDaily)

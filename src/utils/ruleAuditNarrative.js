@@ -494,6 +494,7 @@ function formatOneActionHuman(a) {
   if (type === 'set_dynamic_budget') {
     let s = `${base}：${METRIC_LABEL[a.metric] || a.metric || '购买次数'} × ${Number(a.multiplier || 0)}`
     if (a.skip_when_current_higher) s += '（当前预算更高时跳过）'
+    if (a.skip_when_current_lower) s += '（当前预算更低时跳过）'
     if (a.min_daily_budget != null) {
       const d = dollarsFromCents(a.min_daily_budget)
       if (d != null) s += `（日预算下限 $${d}）`

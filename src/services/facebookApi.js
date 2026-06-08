@@ -188,6 +188,81 @@ class FacebookMarketingService {
     })
     return resp.data || { object_ids: [], count: 0 }
   }
+
+  // ============================================
+  // 定时任务 API（scheduled_tasks 表）
+  // ============================================
+
+  /**
+   * 获取定时任务列表
+   * @param {Object} params - { account_id?, status?, schedule_type?, limit?, offset? }
+   * @returns {Promise<{ items: Array, total: number }>}
+   */
+  async getScheduledTasks(params = {}) {
+    const resp = await apiClient.get('/scheduled-tasks', { params })
+    return resp.data || { items: [], total: 0 }
+  }
+
+  /**
+   * 创建定时任务
+   * @param {Object} data - { schedule_type, schedule_at, schedule_cron?, schedule_timezone?, account_id, target_level, target_id, action_type, action_params, is_simulation?, auto_disable? }
+   * @returns {Promise<Object>} 新创建的任务
+   */
+  async createScheduledTask(data) {
+    const resp = await apiClient.post('/scheduled-tasks', data)
+    return resp.data
+  }
+
+  /**
+   * 获取单条定时任务
+   * @param {number} id - 任务 ID
+   * @returns {Promise<Object>}
+   */
+  async getScheduledTask(id) {
+    const resp = await apiClient.get(`/scheduled-tasks/${id}`)
+    return resp.data
+  }
+
+  /**
+   * 更新定时任务
+   * @param {number} id - 任务 ID
+   * @param {Object} data - 要更新的字段
+   * @returns {Promise<Object>}
+   */
+  async updateScheduledTask(id, data) {
+    const resp = await apiClient.put(`/scheduled-tasks/${id}`, data)
+    return resp.data
+  }
+
+  /**
+   * 删除定时任务
+   * @param {number} id - 任务 ID
+   * @returns {Promise<Object>}
+   */
+  async deleteScheduledTask(id) {
+    const resp = await apiClient.delete(`/scheduled-tasks/${id}`)
+    return resp.data
+  }
+
+  /**
+   * 切换启用/禁用
+   * @param {number} id - 任务 ID
+   * @returns {Promise<Object>}
+   */
+  async toggleScheduledTask(id) {
+    const resp = await apiClient.patch(`/scheduled-tasks/${id}/toggle`)
+    return resp.data
+  }
+
+  /**
+   * 手动立即执行
+   * @param {number} id - 任务 ID
+   * @returns {Promise<{ message: string, taskId: number }>}
+   */
+  async executeScheduledTask(id) {
+    const resp = await apiClient.post(`/scheduled-tasks/${id}/execute`)
+    return resp.data
+  }
 }
 
 export default new FacebookMarketingService()

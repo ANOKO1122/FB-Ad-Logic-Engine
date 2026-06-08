@@ -20,6 +20,10 @@
           <span class="text">执行日志</span>
         </router-link>
 
+        <router-link to="/scheduled-tasks" class="nav-item" active-class="active">
+          <span class="text">定时任务</span>
+        </router-link>
+
         <div class="divider"></div>
 
         <!-- 仅管理员可见 -->

@@ -47,14 +47,15 @@
             <option v-for="r in rules" :key="r.id" :value="r.id">{{ r.name }}</option>
           </select>
         </div>
-        <div class="filter-item">
-          <label>状态</label>
-          <select v-model="filters.status" @change="resetAndLoad" class="select">
-            <option value="">全部状态</option>
-            <option value="success">成功</option>
-            <option value="fail">失败</option>
-            <option value="skipped">跳过</option>
-          </select>
+        <div class="filter-item search-item">
+          <label>搜索对象ID</label>
+          <input 
+            type="text" 
+            v-model="filters.object_id" 
+            @keyup.enter="resetAndLoad"
+            placeholder="广告ID / 广告组ID / 广告系列ID"
+            class="input-text"
+          />
         </div>
         <div class="filter-item">
           <label>开始日期</label>
@@ -304,6 +305,7 @@ export default {
       account_id: '',
       rule_id: '',
       status: '',
+      object_id: '',
       start_date: '',
       end_date: ''
     })
@@ -323,6 +325,7 @@ export default {
         if (filters.account_id) params.append('account_id', filters.account_id)
         if (filters.rule_id) params.append('rule_id', filters.rule_id)
         if (filters.status) params.append('status', filters.status)
+        if (filters.object_id) params.append('object_id', filters.object_id)
         if (filters.start_date) params.append('start_date', filters.start_date)
         if (filters.end_date) params.append('end_date', filters.end_date)
         params.append('page', pagination.page)
@@ -392,6 +395,7 @@ export default {
       filters.account_id = ''
       filters.rule_id = ''
       filters.status = ''
+      filters.object_id = ''
       filters.start_date = ''
       filters.end_date = ''
       resetAndLoad()
@@ -598,13 +602,22 @@ export default {
   font-weight: 500;
 }
 
-.select, .input-date {
+.select, .input-date, .input-text {
   padding: 8px 12px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: #fff;
   min-width: 140px;
   font-size: 13px;
+}
+
+.input-text {
+  min-width: 220px;
+}
+
+.search-item {
+  flex: 1;
+  min-width: 240px;
 }
 
 /* 表格 */

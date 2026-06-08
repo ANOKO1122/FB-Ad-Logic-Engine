@@ -278,3 +278,50 @@ export const ruleMatchedObjects = mysqlTable('rule_matched_objects', {
   objectType: varchar('object_type', { length: 16 }).notNull(),   // 真实业务字段：ad | adset | campaign
   createdAt: timestamp('created_at').notNull().defaultNow()
 })
+
+// ============================================
+// scheduled_tasks：定时任务表（方案二：独立表）
+// 负责存储"什么时间做什么"，由 scheduledTaskService 每分钟扫描执行
+// ============================================
+export const scheduledTasks = mysqlTable('scheduled_tasks', {
+  id: int('id').primaryKey().autoincrement(),
+  // 用户归属
+  userId: int('user_id').notNull(),
+  ownerId: int('owner_id').notNull().default(0),
+  // 调度配置
+  scheduleType: varchar('schedule_type', { length: 16 }).notNull(),      // once / daily / weekly / interval / cron
+  scheduleAt: varchar('schedule_at', { length: 32 }),                    // cron 类型可为 NULL
+  scheduleCron: varchar('schedule_cron', { length: 64 }),               // cron 表达式
+  scheduleTimezone: varchar('schedule_timezone', { length: 50 }),       // 时区，NULL=跟随账户时区
+  nextExecuteAt: timestamp('next_execute_at'),                           // 下次执行时间（UTC）
+  // 目标对象（v2 多对象支持：targetId 保留向后兼容，targetIds 为主字段）
+  accountId: varchar('account_id', { length: 50 }).notNull(),            // 主账户（向后兼容，新任务配合 target_by_account 使用）
+  targetAccountIds: json('target_account_ids'),                           // v3 多选账户ID列表（JSON数组，复用规则管理逻辑）
+  targetByAccount: json('target_by_account'),                            // v3 按账户分组的目标ID { "act_1": ["id1"], "act_2": ["id2"] }
+  targetLevel: varchar('target_level', { length: 16 }).notNull().default('ad'),
+  targetId: varchar('target_id', { length: 50 }),                        // 向后兼容，新任务用 targetIds
+  targetIds: json('target_ids'),                                          // 多目标ID列表（JSON数组）
+  // 动态筛选（复用规则管理的 scope_filters / exclude_ids 模式）
+  useDynamicScope: boolean('use_dynamic_scope').notNull().default(false),
+  scopeFilters: json('scope_filters'),                                    // 监控范围条件
+  excludeIds: json('exclude_ids'),                                        // 排除名单
+  maxDynamicMatches: int('max_dynamic_matches').notNull().default(1000),  // 动态匹配上限
+  // 动作配置
+  actionType: varchar('action_type', { length: 32 }).notNull(),         // pause_ad / activate_ad / set_budget / increase_budget / decrease_budget
+  actionParams: json('action_params').notNull(),                         // 动作参数
+  taskName: varchar('task_name', { length: 255 }),                      // 任务名称（用户自定义）
+  // 状态控制
+  enabled: boolean('enabled').notNull().default(true),
+  isSimulation: boolean('is_simulation').notNull().default(false),
+  autoDisable: boolean('auto_disable').notNull().default(true),         // once 类型执行后自动禁用
+  // 执行追踪
+  lastExecutedAt: timestamp('last_executed_at'),
+  lastStatus: varchar('last_status', { length: 16 }),                   // success / fail / skipped
+  // 重试控制
+  retryCount: int('retry_count').notNull().default(0),
+  maxRetries: int('max_retries').notNull().default(3),
+  // 并发控制（乐观锁）
+  version: int('version').notNull().default(0),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow()
+})

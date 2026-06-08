@@ -1044,7 +1044,7 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
     // 使用 resolveObjectsByIds 批量查询，避免拉取所有广告（包括废弃的）
     throwIfSignalAborted(signal, `账户 ${accountId} 在解析滑动窗口广告状态前已被取消`)
     const adsWithStatus = await facebookApi.resolveObjectsByIds(targetAdIds, {
-      fields: 'id,name,effective_status,status,configured_status',
+      fields: 'id,name,effective_status,status,configured_status,adset_id,campaign_id,updated_time,created_time',
       signal
     })
     const statusMap = new Map()
@@ -1055,6 +1055,20 @@ export async function syncAccountSlidingWindow(accountId, ownerId, timezoneName 
         statusMap.set(adId, status)
       }
     })
+
+    // [修复] 凌晨滑动窗口补齐 structure_ads，确保 use_dynamic_scope=1 的规则能发现新广告
+    // 根因：动态范围规则依赖 structure_ads 做目标筛选，凌晨若 structure_ads 无新广告记录，
+    //       即使 ad_snapshots 已有性能数据（CPC/加购等），规则仍"看不见"这些广告
+    try {
+      const structurePayload = {}
+      for (const ad of adsWithStatus) {
+        const id = String(ad.id || '').trim()
+        if (id) structurePayload[id] = ad
+      }
+      await piggybackStructureFromToday(accountId, targetAdIds, structurePayload, facebookApi)
+    } catch (pbErr) {
+      logger.warn(`   ⚠️ [${accountId}] 滑动窗口 Piggyback 跳过:`, pbErr.message)
+    }
     
     // 7. 同步 Today 数据 → 写入 ad_snapshots（实时快照）
     logger.info(`📅 同步 Today 数据 → ad_snapshots...`)
@@ -1152,12 +1166,30 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
   logger.info('🔄 开始同步所有账户的滑动窗口数据（修复归因延迟）...')
   
   // 分布式锁：防止多实例重复执行
+  // 【重要】MySQL GET_LOCK/RELEASE_LOCK 是连接作用域的，必须使用专用连接
+  // 不能用 pool.execute()（每次获取不同连接），否则 RELEASE_LOCK 无法释放 GET_LOCK 持有的锁
   const lockName = 'sync:sliding_window'
-  const [lockRows] = await pool.execute('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
-  const lockAcquired = lockRows[0]?.acquired === 1
+  let lockConnection = null
+  let lockAcquired = false
+  
+  try {
+    lockConnection = await pool.getConnection()
+    const [lockRows] = await lockConnection.query('SELECT GET_LOCK(?, 0) AS acquired', [lockName])
+    lockAcquired = lockRows[0]?.acquired === 1
+  } catch (lockError) {
+    logger.warn('⚠️  获取滑动窗口同步锁失败:', lockError.message)
+    if (lockConnection) {
+      lockConnection.release()
+      lockConnection = null
+    }
+  }
   
   if (!lockAcquired) {
     logger.info('⏸️  另一个实例正在执行滑动窗口同步（DB锁已占用），跳过本次执行')
+    if (lockConnection) {
+      lockConnection.release()
+      lockConnection = null
+    }
     return {
       success: true,
       totalAccounts: 0,
@@ -1254,11 +1286,15 @@ export async function syncAllAccountsSlidingWindow(daysBack = 7, optimizeQuota =
     logger.error('❌ 同步所有账户滑动窗口数据失败:', error.message)
     throw error
   } finally {
-    // 释放锁
-    try {
-      await pool.execute('SELECT RELEASE_LOCK(?) AS released', [lockName])
-    } catch (lockError) {
-      logger.warn(`⚠️  释放锁失败: ${lockError.message}`)
+    // 释放锁（必须在同一连接上操作）
+    if (lockConnection) {
+      try {
+        await lockConnection.query('SELECT RELEASE_LOCK(?) AS released', [lockName])
+      } catch (lockError) {
+        logger.warn(`⚠️  释放锁失败: ${lockError.message}`)
+      }
+      lockConnection.release()
+      lockConnection = null
     }
   }
 }

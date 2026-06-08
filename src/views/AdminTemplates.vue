@@ -269,6 +269,10 @@
                       <input type="checkbox" v-model="a.skip_when_current_higher" />
                       <span>如果当前预算更高，不做下调</span>
                     </label>
+                    <label class="skip-lower-wrap">
+                      <input type="checkbox" v-model="a.skip_when_current_lower" />
+                      <span>如果当前预算更低，不做上调</span>
+                    </label>
                   </template>
                   <template v-else>
                   <select v-if="a.type !== 'set_budget'" v-model="a.value_unit" class="select-clean select-unit" title="调整单位">
@@ -422,6 +426,7 @@ export default {
       if (a.type === 'set_dynamic_budget') {
         const parts = [`${label}：${metricLabel(a.metric || 'purchases')} × ${Number(a.multiplier || 0)}`]
         if (a.skip_when_current_higher) parts.push('当前预算更高时跳过')
+        if (a.skip_when_current_lower) parts.push('当前预算更低时跳过')
         if (a.min_daily_budget != null) parts.push(`下限 $${(Number(a.min_daily_budget) / 100).toFixed(2)}`)
         if (a.max_daily_budget != null) parts.push(`上限 $${(Number(a.max_daily_budget) / 100).toFixed(2)}`)
         return parts.join('，')
@@ -598,6 +603,7 @@ export default {
         a.metric = a.metric || 'purchases'
         if (a.multiplier == null || a.multiplier === '' || Number(a.multiplier) <= 0) a.multiplier = 30
         a.skip_when_current_higher = a.skip_when_current_higher ?? false
+        a.skip_when_current_lower = a.skip_when_current_lower ?? false
       } else if (a.type?.includes('budget')) {
         a.value_unit = a.value_unit || 'percent'
         if (a.value_unit === 'percent' && (a.value == null || a.value === '')) a.value = 10
@@ -734,6 +740,7 @@ export default {
             out.value_unit = 'usd'
             delete out.value
             if (a.skip_when_current_higher) out.skip_when_current_higher = true
+            if (a.skip_when_current_lower) out.skip_when_current_lower = true
             if (a.min_daily_budget != null) out.min_daily_budget = a.min_daily_budget
             if (a.max_daily_budget != null) out.max_daily_budget = a.max_daily_budget
           } else if (a.type === 'set_budget') {
