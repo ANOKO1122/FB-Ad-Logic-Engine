@@ -2913,11 +2913,25 @@ app.get('/api/structure/objects', requireAuth, requireActive, async (req, res) =
     const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
     const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
 
+    // 新增：创建超过 N 小时（older_than）
+    const scopeCreatedBeforeHoursRaw = req.query.scope_created_before_hours
+    const scopeCreatedBeforeHours = scopeCreatedBeforeHoursRaw != null ? parseInt(scopeCreatedBeforeHoursRaw, 10) : undefined
+    const scope_created_before_hours = Number.isFinite(scopeCreatedBeforeHours) && scopeCreatedBeforeHours > 0 ? scopeCreatedBeforeHours : undefined
+
+    // 新增：介于 X~Y 小时之间（between）
+    const scopeCreatedBetweenFromRaw = req.query.scope_created_between_from_hours
+    const scopeCreatedBetweenFrom = scopeCreatedBetweenFromRaw != null ? parseInt(scopeCreatedBetweenFromRaw, 10) : undefined
+    const scope_created_between_from_hours = Number.isFinite(scopeCreatedBetweenFrom) && scopeCreatedBetweenFrom > 0 ? scopeCreatedBetweenFrom : undefined
+
+    const scopeCreatedBetweenToRaw = req.query.scope_created_between_to_hours
+    const scopeCreatedBetweenTo = scopeCreatedBetweenToRaw != null ? parseInt(scopeCreatedBetweenToRaw, 10) : undefined
+    const scope_created_between_to_hours = Number.isFinite(scopeCreatedBetweenTo) && scopeCreatedBetweenTo > 0 ? scopeCreatedBetweenTo : undefined
+
     if (!account_id) return res.status(400).json({ error: '缺少 account_id 参数' })
     if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
     if (!(await assertAccountAccess(req, res, account_id))) return
 
-    const result = await listStructureObjectsFromDb(account_id, { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours })
+    const result = await listStructureObjectsFromDb(account_id, { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours })
     const sourceTable = result._source || (type === 'campaign' ? 'structure_campaigns' : type === 'adset' ? 'structure_adsets' : 'structure_ads')
     logger.info('[2.2] GET /api/structure/objects', { account_id, type, count: result.items.length, has_next: !!result.paging?.after })
     return res.json({
@@ -2954,6 +2968,20 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
     const scopeCreatedWithinHoursRaw = req.query.scope_created_within_hours
     const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
     const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
+
+    // 新增：创建超过 N 小时（older_than）
+    const scopeCreatedBeforeHoursRaw = req.query.scope_created_before_hours
+    const scopeCreatedBeforeHours = scopeCreatedBeforeHoursRaw != null ? parseInt(scopeCreatedBeforeHoursRaw, 10) : undefined
+    const scope_created_before_hours = Number.isFinite(scopeCreatedBeforeHours) && scopeCreatedBeforeHours > 0 ? scopeCreatedBeforeHours : undefined
+
+    // 新增：介于 X~Y 小时之间（between）
+    const scopeCreatedBetweenFromRaw = req.query.scope_created_between_from_hours
+    const scopeCreatedBetweenFrom = scopeCreatedBetweenFromRaw != null ? parseInt(scopeCreatedBetweenFromRaw, 10) : undefined
+    const scope_created_between_from_hours = Number.isFinite(scopeCreatedBetweenFrom) && scopeCreatedBetweenFrom > 0 ? scopeCreatedBetweenFrom : undefined
+
+    const scopeCreatedBetweenToRaw = req.query.scope_created_between_to_hours
+    const scopeCreatedBetweenTo = scopeCreatedBetweenToRaw != null ? parseInt(scopeCreatedBetweenToRaw, 10) : undefined
+    const scope_created_between_to_hours = Number.isFinite(scopeCreatedBetweenTo) && scopeCreatedBetweenTo > 0 ? scopeCreatedBetweenTo : undefined
 
     if (!accountIdsRaw) return res.status(400).json({ error: '缺少 account_ids 参数' })
     if (!['campaign', 'adset', 'ad'].includes(type)) return res.status(400).json({ error: 'type 只允许 campaign | adset | ad' })
@@ -2999,7 +3027,7 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
         return res.status(400).json({ error: 'after 游标无效' })
       }
       const accountId = allowedIds[i]
-      const result = await listStructureObjectsFromDb(accountId, { type, q, limit, after: a || null, include_paused: includePausedEffective, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours })
+      const result = await listStructureObjectsFromDb(accountId, { type, q, limit, after: a || null, include_paused: includePausedEffective, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours })
       const items = result.items.map((item) => ({ ...item, account_id: item.account_id || accountId }))
       const hasNext = result.paging && result.paging.after != null
       const nextPas = [...(pas || [])]
@@ -3060,7 +3088,10 @@ app.get('/api/structure/objects/multi', requireAuth, requireActive, async (req, 
           scope_status,
           scope_status_exclude,
           name_exclude,
-          scope_created_within_hours
+          scope_created_within_hours,
+          scope_created_before_hours,
+          scope_created_between_from_hours,
+          scope_created_between_to_hours
         }).then(result => ({ idx, accountId, result }))
       )
     ))
@@ -3129,7 +3160,21 @@ app.get('/api/structure/:level', requireAuth, requireActive, async (req, res) =>
     const scopeCreatedWithinHoursRaw = req.query.scope_created_within_hours
     const scopeCreatedWithinHours = scopeCreatedWithinHoursRaw != null ? parseInt(scopeCreatedWithinHoursRaw, 10) : undefined
     const scope_created_within_hours = Number.isFinite(scopeCreatedWithinHours) && scopeCreatedWithinHours > 0 ? scopeCreatedWithinHours : undefined
-    const opts = { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
+
+    // 新增：创建超过 N 小时（older_than）
+    const scopeCreatedBeforeHoursRaw = req.query.scope_created_before_hours
+    const scopeCreatedBeforeHours = scopeCreatedBeforeHoursRaw != null ? parseInt(scopeCreatedBeforeHoursRaw, 10) : undefined
+    const scope_created_before_hours = Number.isFinite(scopeCreatedBeforeHours) && scopeCreatedBeforeHours > 0 ? scopeCreatedBeforeHours : undefined
+
+    // 新增：介于 X~Y 小时之间（between）
+    const scopeCreatedBetweenFromRaw = req.query.scope_created_between_from_hours
+    const scopeCreatedBetweenFrom = scopeCreatedBetweenFromRaw != null ? parseInt(scopeCreatedBetweenFromRaw, 10) : undefined
+    const scope_created_between_from_hours = Number.isFinite(scopeCreatedBetweenFrom) && scopeCreatedBetweenFrom > 0 ? scopeCreatedBetweenFrom : undefined
+
+    const scopeCreatedBetweenToRaw = req.query.scope_created_between_to_hours
+    const scopeCreatedBetweenTo = scopeCreatedBetweenToRaw != null ? parseInt(scopeCreatedBetweenToRaw, 10) : undefined
+    const scope_created_between_to_hours = Number.isFinite(scopeCreatedBetweenTo) && scopeCreatedBetweenTo > 0 ? scopeCreatedBetweenTo : undefined
+    const opts = { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours }
 
     const edgeMap = { campaigns: 'campaigns', adsets: 'adsets', ads: 'ads' }
     const edge = edgeMap[String(level || '').toLowerCase()]

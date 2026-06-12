@@ -10,6 +10,7 @@ import { requireAuth, requireActive, isAdminLikeRole } from '../middleware/authJ
 import { hasAccountAccess } from '../utils/accountAccess.js'
 import { computeNextExecuteAt } from '../services/scheduledTaskService.js'
 import { forceExecuteTask } from '../services/scheduledTaskService.js'
+import { previewDynamicScope } from '../services/dynamicScopeService.js'
 import { DateTime } from 'luxon'
 import pool from '../db/connection.js'
 
@@ -24,6 +25,83 @@ function parseTaskId(raw) {
   const n = parseInt(raw)
   if (!Number.isInteger(n) || n <= 0) return null
   return n
+}
+
+/**
+ * 为任务列表补全 ownerName（从 users → owners 联表查询）
+ * 复用规则管理的负责人显示逻辑：优先 scheduled_tasks.owner_id，否则 users.owner_id
+ */
+async function enrichTaskOwnerNames(rows) {
+  if (!rows || rows.length === 0) return rows
+  try {
+    const userIds = [...new Set(rows.map(r => r.userId).filter(Boolean))]
+    if (userIds.length === 0) return rows
+    const placeholders = userIds.map(() => '?').join(',')
+    const [userRows] = await pool.execute(
+      `SELECT u.id as user_id, u.owner_id, o.owner_name
+       FROM users u
+       LEFT JOIN owners o ON o.id = COALESCE(u.owner_id, 0)
+       WHERE u.id IN (${placeholders})`,
+      userIds
+    )
+    const userMap = new Map()
+    for (const u of userRows) {
+      userMap.set(u.user_id, { ownerId: u.owner_id, ownerName: u.owner_name || null })
+    }
+    return rows.map(r => {
+      const info = userMap.get(r.userId)
+      return {
+        ...r,
+        ownerId: info?.ownerId ?? r.ownerId ?? 0,
+        ownerName: info?.ownerName || null
+      }
+    })
+  } catch {
+    return rows
+  }
+}
+
+/**
+ * 为开启动态筛选的任务补全 matchedCount
+ * 调用 previewDynamicScope 实时计算当前生效的对象数量
+ */
+async function enrichMatchedCount(rows) {
+  if (!rows || rows.length === 0) return rows
+  const enriched = [...rows]
+  // 并行计算每个任务的 matchedCount
+  const promises = enriched.map(async (task) => {
+    const useDynamic = !!(task.useDynamicScope ?? task.use_dynamic_scope)
+    if (!useDynamic) { task.matchedCount = null; return }
+    const scopeFilters = task.scopeFilters || task.scope_filters
+    if (!scopeFilters || typeof scopeFilters !== 'object') { task.matchedCount = null; return }
+    try {
+      const accountIds = []
+      const tba = task.targetByAccount ?? task.target_by_account
+      if (tba && typeof tba === 'object') {
+        accountIds.push(...Object.keys(tba).filter(k => Array.isArray(tba[k]) && tba[k].length > 0))
+      }
+      if (accountIds.length === 0) {
+        const taIds = task.targetAccountIds ?? task.target_account_ids
+        if (Array.isArray(taIds) && taIds.length > 0) accountIds.push(...taIds.map(String))
+      }
+      if (accountIds.length === 0) {
+        const aid = task.accountId || task.account_id
+        if (aid) accountIds.push(String(aid))
+      }
+      if (accountIds.length === 0) { task.matchedCount = null; return }
+      const result = await previewDynamicScope(accountIds, {
+        scopeFilters,
+        excludeIds: task.excludeIds || task.exclude_ids || null,
+        targetLevel: task.targetLevel || task.target_level || 'ad',
+        maxDynamicMatches: task.maxDynamicMatches ?? task.max_dynamic_matches ?? 1000
+      })
+      task.matchedCount = Array.isArray(result?.object_ids) ? result.object_ids.length : null
+    } catch {
+      task.matchedCount = null
+    }
+  })
+  await Promise.all(promises)
+  return enriched
 }
 
 /** 规范化 target_ids：统一转为字符串数组，兼容前端传入的复合键 "act_xxx:id" */
@@ -48,13 +126,25 @@ function normalizeTargetIds(raw) {
 
 /**
  * GET /api/scheduled-tasks
- * 列表查询，支持筛选：?account_id=&status=enabled&schedule_type=once
+ * 列表查询，支持筛选：
+ *   ?account_id=&status=enabled&schedule_type=once
+ *   ?ownerIds=1,2,3&includeNoOwner=1（仅管理员）
  */
 router.get('/', async (req, res) => {
   try {
     const { account_id, status, schedule_type, limit: limitStr = '50', offset: offsetStr = '0' } = req.query
     const limit = Math.min(Math.max(parseInt(limitStr) || 50, 1), 200)
     const offset = Math.max(parseInt(offsetStr) || 0, 0)
+    const isAdmin = isAdminLikeRole(req.user.role)
+
+    // 解析 ownerIds：仅管理员使用；逗号分隔的负责人 ID
+    let ownerIds = undefined
+    if (isAdmin && req.query.ownerIds != null && String(req.query.ownerIds).trim() !== '') {
+      const raw = String(req.query.ownerIds).split(',').map(s => parseInt(s.trim(), 10))
+      ownerIds = [...new Set(raw)].filter(n => Number.isFinite(n) && n > 0)
+      if (ownerIds.length === 0) ownerIds = undefined
+    }
+    const includeNoOwner = isAdmin && req.query.includeNoOwner === '1'
 
     const conditions = []
 
@@ -75,9 +165,76 @@ router.get('/', async (req, res) => {
       conditions.push(eq(scheduledTasks.scheduleType, String(schedule_type)))
     }
 
-    // 普通用户只看自己的任务，管理员看全部
-    if (!isAdminLikeRole(req.user.role)) {
-      conditions.push(eq(scheduledTasks.userId, req.user.id))
+    // 负责人/权限筛选
+    if (isAdmin) {
+      // 管理员：按负责人筛选（ownerIds 和 includeNoOwner）
+      if (ownerIds && ownerIds.length > 0) {
+        // 查询这些 owner_id 对应的所有 user_id
+        const [userRows] = await pool.execute(
+          `SELECT id FROM users WHERE owner_id IN (${ownerIds.map(() => '?').join(',')}) AND status = 'active'`,
+          ownerIds
+        )
+        const matchingUserIds = userRows.map(r => r.id)
+        if (matchingUserIds.length > 0) {
+          if (includeNoOwner) {
+            // 同时包含管理员创建的（owner_id=0 的用户）和指定负责人的
+            const [adminUserRows] = await pool.execute(
+              `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND status = 'active'`
+            )
+            const adminUserIds = adminUserRows.map(r => r.id)
+            const allIds = [...new Set([...matchingUserIds, ...adminUserIds])]
+            conditions.push(or(
+              ...allIds.map(uid => eq(scheduledTasks.userId, uid))
+            ))
+          } else {
+            conditions.push(or(
+              ...matchingUserIds.map(uid => eq(scheduledTasks.userId, uid))
+            ))
+          }
+        } else if (includeNoOwner) {
+          // 只有 includeNoOwner，没有匹配的 owner
+          const [adminUserRows] = await pool.execute(
+            `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND status = 'active'`
+          )
+          const adminUserIds = adminUserRows.map(r => r.id)
+          if (adminUserIds.length > 0) {
+            conditions.push(or(
+              ...adminUserIds.map(uid => eq(scheduledTasks.userId, uid))
+            ))
+          } else {
+            conditions.push(sql`1=0`) // 无匹配，返回空
+          }
+        }
+      } else if (includeNoOwner) {
+        // 仅筛管理员创建的
+        const [adminUserRows] = await pool.execute(
+          `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND status = 'active'`
+        )
+        const adminUserIds = adminUserRows.map(r => r.id)
+        if (adminUserIds.length > 0) {
+          conditions.push(or(
+            ...adminUserIds.map(uid => eq(scheduledTasks.userId, uid))
+          ))
+        } else {
+          conditions.push(sql`1=0`)
+        }
+      }
+      // 否则管理员不筛选，看全部
+    } else {
+      // 非管理员：按 owner 维度，只看自己同负责人的任务
+      const viewerOwnerId = req.user.owner_id ?? 0
+      const [userRows] = await pool.execute(
+        `SELECT id FROM users WHERE owner_id = ? AND status = 'active'`,
+        [viewerOwnerId]
+      )
+      const sameOwnerUserIds = userRows.map(r => r.id)
+      if (sameOwnerUserIds.length > 0) {
+        conditions.push(or(
+          ...sameOwnerUserIds.map(uid => eq(scheduledTasks.userId, uid))
+        ))
+      } else {
+        conditions.push(eq(scheduledTasks.userId, req.user.id))
+      }
     }
 
     const where = conditions.length > 0 ? and(...conditions) : undefined
@@ -89,6 +246,12 @@ router.get('/', async (req, res) => {
       .orderBy(desc(scheduledTasks.createdAt))
       .limit(limit)
       .offset(offset)
+
+    // 补全每条任务的 ownerName（从 users → owners 联表查询）
+    const enrichedRows = await enrichTaskOwnerNames(rows)
+
+    // v3.2: 为开启动态筛选的任务补全 matchedCount（异步，不阻塞响应）
+    const enrichedWithCount = await enrichMatchedCount(enrichedRows)
 
     // 计数
     let countResult
@@ -106,10 +269,11 @@ router.get('/', async (req, res) => {
     const total = Number(countResult?.[0]?.count ?? 0)
 
     res.json({
-      items: rows,
+      items: enrichedWithCount,
       total,
       limit,
-      offset
+      offset,
+      isAdmin
     })
   } catch (err) {
     logger.error('[ScheduledTasks API] 列表查询失败:', err.message)
@@ -511,9 +675,21 @@ router.put('/:id', async (req, res) => {
       return res.status(400).json({ error: '未提供任何更新字段' })
     }
 
-    await db.update(scheduledTasks)
+    // v3.2 乐观锁：version 递增 + WHERE version 校验，防止并发编辑覆盖
+    updateData.version = sql`version + 1`
+    const updateResult = await db.update(scheduledTasks)
       .set(updateData)
-      .where(eq(scheduledTasks.id, taskId))
+      .where(and(
+        eq(scheduledTasks.id, taskId),
+        eq(scheduledTasks.version, existing.version ?? 0)
+      ))
+
+    // 检查乐观锁：affectedRows=0 表示版本冲突，可能是并发编辑
+    const affectedRows = Array.isArray(updateResult) ? updateResult[0]?.affectedRows : updateResult?.affectedRows
+    if (!affectedRows) {
+      logger.warn(`[ScheduledTasks API] 乐观锁冲突: task #${taskId} 被并发修改，请刷新后重试`)
+      return res.status(409).json({ error: '任务已被其他用户修改，请刷新后重试', code: 'VERSION_CONFLICT' })
+    }
 
     const [updated] = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, taskId)).limit(1)
     res.json(updated)
@@ -583,9 +759,19 @@ router.patch('/:id/toggle', async (req, res) => {
       }
     }
 
-    await db.update(scheduledTasks)
-      .set({ enabled: newEnabled })
-      .where(eq(scheduledTasks.id, taskId))
+    // v3.2 乐观锁：version 递增 + WHERE version 校验
+    const toggleResult = await db.update(scheduledTasks)
+      .set({ enabled: newEnabled, version: sql`version + 1` })
+      .where(and(
+        eq(scheduledTasks.id, taskId),
+        eq(scheduledTasks.version, existing.version ?? 0)
+      ))
+
+    const toggleAffected = Array.isArray(toggleResult) ? toggleResult[0]?.affectedRows : toggleResult?.affectedRows
+    if (!toggleAffected) {
+      logger.warn(`[ScheduledTasks API] 乐观锁冲突 (toggle): task #${taskId}`)
+      return res.status(409).json({ error: '任务已被其他用户修改，请刷新后重试', code: 'VERSION_CONFLICT' })
+    }
 
     const [updated] = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, taskId)).limit(1)
     res.json(updated)
@@ -614,7 +800,7 @@ router.post('/:id/execute', async (req, res) => {
       return res.status(403).json({ error: '无权操作' })
     }
 
-    const result = await forceExecuteTask(taskId)
+    const result = await forceExecuteTask(existing)
     if (result.success) {
       res.json({ message: result.message, taskId })
     } else {

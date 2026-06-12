@@ -19,23 +19,35 @@ export function isScheduledTaskRunning() { return _scheduledTaskRunning }
 
 /**
  * 获取任务的所有目标账户 ID 列表（v3 多账户支持）
- * 优先 targetByAccount keys → targetAccountIds → 单 accountId
+ * 合并 targetByAccount keys + targetAccountIds → 单 accountId
  * @param {Object} task - 任务对象
  * @returns {string[]}
  */
 function getTaskAccountIds(task) {
+  const accountIds = new Set()
+
+  // 1. 从 targetByAccount 提取有手动目标对象的账户
   const targetByAccount = task.targetByAccount ?? task.target_by_account
   if (targetByAccount && typeof targetByAccount === 'object') {
-    const keys = Object.keys(targetByAccount).filter(k => {
-      const ids = targetByAccount[k]
-      return Array.isArray(ids) && ids.length > 0
-    })
-    if (keys.length > 0) return keys
+    for (const k of Object.keys(targetByAccount)) {
+      if (Array.isArray(targetByAccount[k]) && targetByAccount[k].length > 0) {
+        accountIds.add(String(k).trim())
+      }
+    }
   }
+
+  // 2. 从 targetAccountIds 补充（可能有些账户只有动态筛选没有手动对象）
   const targetAccountIds = task.targetAccountIds ?? task.target_account_ids
   if (Array.isArray(targetAccountIds) && targetAccountIds.length > 0) {
-    return targetAccountIds.map(a => String(a).trim()).filter(Boolean)
+    for (const a of targetAccountIds) {
+      const s = String(a).trim()
+      if (s) accountIds.add(s)
+    }
   }
+
+  if (accountIds.size > 0) return [...accountIds]
+
+  // 3. 兜底：单账户
   const accountId = task.accountId || task.account_id
   return accountId ? [String(accountId).trim()] : []
 }
@@ -165,9 +177,9 @@ async function computeNextExecuteAt(task) {
  * @param {Object} task - 任务对象
  * @param {string} targetId - 目标对象 ID
  * @param {string} budgetObjectId - 预算操作的实际对象 ID（adset 或 campaign）
- * @returns {Promise<{ result: any, apiRequest: object|null, apiResponse: object|null }>}
+ * @returns {Promise<{ result: any, apiRequest: string|null, apiResponse: string|null }>}
  */
-async function executeAction(api, task, targetId, budgetObjectId) {
+async function executeAction(api, task, targetId, budgetObjectId, targetCampaignId = null) {
   const actionType = task.actionType || task.action_type
   const targetLevel = (task.targetLevel || task.target_level || 'ad').toLowerCase()
   const params = typeof task.actionParams === 'string'
@@ -178,10 +190,14 @@ async function executeAction(api, task, targetId, budgetObjectId) {
   let apiResponse = null
   let result
 
+  const makeReq = (method, endpoint, body) => JSON.stringify({ method, endpoint, targetLevel, body })
+  const makeResp = (ok, data) => JSON.stringify({ success: !!ok, ...(typeof data === 'object' ? data : { message: data }) })
+
   try {
     switch (actionType) {
       case 'pause_ad': {
-        apiRequest = { method: targetLevel === 'adset' ? 'pauseAdset' : targetLevel === 'campaign' ? 'pauseCampaign' : 'pauseAd', targetId }
+        const method = targetLevel === 'adset' ? 'pauseAdset' : targetLevel === 'campaign' ? 'pauseCampaign' : 'pauseAd'
+        apiRequest = makeReq('POST', `/${targetId}`, { status: 'PAUSED' })
         if (targetLevel === 'adset') result = await api.pauseAdset(targetId)
         else if (targetLevel === 'campaign') result = await api.pauseCampaign(targetId)
         else result = await api.pauseAd(targetId)
@@ -189,7 +205,8 @@ async function executeAction(api, task, targetId, budgetObjectId) {
       }
 
       case 'activate_ad': {
-        apiRequest = { method: targetLevel === 'adset' ? 'activateAdset' : targetLevel === 'campaign' ? 'activateCampaign' : 'activateAd', targetId }
+        const method = targetLevel === 'adset' ? 'activateAdset' : targetLevel === 'campaign' ? 'activateCampaign' : 'activateAd'
+        apiRequest = makeReq('POST', `/${targetId}`, { status: 'ACTIVE' })
         if (targetLevel === 'adset') result = await api.activateAdset(targetId)
         else if (targetLevel === 'campaign') result = await api.activateCampaign(targetId)
         else result = await api.activateAd(targetId)
@@ -207,11 +224,30 @@ async function executeAction(api, task, targetId, budgetObjectId) {
           const cap = Math.round(Number(params.max_daily_budget))
           if (cap > 0) newCents = Math.min(newCents, cap)
         }
-        if (targetLevel === 'campaign') {
-          apiRequest = { method: 'updateCampaignBudget', targetId: budgetObjectId, budgetCents: newCents }
-          result = await api.updateCampaignBudget(budgetObjectId, newCents)
+        // v3.6 ABO/CBO 智能路由（对齐规则引擎 AdsPolar 逻辑）：
+        // 广告/广告组目标先查当前节点是否有预算(ABO)，有则直接调；无则向上调 Campaign(CBO)
+        let useCBO = targetLevel === 'campaign'
+        if (!useCBO && (targetLevel === 'ad' || targetLevel === 'adset') && targetCampaignId) {
+          const budgetNodeId = targetLevel === 'adset' ? targetId : budgetObjectId
+          try {
+            const detail = await api.getAdsetBudgetDetail(budgetNodeId)
+            const hasBudget = detail && ((detail.daily_budget || 0) > 0 || (detail.lifetime_budget || 0) > 0)
+            if (!hasBudget) {
+              useCBO = true
+              logger.info(`[ScheduledTask #${task.id}] ${targetLevel === 'adset' ? 'AdSet' : 'AdSet(vi a ad)'} ${budgetNodeId} 无预算，切换为 CBO (Campaign ${targetCampaignId})`)
+            }
+          } catch (e) {
+            logger.warn(`[ScheduledTask #${task.id}] 无法获取预算详情，尝试 CBO:`, e.message)
+            useCBO = true
+          }
+        }
+        if (useCBO) {
+          const cboId = targetLevel === 'campaign' ? budgetObjectId : targetCampaignId
+          if (!cboId) throw new Error('CBO 路由失败：缺少 campaign_id')
+          apiRequest = makeReq('POST', `/${cboId}`, { daily_budget: newCents, budgetUnit: 'cents' })
+          result = await api.updateCampaignBudget(cboId, newCents)
         } else {
-          apiRequest = { method: 'updateAdsetBudget', targetId: budgetObjectId, budgetCents: newCents }
+          apiRequest = makeReq('POST', `/${budgetObjectId}`, { daily_budget: newCents, budgetUnit: 'cents' })
           result = await api.updateAdsetBudget(budgetObjectId, newCents)
         }
         break
@@ -219,26 +255,46 @@ async function executeAction(api, task, targetId, budgetObjectId) {
 
       case 'increase_budget':
       case 'decrease_budget': {
+        // v3.6 ABO/CBO 智能路由
+        let useCBO = targetLevel === 'campaign'
+        if (!useCBO && (targetLevel === 'ad' || targetLevel === 'adset') && targetCampaignId) {
+          const budgetNodeId = targetLevel === 'adset' ? targetId : budgetObjectId
+          try {
+            const detail = await api.getAdsetBudgetDetail(budgetNodeId)
+            const hasBudget = detail && ((detail.daily_budget || 0) > 0 || (detail.lifetime_budget || 0) > 0)
+            if (!hasBudget) {
+              useCBO = true
+              logger.info(`[ScheduledTask #${task.id}] ${targetLevel === 'adset' ? 'AdSet' : 'AdSet(via ad)'} ${budgetNodeId} 无预算，切换为 CBO (Campaign ${targetCampaignId})`)
+            }
+          } catch (e) {
+            logger.warn(`[ScheduledTask #${task.id}] 无法获取预算详情，尝试 CBO:`, e.message)
+            useCBO = true
+          }
+        }
+        const effectiveBudgetId = useCBO ? (targetLevel === 'campaign' ? budgetObjectId : targetCampaignId) : budgetObjectId
+        if (!effectiveBudgetId) throw new Error('预算路由失败：缺少有效的预算对象 ID')
+
         let currentCents
-        if (targetLevel === 'campaign') {
-          currentCents = await api.getCampaignBudget(budgetObjectId)
+        if (useCBO) {
+          currentCents = await api.getCampaignBudget(effectiveBudgetId)
         } else {
-          currentCents = await api.getAdsetBudget(budgetObjectId)
+          currentCents = await api.getAdsetBudget(effectiveBudgetId)
         }
         const action = { ...params, type: actionType }
         const newCents = computeNewBudgetCentsOnce(currentCents, action)
         if (newCents === currentCents) {
           logger.info(`[ScheduledTask #${task.id}] 预算无需调整（当前=${currentCents}分，目标=${newCents}分），跳过API调用`)
-          apiRequest = { method: 'budget_no_change', currentCents, newCents }
-          apiResponse = { skipped: true, reason: '预算无需调整' }
+          apiRequest = makeReq('GET', `/${effectiveBudgetId}`, { action: 'readBudget' })
+          apiResponse = makeResp(true, { skipped: true, reason: '预算无需调整', currentCents, newCents })
           return { result: null, apiRequest, apiResponse }
         }
-        if (targetLevel === 'campaign') {
-          apiRequest = { method: 'updateCampaignBudget', targetId: budgetObjectId, budgetCents: newCents, previousCents: currentCents }
-          result = await api.updateCampaignBudget(budgetObjectId, newCents)
+        const direction = actionType === 'increase_budget' ? 'increase' : 'decrease'
+        if (useCBO) {
+          apiRequest = makeReq('POST', `/${effectiveBudgetId}`, { daily_budget: newCents, previousCents: currentCents, direction })
+          result = await api.updateCampaignBudget(effectiveBudgetId, newCents)
         } else {
-          apiRequest = { method: 'updateAdsetBudget', targetId: budgetObjectId, budgetCents: newCents, previousCents: currentCents }
-          result = await api.updateAdsetBudget(budgetObjectId, newCents)
+          apiRequest = makeReq('POST', `/${effectiveBudgetId}`, { daily_budget: newCents, previousCents: currentCents, direction })
+          result = await api.updateAdsetBudget(effectiveBudgetId, newCents)
         }
         break
       }
@@ -247,11 +303,11 @@ async function executeAction(api, task, targetId, budgetObjectId) {
         throw new Error(`不支持的动作类型: ${actionType}`)
     }
 
-    apiResponse = result ? (typeof result === 'object' ? { ...result } : { data: result }) : { success: true }
+    apiResponse = makeResp(true, result && typeof result === 'object' ? result : { data: result })
     return { result, apiRequest, apiResponse }
 
   } catch (err) {
-    apiResponse = { error: err.message, stack: err.stack?.slice(0, 500) }
+    apiResponse = makeResp(false, { error: err.message, stack: err.stack?.slice(0, 300) })
     err._apiRequest = apiRequest
     err._apiResponse = apiResponse
     throw err
@@ -296,6 +352,7 @@ async function writeAuditLog(task, targetId, status, preflightMode, errorMessage
     await db.insert(automationLogs).values({
       accountId: accountId,
       adId: auditAdId,
+      adName: extra.adName || null,                                  // v3.2：关联广告名称
       runId: extra.runId || null,
       ruleName: taskName,
       objectType: targetLevel,
@@ -303,12 +360,14 @@ async function writeAuditLog(task, targetId, status, preflightMode, errorMessage
       objectName: extra.objectName || null,
       actionType: actionType,
       actionPayload: actionParams,
-      apiRequest: extra.apiRequest || null,
-      apiResponse: extra.apiResponse || null,
+      // apiRequest/apiResponse 是 TEXT 列，需序列化为 JSON 字符串
+      apiRequest: extra.apiRequest ? (typeof extra.apiRequest === 'string' ? extra.apiRequest : JSON.stringify(extra.apiRequest)) : null,
+      apiResponse: extra.apiResponse ? (typeof extra.apiResponse === 'string' ? extra.apiResponse : JSON.stringify(extra.apiResponse)) : null,
       explanation: {
         trigger_type: 'scheduled',
         schedule_type: task.scheduleType || task.schedule_type,
         schedule_at: task.scheduleAt || task.schedule_at,
+        scheduled_at: task.nextExecuteAt || task.next_execute_at,
         task_id: task.id,
         task_name: taskName
       },
@@ -320,20 +379,23 @@ async function writeAuditLog(task, targetId, status, preflightMode, errorMessage
       ownerId: task.ownerId || task.owner_id || 0
     })
   } catch (e) {
-    logger.error(`[ScheduledTask #${task.id}] 审计日志写入失败:`, e.message)
+    logger.error(`[ScheduledTask #${task.id}] 审计日志写入失败: ${e.message || '(无错误消息)'} code=${e.code} errno=${e.errno} sqlMessage=${e.sqlMessage}`)
   }
 }
 
 /**
  * 成功后更新任务状态
+ * v3.2：增加 affectedRows 检查，乐观锁冲突时记录 warn；once 类型 nextExecuteAt 始终为 null
  */
 async function updateTaskAfterExecute(task) {
-  const nextAt = await computeNextExecuteAt(task)
+  const scheduleType = task.scheduleType || task.schedule_type
+  // once 类型是一次性的，执行后无需计算下次执行时间；其他类型正常计算
+  const nextAt = scheduleType === 'once' ? null : await computeNextExecuteAt(task)
   let newEnabled = task.enabled ?? true
-  if ((task.scheduleType || task.schedule_type) === 'once' && (task.autoDisable ?? task.auto_disable ?? true)) {
+  if (scheduleType === 'once' && (task.autoDisable ?? task.auto_disable ?? true)) {
     newEnabled = false
   }
-  await db.update(scheduledTasks)
+  const result = await db.update(scheduledTasks)
     .set({
       lastExecutedAt: new Date(),
       lastStatus: 'success',
@@ -346,41 +408,29 @@ async function updateTaskAfterExecute(task) {
       eq(scheduledTasks.id, task.id),
       eq(scheduledTasks.version, task.version ?? 0)
     ))
+  const affected = Array.isArray(result) ? result[0]?.affectedRows : result?.affectedRows
+  if (!affected) {
+    logger.warn(`[ScheduledTask #${task.id}] updateTaskAfterExecute 乐观锁冲突，可能被并发修改`)
+  }
 }
 
 /**
- * 失败后更新：指数退避重试
- * 第1次失败：5分钟后重试
- * 第2次失败：10分钟后重试
- * 第3次失败：20分钟后重试（超过 maxRetries → 自动禁用）
+ * 失败后更新：不做重试（失败多为限流，短期重试无意义）
+ * once 类型失败后直接禁用
+ * 周期类型失败后前推到下一正常调度时间，不重试
+ * v3.4：取消指数退避重试
  */
 async function updateTaskAfterFailure(task) {
-  const maxRetries = task.maxRetries ?? task.max_retries ?? 3
-  const newRetryCount = (task.retryCount ?? task.retry_count ?? 0) + 1
+  const scheduleType = task.scheduleType || task.schedule_type
   const now = DateTime.utc()
 
-  if (newRetryCount >= maxRetries) {
-    await db.update(scheduledTasks)
-      .set({
-        lastStatus: 'stale',
-        retryCount: newRetryCount,
-        enabled: false,
-        lastExecutedAt: now.toJSDate(),
-        version: sql`version + 1`
-      })
-      .where(and(
-        eq(scheduledTasks.id, task.id),
-        eq(scheduledTasks.version, task.version ?? 0)
-      ))
-    logger.warn(`[ScheduledTask #${task.id}] 已重试 ${newRetryCount}/${maxRetries} 次，自动禁用`)
-  } else {
-    const backoffMinutes = 5 * Math.pow(2, newRetryCount - 1)
-    const nextRetry = now.plus({ minutes: backoffMinutes }).toJSDate()
-    await db.update(scheduledTasks)
+  if (scheduleType === 'once') {
+    // 一次性任务失败 → 直接禁用，不重试
+    const result = await db.update(scheduledTasks)
       .set({
         lastStatus: 'fail',
-        retryCount: newRetryCount,
-        nextExecuteAt: nextRetry,
+        enabled: false,
+        nextExecuteAt: null,
         lastExecutedAt: now.toJSDate(),
         version: sql`version + 1`
       })
@@ -388,18 +438,46 @@ async function updateTaskAfterFailure(task) {
         eq(scheduledTasks.id, task.id),
         eq(scheduledTasks.version, task.version ?? 0)
       ))
-    logger.info(`[ScheduledTask #${task.id}] 第 ${newRetryCount}/${maxRetries} 次失败，${backoffMinutes} 分钟后重试`)
+    const affected = Array.isArray(result) ? result[0]?.affectedRows : result?.affectedRows
+    if (!affected) {
+      logger.warn(`[ScheduledTask #${task.id}] updateTaskAfterFailure(once) 乐观锁冲突`)
+      return
+    }
+    logger.warn(`[ScheduledTask #${task.id}] 一次性任务执行失败，已禁用（不重试）`)
+    return
   }
+
+  // 周期任务：不重试，直接前推到下一正常调度时间
+  const nextAt = await computeNextExecuteAt(task)
+  const result = await db.update(scheduledTasks)
+    .set({
+      lastStatus: 'fail',
+      nextExecuteAt: nextAt,
+      lastExecutedAt: now.toJSDate(),
+      retryCount: 0,
+      version: sql`version + 1`
+    })
+    .where(and(
+      eq(scheduledTasks.id, task.id),
+      eq(scheduledTasks.version, task.version ?? 0)
+    ))
+  const affected = Array.isArray(result) ? result[0]?.affectedRows : result?.affectedRows
+  if (!affected) {
+    logger.warn(`[ScheduledTask #${task.id}] updateTaskAfterFailure(periodic) 乐观锁冲突`)
+    return
+  }
+  logger.warn(`[ScheduledTask #${task.id}] 执行失败，已前推到下一周期（不重试）`)
 }
 
 /**
  * 跳过时更新：前推 next_execute_at 到下一周期，防止每分钟重复 skip
  * once 类型跳过时直接禁用（目标不存在或账户未激活，重试无意义）
+ * v3.2：增加 affectedRows 检查
  */
 async function updateTaskAfterSkip(task) {
   const scheduleType = task.scheduleType || task.schedule_type
   if (scheduleType === 'once') {
-    await db.update(scheduledTasks)
+    const result = await db.update(scheduledTasks)
       .set({
         lastStatus: 'skipped',
         enabled: false,
@@ -409,10 +487,14 @@ async function updateTaskAfterSkip(task) {
         eq(scheduledTasks.id, task.id),
         eq(scheduledTasks.version, task.version ?? 0)
       ))
+    const affected = Array.isArray(result) ? result[0]?.affectedRows : result?.affectedRows
+    if (!affected) {
+      logger.warn(`[ScheduledTask #${task.id}] updateTaskAfterSkip(once) 乐观锁冲突`)
+    }
     return
   }
   const nextAt = await computeNextExecuteAt(task)
-  await db.update(scheduledTasks)
+  const result = await db.update(scheduledTasks)
     .set({
       lastStatus: 'skipped',
       nextExecuteAt: nextAt,
@@ -422,6 +504,32 @@ async function updateTaskAfterSkip(task) {
       eq(scheduledTasks.id, task.id),
       eq(scheduledTasks.version, task.version ?? 0)
     ))
+  const affected = Array.isArray(result) ? result[0]?.affectedRows : result?.affectedRows
+  if (!affected) {
+    logger.warn(`[ScheduledTask #${task.id}] updateTaskAfterSkip 乐观锁冲突`)
+  }
+}
+
+/**
+ * 刷写审计日志批次（v3.2：改为每个任务完成后立即刷写，防止服务重启丢日志）
+ * @param {Array} batch - 审计日志记录数组
+ */
+async function flushAuditBatch(batch) {
+  if (!batch || batch.length === 0) return
+  // 逐条写入，每条失败单独记日志便于定位
+  let ok = 0, fail = 0
+  for (const record of batch) {
+    try {
+      await db.insert(automationLogs).values(record)
+      ok++
+    } catch (e) {
+      fail++
+      logger.error(`[ScheduledTask] 审计日志写入失败 (${ok+fail}/${batch.length}): ${e.message || '(无错误消息)'} code=${e.code} errno=${e.errno} sqlMessage=${e.sqlMessage}`)
+    }
+  }
+  if (fail > 0) {
+    logger.warn(`[ScheduledTask] 审计日志写入完成: ${ok} 成功, ${fail} 失败`)
+  }
 }
 
 /**
@@ -471,7 +579,7 @@ export async function executeDueScheduledTasks() {
       try {
         // v3 多账户支持：获取任务的所有目标账户
         const taskAccountIds = getTaskAccountIds(task)
-        let taskExecuted = 0, taskErrors = 0, taskSkippedAccounts = 0
+        let taskExecuted = 0, taskErrors = 0, taskSkippedAccounts = 0, taskSkipped = 0
 
         for (const acctId of taskAccountIds) {
           // 2. 校验账户是否 active
@@ -496,51 +604,77 @@ export async function executeDueScheduledTasks() {
           // 4. 遍历每个目标对象执行动作
           const runId = generateRunId(task.id)
           for (const targetId of targetIds) {
+            // v3.2: objectName/auditAdId/adName 提前声明并尽早解析，确保所有路径（含跳过）都能写入审计日志
+            const targetLevel = (task.targetLevel || task.target_level || 'ad').toLowerCase()
+            let auditAdId = targetId  // 默认值，解析失败时兜底
+            let objectName = null
+            let adName = null
             try {
-              const targetLevel = (task.targetLevel || task.target_level || 'ad').toLowerCase()
               const actionType = task.actionType || task.action_type
               const isBudgetAction = ['set_budget', 'increase_budget', 'decrease_budget'].includes(actionType)
               let budgetObjectId = targetId
+              let targetCampaignId = null  // v3.6：CBO 系列预算路由用
 
-              // v3 修复 S2：提前解析 auditAdId，避免后续分支引用未定义变量
-              const auditAdId = await resolveAuditAdId(acctId, targetLevel, targetId)
+              // 解析审计日志用的 ad_id
+              auditAdId = await resolveAuditAdId(acctId, targetLevel, targetId)
+
+              // v3.5：提前解析对象名称 + 广告名称（在"找不到广告"跳过之前），确保跳过路径也能写入 audit 日志
+              objectName = await resolveObjectName(acctId, targetLevel, targetId)
+              adName = await resolveAdName(acctId, targetLevel, targetId)
 
               if (targetLevel === 'ad' && isBudgetAction) {
                 const [adRows] = await pool.execute(
-                  'SELECT adset_id FROM structure_ads WHERE account_id = ? AND ad_id = ? LIMIT 1',
+                  'SELECT adset_id, campaign_id FROM structure_ads WHERE account_id = ? AND ad_id = ? LIMIT 1',
                   [acctId, targetId]
                 )
                 if (adRows.length === 0) {
                   logger.warn(`[ScheduledTask #${task.id}] 账户 ${acctId} 目标 ${targetId} 找不到广告，跳过该对象`)
                   taskErrors++
-                  auditBatch.push(buildAuditRecord(task, targetId, 'skipped', null, `找不到广告 ${targetId}`, { runId, accountId: acctId, auditAdId }))
+                  auditBatch.push(buildAuditRecord(task, targetId, 'skipped', null, `找不到广告 ${targetId}`, { runId, objectName, adName, accountId: acctId, auditAdId }))
                   continue
                 }
                 budgetObjectId = adRows[0].adset_id
+                targetCampaignId = adRows[0].campaign_id || null
+              } else if (targetLevel === 'adset' && isBudgetAction) {
+                // v3.6：广告组层级的预算动作也需要查 campaign_id，用于 CBO 路由
+                const [adsetRows] = await pool.execute(
+                  'SELECT campaign_id FROM structure_adsets WHERE account_id = ? AND adset_id = ? LIMIT 1',
+                  [acctId, targetId]
+                )
+                if (adsetRows.length > 0) {
+                  targetCampaignId = adsetRows[0].campaign_id || null
+                }
               }
-
-              // 解析对象名称
-              const objectName = await resolveObjectName(acctId, targetLevel, targetId)
 
               // 执行
               if (task.isSimulation) {
                 logger.info(`[ScheduledTask #${task.id}] Dry Run: ${task.actionType} on ${targetId} (${acctId})`)
                 taskExecuted++
-                auditBatch.push(buildAuditRecord(task, targetId, 'success', 'preflight', null, { runId, objectName, accountId: acctId, auditAdId }))
+                auditBatch.push(buildAuditRecord(task, targetId, 'success', 'preflight', null, { runId, objectName, adName, accountId: acctId, auditAdId }))
               } else {
-                const actionResult = await executeAction(api, task, targetId, budgetObjectId)
-                taskExecuted++
-                auditBatch.push(buildAuditRecord(task, targetId, 'success', null, null, {
-                  runId, objectName, accountId: acctId, auditAdId,
-                  apiRequest: actionResult.apiRequest,
-                  apiResponse: actionResult.apiResponse
-                }))
+                const actionResult = await executeAction(api, task, targetId, budgetObjectId, targetCampaignId)
+                // v3.4：预算类动作 result=null 表示已触达封顶/保底，实际未发 POST，记为 skipped
+                if (actionResult.result === null) {
+                  taskSkipped++
+                  auditBatch.push(buildAuditRecord(task, targetId, 'skipped', null, '预算已触达上限/下限，无需调整', {
+                    runId, objectName, adName, accountId: acctId, auditAdId,
+                    apiRequest: actionResult.apiRequest,
+                    apiResponse: actionResult.apiResponse
+                  }))
+                } else {
+                  taskExecuted++
+                  auditBatch.push(buildAuditRecord(task, targetId, 'success', null, null, {
+                    runId, objectName, adName, accountId: acctId, auditAdId,
+                    apiRequest: actionResult.apiRequest,
+                    apiResponse: actionResult.apiResponse
+                  }))
+                }
               }
             } catch (targetErr) {
               logger.error(`[ScheduledTask #${task.id}] 账户 ${acctId} 目标 ${targetId} 执行失败:`, targetErr.message)
               taskErrors++
               auditBatch.push(buildAuditRecord(task, targetId, 'fail', null, targetErr.message, {
-                runId, accountId: acctId, auditAdId,
+                runId, accountId: acctId, auditAdId, objectName, adName,
                 apiRequest: targetErr._apiRequest || null,
                 apiResponse: targetErr._apiResponse || null
               }))
@@ -556,10 +690,14 @@ export async function executeDueScheduledTasks() {
           executed++
           await updateTaskAfterExecute(task)
         } else {
-          // 所有账户都跳过（无 active 账户 或 所有账户无有效目标）
+          // 所有目标都被跳过（账户未激活 / 无有效目标 / 预算触达上限）
           skipped++
           await updateTaskAfterSkip(task)
         }
+
+        // v3.2：每个任务完成后立即刷写审计日志，防止服务重启丢日志
+        await flushAuditBatch(auditBatch)
+        auditBatch.length = 0
 
       } catch (err) {
         logger.error(`[ScheduledTask #${task.id}] 执行失败:`, err.message)
@@ -572,17 +710,14 @@ export async function executeDueScheduledTasks() {
           apiRequest: err._apiRequest || null,
           apiResponse: err._apiResponse || null
         }))
+        // 异常路径也刷写审计日志
+        await flushAuditBatch(auditBatch)
+        auditBatch.length = 0
       }
     }
 
-    // 批量写入审计日志（单次 INSERT，避免逐条写入的性能损耗）
-    if (auditBatch.length > 0) {
-      try {
-        await db.insert(automationLogs).values(auditBatch)
-      } catch (e) {
-        logger.error(`[ScheduledTask] 批量审计日志写入失败 (${auditBatch.length} 条):`, e.message)
-      }
-    }
+    // 最终兜底刷写（正常情况此时 auditBatch 已空，仅防御性保留）
+    await flushAuditBatch(auditBatch)
 
     return { executed, skipped, errors }
 
@@ -596,9 +731,7 @@ export async function executeDueScheduledTasks() {
  * @param {number} taskId - 任务 ID
  * @returns {Promise<{ success: boolean, message: string }>}
  */
-export async function forceExecuteTask(taskId) {
-  const [rows] = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, taskId)).limit(1)
-  const task = rows[0]
+export async function forceExecuteTask(task) {
   if (!task) return { success: false, message: '任务不存在' }
 
   const token = process.env.FACEBOOK_ACCESS_TOKEN
@@ -609,7 +742,7 @@ export async function forceExecuteTask(taskId) {
 
     // v3 多账户支持
     const taskAccountIds = getTaskAccountIds(task)
-    let totalSuccess = 0, totalFail = 0
+    let totalSuccess = 0, totalFail = 0, totalSkipped = 0
     const runId = generateRunId(task.id)
     const targetLevel = (task.targetLevel || task.target_level || 'ad').toLowerCase()
 
@@ -630,44 +763,70 @@ export async function forceExecuteTask(taskId) {
       if (targetIds.length === 0) continue
 
       for (const targetId of targetIds) {
+        // v3.2: objectName 提前声明，确保失败路径也能写入审计日志
+        // v3.5: objectName/adName 提前声明并尽早解析，确保跳过路径也能写入 audit 日志
+        let objectName = null
+        let adName = null
         try {
           const actionType = task.actionType || task.action_type
           const isBudgetAction = ['set_budget', 'increase_budget', 'decrease_budget'].includes(actionType)
           let budgetObjectId = targetId
+          let targetCampaignId = null  // v3.6：CBO 系列预算路由用
+
+          // 提前解析对象名称 + 广告名称（在"找不到广告"跳过之前）
+          objectName = await resolveObjectName(acctId, targetLevel, targetId)
+          adName = await resolveAdName(acctId, targetLevel, targetId)
+
           if (targetLevel === 'ad' && isBudgetAction) {
             const [adRows] = await pool.execute(
-              'SELECT adset_id FROM structure_ads WHERE account_id = ? AND ad_id = ? LIMIT 1',
+              'SELECT adset_id, campaign_id FROM structure_ads WHERE account_id = ? AND ad_id = ? LIMIT 1',
               [acctId, targetId]
             )
             if (adRows.length === 0) {
               totalFail++
-              await writeAuditLog(task, targetId, 'skipped', null, `找不到广告 ${targetId}`, { runId, accountId: acctId })
+              await writeAuditLog(task, targetId, 'skipped', null, `找不到广告 ${targetId}`, { runId, objectName, adName, accountId: acctId })
               continue
             }
             budgetObjectId = adRows[0].adset_id
+            targetCampaignId = adRows[0].campaign_id || null
+          } else if (targetLevel === 'adset' && isBudgetAction) {
+            const [adsetRows] = await pool.execute(
+              'SELECT campaign_id FROM structure_adsets WHERE account_id = ? AND adset_id = ? LIMIT 1',
+              [acctId, targetId]
+            )
+            if (adsetRows.length > 0) {
+              targetCampaignId = adsetRows[0].campaign_id || null
+            }
           }
-
-          // 解析对象名称
-          const objectName = await resolveObjectName(acctId, targetLevel, targetId)
 
           if (task.isSimulation) {
             logger.info(`[ScheduledTask #${task.id}] Force Dry Run: ${task.actionType} on ${targetId} (${acctId})`)
             totalSuccess++
-            await writeAuditLog(task, targetId, 'success', 'preflight', null, { runId, objectName, accountId: acctId })
+            await writeAuditLog(task, targetId, 'success', 'preflight', null, { runId, objectName, adName, accountId: acctId })
           } else {
-            const actionResult = await executeAction(api, task, targetId, budgetObjectId)
-            totalSuccess++
-            await writeAuditLog(task, targetId, 'success', null, null, {
-              runId, objectName, accountId: acctId,
-              apiRequest: actionResult.apiRequest,
-              apiResponse: actionResult.apiResponse
-            })
+            const actionResult = await executeAction(api, task, targetId, budgetObjectId, targetCampaignId)
+            // v3.4：预算类动作 result=null 表示已触达封顶/保底，实际未发 POST，记为 skipped
+            if (actionResult.result === null) {
+              totalSkipped++
+              await writeAuditLog(task, targetId, 'skipped', null, '预算已触达上限/下限，无需调整', {
+                runId, objectName, adName, accountId: acctId,
+                apiRequest: actionResult.apiRequest,
+                apiResponse: actionResult.apiResponse
+              })
+            } else {
+              totalSuccess++
+              await writeAuditLog(task, targetId, 'success', null, null, {
+                runId, objectName, adName, accountId: acctId,
+                apiRequest: actionResult.apiRequest,
+                apiResponse: actionResult.apiResponse
+              })
+            }
           }
         } catch (targetErr) {
           logger.error(`[ScheduledTask #${task.id}] 目标 ${targetId} 手动执行失败:`, targetErr.message)
           totalFail++
           await writeAuditLog(task, targetId, 'fail', null, targetErr.message, {
-            runId, accountId: acctId,
+            runId, accountId: acctId, objectName, adName,
             apiRequest: targetErr._apiRequest || null,
             apiResponse: targetErr._apiResponse || null
           })
@@ -675,12 +834,16 @@ export async function forceExecuteTask(taskId) {
       }
     }
 
-    if (totalFail > 0 || totalSuccess === 0) {
+    if (totalFail > 0) {
       await updateTaskAfterFailure(task)
-      return { success: totalSuccess > 0, message: `执行完成: ${totalSuccess} 成功, ${totalFail} 失败` }
+      return { success: totalSuccess > 0, message: `执行完成: ${totalSuccess} 成功, ${totalSkipped} 跳过, ${totalFail} 失败` }
+    }
+    if (totalSuccess === 0) {
+      await updateTaskAfterSkip(task)
+      return { success: true, message: `全部跳过 (${totalSkipped} 个对象)` }
     }
     await updateTaskAfterExecute(task)
-    return { success: true, message: `全部执行成功 (${totalSuccess} 个对象)` }
+    return { success: true, message: `执行完成: ${totalSuccess} 成功, ${totalSkipped} 跳过` }
   } catch (err) {
     logger.error(`[ScheduledTask #${task.id}] 手动执行失败:`, err.message)
     await updateTaskAfterFailure(task)
@@ -715,11 +878,47 @@ async function resolveTargetIdsForTask(task, accountId = null) {
 
   // v3 多账户：targetByAccount 优先 — 提取指定账户的目标 ID
   const targetByAccount = task.targetByAccount ?? task.target_by_account
+  const hasTargetByAccount = targetByAccount && typeof targetByAccount === 'object' && Object.keys(targetByAccount).length > 0
   let manualIds = []
-  if (targetByAccount && typeof targetByAccount === 'object' && accountId && targetByAccount[accountId]) {
+
+  // v3.6：检测旧任务数据异常 — targetByAccount 把所有目标归到一个账户但 targetAccountIds 有多个账户
+  const targetAccountIds = task.targetAccountIds ?? task.target_account_ids
+  const hasMultipleTargetAccounts = Array.isArray(targetAccountIds) && targetAccountIds.length > 1
+  const allTbaIds = hasTargetByAccount ? Object.values(targetByAccount).flat().map(v => String(v).trim()).filter(Boolean) : []
+  const tbaHasOnlyOneAccount = hasTargetByAccount && Object.keys(targetByAccount).length === 1
+
+  if (tbaHasOnlyOneAccount && hasMultipleTargetAccounts && allTbaIds.length > 0) {
+    // 数据异常：所有目标被归到一个账户 → 对所有账户统一从 structure 表按真实归属查询
+    logger.info(`[ScheduledTask #${task.id}] targetByAccount 数据异常（全部目标在单一账户），从 structure 表修复账户 ${accountId} 的归属`)
+    try {
+      const tableName = targetLevel === 'campaign' ? 'structure_campaigns' : targetLevel === 'adset' ? 'structure_adsets' : 'structure_ads'
+      const idCol = targetLevel === 'campaign' ? 'campaign_id' : targetLevel === 'adset' ? 'adset_id' : 'ad_id'
+      const placeholders = allTbaIds.map(() => '?').join(',')
+      const [rows] = await pool.execute(
+        `SELECT ${idCol} AS object_id FROM \`${tableName}\` WHERE account_id = ? AND ${idCol} IN (${placeholders})`,
+        [accountId, ...allTbaIds]
+      )
+      manualIds = rows.map(r => String(r.object_id)).filter(Boolean)
+      if (manualIds.length > 0) {
+        logger.info(`[ScheduledTask #${task.id}] 从 structure 表为账户 ${accountId} 解析到 ${manualIds.length} 个目标`)
+      }
+    } catch (e) {
+      logger.warn(`[ScheduledTask #${task.id}] 修复账户 ${accountId} 归属失败:`, e.message)
+    }
+  } else if (hasTargetByAccount && accountId && targetByAccount[accountId]) {
+    // 该账户在 targetByAccount 中有明确的手动目标列表
     manualIds = (targetByAccount[accountId] || []).map(v => String(v).trim()).filter(Boolean)
-  } else if (Array.isArray(targetIdsRaw) && targetIdsRaw.length > 0) {
-    // 兼容旧数据：targetIds 中的复合键 "act_xxx:id" 提取纯 ID
+  } else if (hasTargetByAccount && accountId) {
+    // 该账户在 targetByAccount 中无数据（且前面已处理数据异常情况）→ 尝试从复合 targetIds 提取
+    if (Array.isArray(targetIdsRaw) && targetIdsRaw.length > 0) {
+      const prefix = `${accountId}:`
+      manualIds = targetIdsRaw
+        .filter(v => String(v).trim().startsWith(prefix))
+        .map(v => String(v).trim().slice(prefix.length))
+        .filter(Boolean)
+    }
+  } else if (!hasTargetByAccount && Array.isArray(targetIdsRaw) && targetIdsRaw.length > 0) {
+    // 无 targetByAccount（单账户 / 旧数据兼容）：targetIds 中提取纯 ID
     manualIds = targetIdsRaw.map(v => {
       const s = String(v).trim()
       const idx = s.indexOf(':')
@@ -740,7 +939,7 @@ async function resolveTargetIdsForTask(task, accountId = null) {
 
   // 手动模式：直接返回手动 IDs（已排除）
   if (!useDynamic) {
-    return manualIds.filter(id => !excludeSet.has(id))
+    return manualIds.filter(id => !excludeSet.has(id) && isValidObjectId(id))
   }
 
   // 动态模式：调用 previewDynamicScope 实时解析 scope_filters，与手动 IDs 合并后去排除
@@ -762,7 +961,7 @@ async function resolveTargetIdsForTask(task, accountId = null) {
           const s = String(rawId).trim()
           const idx = s.indexOf(':')
           const pureId = idx >= 0 ? s.slice(idx + 1) : s
-          if (pureId) dynIds.add(pureId)
+          if (isValidObjectId(pureId)) dynIds.add(pureId)
         }
       }
     } catch (e) {
@@ -771,7 +970,7 @@ async function resolveTargetIdsForTask(task, accountId = null) {
   }
 
   // 去重 + 排除
-  return [...dynIds].filter(id => !excludeSet.has(id))
+  return [...dynIds].filter(id => !excludeSet.has(id) && isValidObjectId(id))
 }
 
 /**
@@ -790,6 +989,7 @@ function buildAuditRecord(task, targetId, status, preflightMode, errorMessage, e
   return {
     accountId,
     adId: extra.auditAdId || targetId,                             // S2 修复：非 ad 级目标使用解析后的关联 ad_id
+    adName: extra.adName || null,                                   // v3.2：关联广告名称
     runId: extra.runId || null,
     ruleName: taskName,                                             // 任务自定义名称写入 rule_name
     objectType: targetLevel,
@@ -797,9 +997,10 @@ function buildAuditRecord(task, targetId, status, preflightMode, errorMessage, e
     objectName: extra.objectName || null,
     actionType,
     actionPayload: actionParams,
-    apiRequest: extra.apiRequest || null,
-    apiResponse: extra.apiResponse || null,
-    explanation: { trigger_type: 'scheduled', schedule_type: task.scheduleType || task.schedule_type, schedule_at: task.scheduleAt || task.schedule_at, task_id: task.id, task_name: taskName },
+    // apiRequest/apiResponse 是 TEXT 列，需序列化为 JSON 字符串，不可直接传 JS 对象
+    apiRequest: extra.apiRequest ? (typeof extra.apiRequest === 'string' ? extra.apiRequest : JSON.stringify(extra.apiRequest)) : null,
+    apiResponse: extra.apiResponse ? (typeof extra.apiResponse === 'string' ? extra.apiResponse : JSON.stringify(extra.apiResponse)) : null,
+    explanation: { trigger_type: 'scheduled', schedule_type: task.scheduleType || task.schedule_type, schedule_at: task.scheduleAt || task.schedule_at, scheduled_at: task.nextExecuteAt || task.next_execute_at, task_id: task.id, task_name: taskName },
     preflightMode: preflightMode || (isSim ? 'preflight' : null),
     status,
     errorMessage: errorMessage || null,
@@ -817,6 +1018,15 @@ function generateRunId(taskId) {
 }
 
 /**
+ * 校验对象 ID 是否有效（非 null/undefined/空字符串，非字面量 "null"/"undefined"）
+ */
+function isValidObjectId(id) {
+  if (id == null) return false
+  const s = String(id).trim()
+  return s.length > 0 && s !== 'null' && s !== 'undefined'
+}
+
+/**
  * 查询目标对象的名称
  * @param {string} accountId
  * @param {string} targetLevel - ad / adset / campaign
@@ -826,9 +1036,9 @@ function generateRunId(taskId) {
 async function resolveObjectName(accountId, targetLevel, targetId) {
   try {
     const tableMap = {
-      ad: { table: 'structure_ads', col: 'ad_id', nameCol: 'ad_name' },
-      adset: { table: 'structure_adsets', col: 'adset_id', nameCol: 'adset_name' },
-      campaign: { table: 'structure_campaigns', col: 'campaign_id', nameCol: 'campaign_name' }
+      ad: { table: 'structure_ads', col: 'ad_id', nameCol: 'name' },
+      adset: { table: 'structure_adsets', col: 'adset_id', nameCol: 'name' },
+      campaign: { table: 'structure_campaigns', col: 'campaign_id', nameCol: 'name' }
     }
     const mapping = tableMap[targetLevel]
     if (!mapping) return null
@@ -857,6 +1067,30 @@ async function resolveAuditAdId(accountId, targetLevel, targetId) {
     return String(rows?.[0]?.ad_id || targetId)
   } catch {
     return targetId
+  }
+}
+
+/**
+ * 解析审计日志用的 ad_name（v3.2）
+ * ad 级目标直接查 ad_name；adset/campaign 级目标查该层级下任意一个 ad 的名称
+ */
+async function resolveAdName(accountId, targetLevel, targetId) {
+  try {
+    if (targetLevel === 'ad') {
+      const [rows] = await pool.execute(
+        'SELECT name FROM structure_ads WHERE account_id = ? AND ad_id = ? LIMIT 1',
+        [accountId, targetId]
+      )
+      return rows?.[0]?.name || null
+    }
+    const filterCol = targetLevel === 'adset' ? 'adset_id' : 'campaign_id'
+    const [rows] = await pool.execute(
+      `SELECT name FROM structure_ads WHERE account_id = ? AND ${filterCol} = ? LIMIT 1`,
+      [accountId, targetId]
+    )
+    return rows?.[0]?.name || null
+  } catch {
+    return null
   }
 }
 

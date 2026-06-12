@@ -47,6 +47,23 @@
             <option v-for="r in rules" :key="r.id" :value="r.id">{{ r.name }}</option>
           </select>
         </div>
+        <div class="filter-item">
+          <label>触发类型</label>
+          <select v-model="filters.trigger_type" @change="resetAndLoad" class="select">
+            <option value="">全部类型</option>
+            <option value="condition">规则触发</option>
+            <option value="scheduled">定时任务</option>
+          </select>
+        </div>
+        <div class="filter-item">
+          <label>执行状态</label>
+          <select v-model="filters.status" @change="resetAndLoad" class="select">
+            <option value="">全部状态</option>
+            <option value="success">成功</option>
+            <option value="fail">失败</option>
+            <option value="skipped">跳过</option>
+          </select>
+        </div>
         <div class="filter-item search-item">
           <label>搜索对象ID</label>
           <input 
@@ -90,7 +107,8 @@
           <thead>
             <tr>
               <th class="col-time">执行时间</th>
-              <th class="col-rule">规则名称</th>
+              <th class="col-trigger">来源</th>
+              <th class="col-rule">规则/任务</th>
               <th class="col-ad">执行对象</th>
               <th class="col-action">执行动作</th>
               <th class="col-status">状态</th>
@@ -101,12 +119,15 @@
           <tbody>
             <tr v-for="log in logs" :key="log.id" :class="{ 'row-error': log.status === 'fail' }">
               <td class="col-time">
-                <!-- 主显示：统一北京时区（UTC+8） -->
                 <div class="time-primary">
                   <span class="account-time">{{ formatAccountTime(log.triggered_at) }}</span>
                   <span class="tz-label">北京</span>
                 </div>
                 <div class="date-text">{{ formatAccountDate(log.triggered_at) }}</div>
+              </td>
+              <td class="col-trigger">
+                <span v-if="log.triggerType === 'scheduled'" class="trigger-badge scheduled">定时</span>
+                <span v-else class="trigger-badge condition">规则</span>
               </td>
               <td class="col-rule">
                 <div class="rule-name">{{ log.rule_name || '-' }}</div>
@@ -305,6 +326,7 @@ export default {
       account_id: '',
       rule_id: '',
       status: '',
+      trigger_type: '',
       object_id: '',
       start_date: '',
       end_date: ''
@@ -325,6 +347,7 @@ export default {
         if (filters.account_id) params.append('account_id', filters.account_id)
         if (filters.rule_id) params.append('rule_id', filters.rule_id)
         if (filters.status) params.append('status', filters.status)
+        if (filters.trigger_type) params.append('trigger_type', filters.trigger_type)
         if (filters.object_id) params.append('object_id', filters.object_id)
         if (filters.start_date) params.append('start_date', filters.start_date)
         if (filters.end_date) params.append('end_date', filters.end_date)
@@ -395,6 +418,7 @@ export default {
       filters.account_id = ''
       filters.rule_id = ''
       filters.status = ''
+      filters.trigger_type = ''
       filters.object_id = ''
       filters.start_date = ''
       filters.end_date = ''
@@ -730,6 +754,20 @@ export default {
 .action-badge.danger { background: #fff5f5; color: var(--danger-color); }
 .action-badge.success { background: #e6f6ec; color: var(--secondary-color); }
 .action-badge.primary { background: #eef2ff; color: var(--primary-color); }
+
+/* 触发类型徽章 */
+.trigger-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.trigger-badge.scheduled { background: #fef3c7; color: #92400e; }
+.trigger-badge.condition { background: #e0e7ff; color: #3730a3; }
+
+.col-trigger { width: 80px; }
 
 .mode-badge {
   font-size: 12px;

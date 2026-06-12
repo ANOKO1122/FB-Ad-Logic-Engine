@@ -157,6 +157,7 @@ router.get('/automation-logs/stats/summary', requireAuth, requireActive, async (
  *   - rule_name: 规则名称（可选，精确匹配）
  *   - status: 状态（success/fail/skipped，可选）
  *   - object_id: 搜索对象ID（模糊匹配 ad_id / object_id，可选）
+ *   - trigger_type: 触发类型（scheduled=定时任务 / condition=条件规则，可选）
  *   - start_date: 开始日期（可选，格式 YYYY-MM-DD）
  *   - end_date: 结束日期（可选，格式 YYYY-MM-DD）
  *   - page: 页码（默认 1）
@@ -174,11 +175,11 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
       rule_name,
       status,
       object_id,
+      trigger_type,
       start_date,
       end_date,
       page = 1,
-      limit = 50,
-      include_all_status
+      limit = 50
     } = req.query
     
     // 限制每页条数
@@ -186,18 +187,12 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 50))
     const offset = (pageNum - 1) * limitNum
     
-    // ✅ 只有 admin 用户才能通过参数查看全部状态，非 admin 强制只看 success
-    // ✅ 修复大小写问题：使用 toLowerCase() 处理参数
-    const includeAllStatus = String(include_all_status || '').toLowerCase() === 'true' && isAdminLikeRole(userRole)
-    
     // 构建查询条件
     let whereClause = 'WHERE 1=1'
     const params = []
     
     // 非管理员只能看到自己负责的账户的日志
-    // 需要先查询用户对应的 owner_id
     if (!isAdminLikeRole(userRole)) {
-      // 查询用户的 owner_id
       const [userRows] = await pool.execute(
         'SELECT owner_id FROM users WHERE id = ?',
         [userId]
@@ -222,14 +217,21 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
       params.push(String(rule_name).trim())
     }
     
-    // ✅ 默认只返回 status=success 的日志（除非 admin 通过 include_all_status=true 查看全部）
-    if (!includeAllStatus) {
-      whereClause += ' AND al.status = ?'
-      params.push('success')
-    } else if (status && ['success', 'fail', 'skipped'].includes(status)) {
-      // admin 用户可以通过 status 参数进一步筛选
+    // 状态筛选：规则触发只看 success；定时任务允许看全部状态
+    // 用户传入的 status 参数作为额外过滤条件叠加
+    if (status && ['success', 'fail', 'skipped'].includes(status)) {
       whereClause += ' AND al.status = ?'
       params.push(status)
+    } else {
+      // 默认：成功日志全部可见 + 定时任务的失败/跳过也可见
+      whereClause += ` AND (al.status = 'success' OR JSON_EXTRACT(al.explanation, '$.trigger_type') = 'scheduled')`
+    }
+    
+    // 触发类型筛选：scheduled=定时任务 / condition=条件规则
+    if (trigger_type === 'scheduled') {
+      whereClause += ` AND JSON_EXTRACT(al.explanation, '$.trigger_type') = 'scheduled'`
+    } else if (trigger_type === 'condition') {
+      whereClause += ` AND (JSON_EXTRACT(al.explanation, '$.trigger_type') IS NULL OR JSON_EXTRACT(al.explanation, '$.trigger_type') != 'scheduled')`
     }
     
     if (start_date) {
@@ -295,18 +297,23 @@ router.get('/automation-logs', requireAuth, requireActive, async (req, res) => {
     const [rows] = await pool.execute(dataSql, params)
     
     // 解析 JSON 字段；triggered_at/created_at 统一为 UTC ISO（带 Z），前端按 UTC 转北京展示
-    const logs = rows.map(row => ({
-      ...row,
-      triggered_at: toUTCISO(row.triggered_at),
-      created_at: toUTCISO(row.created_at),
-      metrics_snapshot: typeof row.metrics_snapshot === 'string' 
-        ? JSON.parse(row.metrics_snapshot || '{}') 
-        : (row.metrics_snapshot || {}),
-      explanation: parseLogJsonField(row.explanation, null),
-      action_payload: typeof row.action_payload === 'string'
-        ? JSON.parse(row.action_payload || '{}')
-        : (row.action_payload || {})
-    }))
+    const logs = rows.map(row => {
+      const explanation = parseLogJsonField(row.explanation, null)
+      return {
+        ...row,
+        triggered_at: toUTCISO(row.triggered_at),
+        created_at: toUTCISO(row.created_at),
+        metrics_snapshot: typeof row.metrics_snapshot === 'string' 
+          ? JSON.parse(row.metrics_snapshot || '{}') 
+          : (row.metrics_snapshot || {}),
+        explanation,
+        action_payload: typeof row.action_payload === 'string'
+          ? JSON.parse(row.action_payload || '{}')
+          : (row.action_payload || {}),
+        // 触发类型标签，方便前端展示和筛选
+        triggerType: (explanation && explanation.trigger_type === 'scheduled') ? 'scheduled' : 'condition'
+      }
+    })
     
     res.json({
       success: true,

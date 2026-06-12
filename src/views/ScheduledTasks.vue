@@ -1,9 +1,9 @@
 <template>
   <div class="rule-page">
     <!-- 顶部操作栏 + 筛选 -->
-    <div class="header-actions" style="flex-wrap:wrap;">
+    <div class="header-actions">
       <h2>定时任务</h2>
-      <div class="actions" style="gap:8px;">
+      <div class="actions">
         <select v-model="filterAccountId" class="select" style="max-width:220px;" @change="loadTasks">
           <option value="">全部账户</option>
           <option v-for="acc in accounts" :key="acc.id" :value="acc.id">{{ acc.name || acc.id }}</option>
@@ -21,9 +21,75 @@
           <option value="interval">按间隔</option>
           <option value="cron">Cron</option>
         </select>
+        <!-- 负责人筛选（仅管理员可见） -->
+        <div v-if="isAdminFromTasks" ref="ownerDropdownRef" class="owner-filter-wrap">
+          <div
+            class="owner-filter-trigger"
+            role="button"
+            tabindex="0"
+            aria-haspopup="listbox"
+            :aria-expanded="ownerFilterOpen"
+            title="不选表示全部负责人；可多选筛选"
+            @click="ownerFilterOpen = !ownerFilterOpen"
+            @keydown.enter.prevent="ownerFilterOpen = !ownerFilterOpen"
+            @keydown.space.prevent="ownerFilterOpen = !ownerFilterOpen"
+          >
+            <div class="owner-filter-trigger-text">
+              <span class="owner-filter-label-inline">负责人:</span>
+              <span class="owner-filter-value">{{ ownerFilterDisplayValue }}</span>
+            </div>
+            <div class="owner-filter-trigger-actions">
+              <button
+                v-if="selectedOwnerIds.length > 0"
+                type="button"
+                class="owner-filter-clear"
+                aria-label="清除筛选"
+                @click.stop="clearOwnerFilter"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+              <span class="owner-filter-chevron" :class="{ open: ownerFilterOpen }">▼</span>
+            </div>
+          </div>
+          <Transition name="owner-dropdown">
+            <div v-show="ownerFilterOpen" class="owner-filter-panel" role="listbox">
+              <div
+                class="owner-filter-option owner-filter-option-clear"
+                role="option"
+                @click.stop="clearOwnerFilter"
+              >
+                清除筛选 (全选)
+              </div>
+              <div
+                class="owner-filter-option"
+                :class="{ selected: includeNoOwner }"
+                role="option"
+                :aria-selected="includeNoOwner"
+                @click.stop="toggleNoOwnerOption"
+              >
+                <span class="owner-filter-checkbox" :class="{ selected: includeNoOwner }">
+                  <span v-show="includeNoOwner" class="owner-filter-check">✓</span>
+                </span>
+                <span class="owner-filter-option-label">无（管理员创建）</span>
+              </div>
+              <div
+                v-for="o in ownersList"
+                :key="o.id"
+                class="owner-filter-option"
+                :class="{ selected: selectedOwnerIds.includes(o.id) }"
+                role="option"
+                :aria-selected="selectedOwnerIds.includes(o.id)"
+                @click.stop="toggleOwnerOption(o.id)"
+              >
+                <span class="owner-filter-checkbox" :class="{ selected: selectedOwnerIds.includes(o.id) }">
+                  <span v-show="selectedOwnerIds.includes(o.id)" class="owner-filter-check">✓</span>
+                </span>
+                <span class="owner-filter-option-label">{{ o.owner_name || o.ownerName || o.id }}</span>
+              </div>
+            </div>
+          </Transition>
+        </div>
         <button class="btn secondary small" @click="loadTasks">刷新</button>
-      </div>
-      <div class="actions">
         <button class="btn" @click="openCreateModal">+ 新建定时任务</button>
       </div>
     </div>
@@ -76,12 +142,18 @@
           </div>
           <div class="section">
             <span class="label">动作参数:</span>
-            <span v-if="task.actionParams && task.actionParams.value != null" class="pill action" :class="getActionClass(task.actionType)">
-              {{ task.actionType === 'set_budget' ? '→ $' + task.actionParams.value :
-                 task.actionType === 'increase_budget' ? '↑ ' + task.actionParams.value + (task.actionParams.value_unit === 'percent' ? '%' : '$') :
-                 task.actionType === 'decrease_budget' ? '↓ ' + task.actionParams.value + (task.actionParams.value_unit === 'percent' ? '%' : '$') : '' }}
-            </span>
-            <span v-else class="pill action">{{ actionLabel(task.actionType) }}</span>
+            <span class="pill action" :class="getActionClass(task.actionType)">{{ formatActionParams(task) }}</span>
+          </div>
+          <!-- 动态筛选 -->
+          <div v-if="task.useDynamicScope" class="section">
+            <span class="label">动态筛选：</span>
+            <span class="pill dynamic-on">已开启</span>
+            <span class="pill" :class="dynamicScopeStatusClass(task)">{{ dynamicScopeStatusLabel(task) }}</span>
+            <span v-if="task.matchedCount != null" class="muted" style="margin-left:6px;">当前生效 {{ task.matchedCount }} 个对象</span>
+          </div>
+          <div class="section" v-if="isAdminFromTasks">
+            <span class="label">负责人:</span>
+            <span class="owner-name">{{ task.ownerName || '未分配' }}</span>
           </div>
           <div class="section execution-meta">
             <span class="label">调度:</span>
@@ -247,8 +319,14 @@
                     <input v-model.trim="row.value" type="text" class="input-text scope-value-input" placeholder="请输入名称" :disabled="!form.use_dynamic_scope" :class="{ 'input-error': form.use_dynamic_scope && scopeConditionRowError(row) }" />
                   </template>
                   <template v-else-if="row.field === 'created_within'">
-                    <select v-model="row.value" class="select scope-value-select" :disabled="!form.use_dynamic_scope"><option value="">请选择</option><option value="24">近 24 小时内</option><option value="48">近 48 小时内</option><option value="72">近 72 小时内</option><option value="custom">自定义小时内</option></select>
+                    <select v-model="row.value" class="select scope-value-select" :disabled="!form.use_dynamic_scope"><option value="">请选择</option><option value="24">近 24 小时内</option><option value="48">近 48 小时内</option><option value="72">近 72 小时内</option><option value="custom">自定义小时内</option><option value="older_than">超过 XX 小时</option><option value="between">介于 XX~YY 小时之间</option></select>
                     <input v-if="row.value === 'custom'" v-model.number="row.customHours" type="number" min="1" max="720" class="input-text scope-value-input" placeholder="小时数 1-720" :disabled="!form.use_dynamic_scope" />
+                    <input v-if="row.value === 'older_than'" v-model.number="row.olderThanHours" type="number" min="1" max="720" class="input-text scope-value-input" placeholder="小时数 1-720" :disabled="!form.use_dynamic_scope" />
+                    <span v-if="row.value === 'between'" class="scope-between-group">
+                      <input v-model.number="row.betweenFromHours" type="number" min="1" max="720" class="input-text scope-between-input" placeholder="超过 (小时)" :disabled="!form.use_dynamic_scope" />
+                      <span class="scope-between-sep">—</span>
+                      <input v-model.number="row.betweenToHours" type="number" min="1" max="720" class="input-text scope-between-input" placeholder="以内 (小时)" :disabled="!form.use_dynamic_scope" />
+                    </span>
                   </template>
                   <template v-else>
                     <select v-model="row.value" class="select scope-value-select" :disabled="!form.use_dynamic_scope"><option value="">请选择</option><option value="active_only">所有投放中</option><option value="paused_only">所有已暂停</option><option value="active_and_paused">所有投放中和已暂停</option></select>
@@ -464,6 +542,7 @@
 
 <script>
 import api from '../services/facebookApi.js'
+import { authFetch } from '../utils/authFetch.js'
 
 export default {
   name: 'ScheduledTasks',
@@ -479,6 +558,12 @@ export default {
       filterAccountId: '',
       filterStatus: '',
       filterScheduleType: '',
+      // 负责人筛选（仅管理员）
+      isAdminFromTasks: false,
+      ownersList: [],
+      selectedOwnerIds: [],
+      includeNoOwner: false,
+      ownerFilterOpen: false,
       // modal
       showModal: false,
       editingTaskId: null,
@@ -547,22 +632,22 @@ export default {
     },
     filteredScopeItems() {
       const key = String(this.scopeSearch || '').trim().toLowerCase()
+      const targetLevel = this.form.target_level || 'ad'
       const list = !key
         ? this.scopeItems
         : this.scopeItems.filter(item =>
             String(item.name || '').toLowerCase().includes(key) ||
             String(item.id || '').toLowerCase().includes(key)
           )
-      return [...list].sort((a, b) => {
+      // 过滤：只显示当前目标层级内的对象（resolveObjectsByIds 可能返回跨层级结果，item.type 为 campaign/adset/ad）
+      const levelFiltered = list.filter(item => {
+        if (!item.type) return true  // 来自 getStructureObjects 的结果没有 type 字段，已是正确层级
+        return item.type === targetLevel
+      })
+      return [...levelFiltered].sort((a, b) => {
         const order = (x) => (x.effective_status === 'ACTIVE' ? 0 : 1)
         return order(a) - order(b)
       })
-    },
-    scopeItemKey() {
-      return (item) => this.selectedAccountIds.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
-    },
-    scopeItemValue() {
-      return (item) => this.selectedAccountIds.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
     },
     resolvedName() {
       if (!this.form.target_ids.length) return ''
@@ -573,15 +658,32 @@ export default {
     },
     filteredExcludeScopeItems() {
       const keyword = String(this.excludeScopeSearch || '').trim().toLowerCase()
-      const list = this.excludeScopeSearch ? this.excludeScopeItems : this.scopeItems
-      if (!keyword) return list
-      return list.filter(item =>
+      const targetLevel = this.form.target_level || 'ad'
+      const list = this.scopeItems  // 始终用已加载的主列表做客户端过滤，支持名称和ID搜索
+      // 过滤：只显示当前目标层级内的对象
+      const levelFiltered = list.filter(item => {
+        if (!item.type) return true
+        return item.type === targetLevel
+      })
+      if (!keyword) return levelFiltered
+      return levelFiltered.filter(item =>
         String(item.name || '').toLowerCase().includes(keyword) ||
         String(item.id || '').toLowerCase().includes(keyword)
       )
     },
     canSelectAllExclude() {
       return this.filteredExcludeScopeItems.length > 0
+    },
+    ownerFilterDisplayValue() {
+      const parts = []
+      if (this.selectedOwnerIds.length > 0) {
+        const names = this.ownersList
+          .filter(o => this.selectedOwnerIds.includes(o.id))
+          .map(o => o.owner_name || o.ownerName || String(o.id))
+        if (names.length > 0) parts.push(names.join(', '))
+      }
+      if (this.includeNoOwner) parts.push('管理员创建')
+      return parts.length > 0 ? parts.join(' + ') : '全部 (不选=全部)'
     }
   },
   async mounted() {
@@ -590,6 +692,7 @@ export default {
   watch: {
     selectedAccountIds(val) {
       if (!val?.length) {
+        // 账户清空 → 清空所有选择
         this.scopeItems = []
         this.excludeScopeItems = []
         this.scopeReady = false
@@ -598,6 +701,7 @@ export default {
         if (!this.editingTaskId) this.form.excludeTargetIds = []
         return
       }
+      // 账户变更（新增/移除）→ 清空旧选择后重新加载对象列表（对齐规则管理页行为，避免单账户裸ID与多账户复合ID混用）
       this.scopeItems = []
       this.excludeScopeItems = []
       this.scopeReady = false
@@ -607,6 +711,7 @@ export default {
       this.refreshScopeItems()
     },
     scopeSearch() {
+      // 输入搜索词时重新从后端获取（含ID搜索检测），防抖300ms
       if (!this.selectedAccountIds?.length) return
       clearTimeout(this._scopeSearchTimer)
       this._scopeSearchTimer = setTimeout(() => {
@@ -616,26 +721,18 @@ export default {
         this.refreshScopeItems()
       }, 300)
     },
-    // 排除区搜索防抖：有关键词则请求，无关键词用 scopeItems
+    // 排除区搜索：纯客户端过滤，filteredExcludeScopeItems 已同时匹配名称和ID
     excludeScopeSearch() {
-      const keyword = String(this.excludeScopeSearch || '').trim()
-      if (!keyword) {
-        this.excludeScopeItems = []
-        if (this._excludeSearchTimer) clearTimeout(this._excludeSearchTimer)
-        this._excludeSearchTimer = null
-        return
-      }
-      if (!this.selectedAccountIds?.length) return
-      if (this._excludeSearchTimer) clearTimeout(this._excludeSearchTimer)
-      this._excludeSearchTimer = setTimeout(() => {
-        this._excludeSearchTimer = null
-        this.refreshExcludeScopeItems()
-      }, 300)
+      // 无操作：computed 属性自动响应 excludeScopeSearch 变化
     },
     // 开启动态筛选时，防抖查询 matchedCount
     'form.use_dynamic_scope'(val) {
       if (!val) { this.form.matchedCount = null; return }
       this._triggerMatchedCountPreview()
+    },
+    // 切换目标层级时重新计算匹配数
+    'form.target_level'() {
+      if (this.form.use_dynamic_scope) this._triggerMatchedCountPreview()
     },
     scopeConditionRows: {
       deep: true,
@@ -645,6 +742,14 @@ export default {
     }
   },
   methods: {
+    /** 多选时用 account_id:id 作为唯一键与表单值；单选时用 id（对齐规则管理页逻辑） */
+    scopeItemKey(item) {
+      const key = this.selectedAccountIds.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
+      return key
+    },
+    scopeItemValue(item) {
+      return this.selectedAccountIds.length > 1 ? `${item.account_id || ''}:${item.id}` : item.id
+    },
     getEmptyForm() {
       return {
         schedule_type: 'once',
@@ -667,7 +772,7 @@ export default {
         is_simulation: false,
         auto_disable: true,
         use_dynamic_scope: false,
-        max_dynamic_matches: 1000,
+        max_dynamic_matches: 5000,
         matchedCount: null,
         excludeTargetIds: []
       }
@@ -688,11 +793,51 @@ export default {
         if (this.filterAccountId) p.account_id = this.filterAccountId
         if (this.filterStatus) p.status = this.filterStatus
         if (this.filterScheduleType) p.schedule_type = this.filterScheduleType
+        if (this.isAdminFromTasks) {
+          if (this.selectedOwnerIds.length > 0) {
+            const ids = this.selectedOwnerIds.map(id => Number(id)).filter(Number.isFinite)
+            if (ids.length > 0) p.ownerIds = ids.join(',')
+          }
+          if (this.includeNoOwner) p.includeNoOwner = '1'
+        }
         const r = await api.getScheduledTasks(p)
         this.tasks = r.items || []
+        this.isAdminFromTasks = r.isAdmin === true
+        if (r.isAdmin && this.ownersList.length === 0) {
+          try {
+            const oResp = await authFetch('/api/owners')
+            const oData = await oResp.json()
+            this.ownersList = oData.owners || []
+          } catch { this.ownersList = [] }
+        }
       } catch (e) {
         this.showToast('加载列表失败: ' + e.message, 'error')
       }
+    },
+
+    /** 负责人筛选：清除已选并重新加载 */
+    clearOwnerFilter() {
+      this.selectedOwnerIds = []
+      this.includeNoOwner = false
+      this.ownerFilterOpen = false
+      this.loadTasks()
+    },
+
+    /** 负责人筛选：切换某一负责人的选中状态 */
+    toggleOwnerOption(id) {
+      const idx = this.selectedOwnerIds.indexOf(id)
+      if (idx >= 0) {
+        this.selectedOwnerIds = this.selectedOwnerIds.filter((_, i) => i !== idx)
+      } else {
+        this.selectedOwnerIds = [...this.selectedOwnerIds, id]
+      }
+      this.loadTasks()
+    },
+
+    /** 负责人筛选：切换"管理员创建" */
+    toggleNoOwnerOption() {
+      this.includeNoOwner = !this.includeNoOwner
+      this.loadTasks()
     },
 
     // ---- 账户多选 ----
@@ -717,6 +862,29 @@ export default {
     },
 
     // ---- 作用对象列表加载 ----
+    resolveScopeTimeFilters() {
+      const completed = this.scopeConditionRows.filter(row => !this.scopeConditionRowError(row))
+      const createdRows = completed.filter(r => r.field === 'created_within')
+      const hoursList = createdRows.map(r => {
+        if (r.value === '24' || r.value === '48' || r.value === '72') return parseInt(r.value, 10)
+        if (r.value === 'custom' && r.customHours != null && Number.isFinite(r.customHours) && r.customHours >= 1 && r.customHours <= 720) return r.customHours
+        return null
+      }).filter(h => Number.isFinite(h) && h > 0)
+      const withinHours = hoursList.length ? Math.min(...hoursList) : null
+      const olderThanRow = completed.find(r => r.field === 'created_within' && r.value === 'older_than')
+      const olderThanHours = olderThanRow ? Number(olderThanRow.olderThanHours) : null
+      const beforeHours = Number.isFinite(olderThanHours) && olderThanHours >= 1 && olderThanHours <= 720 ? olderThanHours : null
+      const betweenRow = completed.find(r => r.field === 'created_within' && r.value === 'between')
+      const betweenFrom = betweenRow ? Number(betweenRow.betweenFromHours) : null
+      const betweenTo = betweenRow ? Number(betweenRow.betweenToHours) : null
+      const betweenValid = Number.isFinite(betweenFrom) && Number.isFinite(betweenTo) && betweenFrom >= 1 && betweenTo <= 720 && betweenFrom < betweenTo
+      return {
+        scope_created_within_hours: withinHours ?? undefined,
+        scope_created_before_hours: beforeHours ?? undefined,
+        scope_created_between_from_hours: betweenValid ? betweenFrom : undefined,
+        scope_created_between_to_hours: betweenValid ? betweenTo : undefined
+      }
+    },
     async refreshScopeItems() {
       if (!this.selectedAccountIds?.length) return
       this.scopeLoading = true
@@ -726,18 +894,57 @@ export default {
       const level = this.form.target_level || 'ad'
       const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
       const keyword = String(this.scopeSearch || '').trim()
+      const isIdSearch = /^\d{10,}$/.test(keyword)  // 检测是否为纯数字ID搜索
       const limit = keyword ? 50 : 500
+      const tf = this.resolveScopeTimeFilters()
       try {
         if (ids.length === 1) {
-          const resp = await api.getStructureObjects(levelKey, ids[0], { q: keyword, limit, after: null, include_paused: true })
+          const singleAccountId = ids[0]
+          const promises = [
+            api.getStructureObjects(levelKey, singleAccountId, { q: keyword, limit, after: null, include_paused: true, ...tf })
+          ]
+          if (isIdSearch) promises.push(api.resolveObjectsByIds(keyword).catch(() => []))
+          const results = await Promise.all(promises)
           if (requestId !== this.scopeRequestId) return
-          this.scopeItems = resp.items || []
-          this.scopePagingAfter = keyword ? null : (resp?.paging?.after ?? null)
+          let items = results[0]?.items || []
+          // 单账户 API 返回的 item 不含 account_id，统一补上（对齐多账户 API 行为）
+          items = items.map(it => ({ ...it, account_id: it.account_id || singleAccountId }))
+          if (isIdSearch && results[1]?.length > 0) {
+            const existingIds = new Set(items.map(it => String(it.id)))
+            for (const item of results[1]) {
+              // 只合并当前目标层级内的对象，避免选了广告组却搜到广告/广告系列
+              if (!existingIds.has(String(item.id)) && item.type === level) items.push({ ...item, account_id: item.account_id || singleAccountId })
+            }
+          }
+          this.scopeItems = items
+          this.scopePagingAfter = keyword ? null : (results[0]?.paging?.after ?? null)
         } else {
-          const result = await api.getStructureObjectsMulti(level, ids, { q: keyword, limit, after: null, include_paused: true })
+          const promises = [
+            api.getStructureObjectsMulti(level, ids, { q: keyword, limit, after: null, include_paused: true, ...tf })
+          ]
+          if (isIdSearch) promises.push(api.resolveObjectsByIds(keyword).catch(() => []))
+          const results = await Promise.all(promises)
           if (requestId !== this.scopeRequestId) return
-          this.scopeItems = result.items || []
-          this.scopePagingAfter = keyword ? null : (result.paging?.after ?? null)
+          let items = results[0]?.items || []
+          if (isIdSearch && results[1]?.length > 0) {
+            const existingIds = new Set(items.map(it => String(it.id)))
+            // 多账户模式下 resolve 返回的 item 不含 account_id，合并时需补上
+            // 优先从已有 items 中查找 account_id，找不到则跳过（避免污染 :id 格式）
+            const accountMap = new Map()
+            for (const it of items) {
+              if (it.account_id && it.id) accountMap.set(String(it.id), it.account_id)
+            }
+            for (const item of results[1]) {
+              const itemId = String(item.id)
+              // 只合并当前目标层级内的对象，避免选了广告组却搜到广告/广告系列
+              if (!existingIds.has(itemId) && item.type === level) {
+                const acc = item.account_id || accountMap.get(itemId)
+                items.push({ ...item, account_id: acc || ids[0] })
+              }
+            }
+          }
+          this.scopeItems = items
+          this.scopePagingAfter = keyword ? null : (results[0]?.paging?.after ?? null)
         }
         this.scopeReady = true
       } catch (e) {
@@ -757,14 +964,17 @@ export default {
       const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
       this.scopeLoading = true
       const requestId = ++this.scopeRequestId
+      const tf = this.resolveScopeTimeFilters()
       try {
         if (ids.length === 1) {
-          const resp = await api.getStructureObjects(levelKey, ids[0], { q: String(this.scopeSearch || '').trim(), limit: 500, after: this.scopePagingAfter, include_paused: true })
+          const singleAccountId = ids[0]
+          const resp = await api.getStructureObjects(levelKey, singleAccountId, { q: String(this.scopeSearch || '').trim(), limit: 500, after: this.scopePagingAfter, include_paused: true, ...tf })
           if (requestId !== this.scopeRequestId) return
-          this.scopeItems = [...this.scopeItems, ...(resp.items || [])]
+          const newItems = (resp.items || []).map(it => ({ ...it, account_id: it.account_id || singleAccountId }))
+          this.scopeItems = [...this.scopeItems, ...newItems]
           this.scopePagingAfter = resp?.paging?.after || null
         } else {
-          const result = await api.getStructureObjectsMulti(level, ids, { q: String(this.scopeSearch || '').trim(), limit: 500, after: this.scopePagingAfter, include_paused: true })
+          const result = await api.getStructureObjectsMulti(level, ids, { q: String(this.scopeSearch || '').trim(), limit: 500, after: this.scopePagingAfter, include_paused: true, ...tf })
           if (requestId !== this.scopeRequestId) return
           this.scopeItems = [...this.scopeItems, ...(result.items || [])]
           this.scopePagingAfter = result.paging?.after || null
@@ -827,13 +1037,15 @@ export default {
       const ids = this.selectedAccountIds
       const level = this.form.target_level || 'ad'
       const levelKey = level === 'campaign' ? 'campaigns' : (level === 'adset' ? 'adsets' : 'ads')
+      const tf = this.resolveScopeTimeFilters()
       try {
         if (ids.length === 1) {
-          const resp = await api.getStructureObjects(levelKey, ids[0], { q: keyword, limit: 50, after: null, include_paused: true })
+          const singleAccountId = ids[0]
+          const resp = await api.getStructureObjects(levelKey, singleAccountId, { q: keyword, limit: 50, after: null, include_paused: true, ...tf })
           if (requestId !== this.excludeRequestId) return
-          this.excludeScopeItems = resp.items || []
+          this.excludeScopeItems = (resp.items || []).map(it => ({ ...it, account_id: it.account_id || singleAccountId }))
         } else {
-          const result = await api.getStructureObjectsMulti(level, ids, { q: keyword, limit: 50, after: null, include_paused: true })
+          const result = await api.getStructureObjectsMulti(level, ids, { q: keyword, limit: 50, after: null, include_paused: true, ...tf })
           if (requestId !== this.excludeRequestId) return
           this.excludeScopeItems = result.items || []
         }
@@ -886,7 +1098,7 @@ export default {
 
     // ---- 监控范围条件 ----
     createDefaultScopeConditionRow() {
-      return { id: 'sc-' + Math.random().toString(36).slice(2, 9), field: 'name', operator: 'include', value: '', customHours: null }
+      return { id: 'sc-' + Math.random().toString(36).slice(2, 9), field: 'name', operator: 'include', value: '', customHours: null, olderThanHours: null, betweenFromHours: null, betweenToHours: null }
     },
     scopeConditionRowError(row) {
       const v = String(row.value || '').trim()
@@ -894,15 +1106,23 @@ export default {
       if (row.field === 'name' && !v) return '数据不能为空'
       if (row.field === 'created_within') {
         if (v === '24' || v === '48' || v === '72') return null
-        if (v === 'custom') { const h = row.customHours; if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请选择时间范围或填写小时数'; return null }
-        return '请选择时间范围或填写小时数'
+        if (v === 'custom') { const h = row.customHours; if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请填写小时数(1-720)'; return null }
+        if (v === 'older_than') { const h = row.olderThanHours; if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请填写小时数(1-720)'; return null }
+        if (v === 'between') {
+          const from = row.betweenFromHours; const to = row.betweenToHours
+          if (from == null || !Number.isFinite(from) || from < 1 || from > 720) return '请填写「超过」小时数(1-720)'
+          if (to == null || !Number.isFinite(to) || to < 1 || to > 720) return '请填写「以内」小时数(1-720)'
+          if (from >= to) return '「超过」小时必须小于「以内」小时'
+          return null
+        }
+        return '请选择时间范围'
       }
       return null
     },
     onScopeConditionFieldChange(row) {
       if (!this.form.use_dynamic_scope) return
       if (row.field === 'name') { row.operator = 'include'; row.value = '' }
-      else if (row.field === 'created_within') { row.operator = 'include'; row.value = ''; row.customHours = null }
+      else if (row.field === 'created_within') { row.operator = 'include'; row.value = ''; row.customHours = null; row.olderThanHours = null; row.betweenFromHours = null; row.betweenToHours = null }
       else { row.operator = 'equals'; row.value = '' }
     },
     addScopeConditionRow() {
@@ -924,9 +1144,16 @@ export default {
           const val = String(row.value).trim()
           conditions.push({ field: 'effective_status', operator: row.operator === 'not_equals' ? 'not_in' : 'in', value: val === 'active_only' ? ['ACTIVE'] : val === 'paused_only' ? ['PAUSED'] : ['ACTIVE', 'PAUSED'] })
         } else if (row.field === 'created_within') {
-          let hours = null; if (row.value === '24' || row.value === '48' || row.value === '72') hours = Number(row.value)
-          else if (row.value === 'custom') { const h = Number(row.customHours); if (Number.isFinite(h) && h >= 1 && h <= 720) hours = h }
-          if (Number.isFinite(hours) && hours > 0) conditions.push({ field: 'created_time', operator: 'within_hours', value: hours })
+          if (row.value === '24' || row.value === '48' || row.value === '72') {
+            conditions.push({ field: 'created_time', operator: 'within_hours', value: Number(row.value) })
+          } else if (row.value === 'custom') {
+            const h = Number(row.customHours); if (Number.isFinite(h) && h >= 1 && h <= 720) conditions.push({ field: 'created_time', operator: 'within_hours', value: h })
+          } else if (row.value === 'older_than') {
+            const h = Number(row.olderThanHours); if (Number.isFinite(h) && h >= 1 && h <= 720) conditions.push({ field: 'created_time', operator: 'older_than_hours', value: h })
+          } else if (row.value === 'between') {
+            const from = Number(row.betweenFromHours); const to = Number(row.betweenToHours)
+            if (Number.isFinite(from) && Number.isFinite(to) && from >= 1 && to <= 720 && from < to) conditions.push({ field: 'created_time', operator: 'between_hours', value: [from, to] })
+          }
         }
       }
       return { level: this.form.target_level || 'ad', conditions }
@@ -936,7 +1163,9 @@ export default {
       this.form.target_ids = []
       this.form.excludeTargetIds = []
       this.excludeScopeItems = []
+      this.form.matchedCount = null  // 层级切换后重置匹配数
       if (this.selectedAccountIds.length) this.refreshScopeItems()
+      if (this.form.use_dynamic_scope) this._triggerMatchedCountPreview()
     },
     onScheduleTypeChange() {
       this.form.week_days = []
@@ -953,6 +1182,46 @@ export default {
       this.form.budget_unit = 'percent'
       this.form.max_daily_budget = null
       this.form.min_daily_budget = null
+    },
+
+    /** 从 scope_filters 恢复监控范围条件行（对齐规则管理 RuleManager） */
+    buildScopeRowsFromFilters(scopeFilters) {
+      const sf = typeof scopeFilters === 'string' ? JSON.parse(scopeFilters) : scopeFilters
+      if (!sf || typeof sf !== 'object') return [this.createDefaultScopeConditionRow()]
+      const conditions = sf.conditions || []
+      if (!Array.isArray(conditions) || conditions.length === 0) return [this.createDefaultScopeConditionRow()]
+      const rows = []
+      for (const c of conditions) {
+        if (!c || typeof c !== 'object') continue
+        const base = { id: `sc-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` }
+        if (c.field === 'name' && (c.operator === 'contains' || c.operator === 'not_contains')) {
+          rows.push({ ...base, field: 'name', operator: c.operator === 'not_contains' ? 'exclude' : 'include', value: String(c.value || ''), customHours: null })
+        } else if (c.field === 'effective_status' && (c.operator === 'in' || c.operator === 'not_in')) {
+          const arr = Array.isArray(c.value) ? c.value.map(v => String(v).toUpperCase()) : []
+          let value = 'active_and_paused'
+          if (arr.length === 1 && arr[0] === 'ACTIVE') value = 'active_only'
+          else if (arr.length === 1 && arr[0] === 'PAUSED') value = 'paused_only'
+          rows.push({ ...base, field: 'status', operator: c.operator === 'not_in' ? 'not_equals' : 'equals', value, customHours: null })
+        } else if (c.field === 'created_time') {
+          if (c.operator === 'within_hours') {
+            const h = Number(c.value)
+            if (!Number.isFinite(h) || h <= 0) continue
+            let value = 'custom', customHours = h
+            if (h === 24 || h === 48 || h === 72) { value = String(h); customHours = null }
+            rows.push({ ...base, field: 'created_within', operator: 'include', value, customHours })
+          } else if (c.operator === 'older_than_hours') {
+            const h = Number(c.value)
+            if (!Number.isFinite(h) || h <= 0) continue
+            rows.push({ ...base, field: 'created_within', operator: 'include', value: 'older_than', olderThanHours: h, customHours: null })
+          } else if (c.operator === 'between_hours') {
+            const arr = Array.isArray(c.value) ? c.value.map(Number) : []
+            const from = arr[0], to = arr[1]
+            if (!Number.isFinite(from) || !Number.isFinite(to) || from < 1 || to > 720 || from >= to) continue
+            rows.push({ ...base, field: 'created_within', operator: 'include', value: 'between', betweenFromHours: from, betweenToHours: to, customHours: null })
+          }
+        }
+      }
+      return rows.length > 0 ? rows : [this.createDefaultScopeConditionRow()]
     },
 
     openCreateModal() {
@@ -982,30 +1251,40 @@ export default {
       this.excludeScopeItems = []
       this.scopePagingAfter = null
       this.scopeApplyMessage = ''
-      this.scopeConditionRows = [this.createDefaultScopeConditionRow()]
+      // v3.2: 从 scope_filters 恢复监控范围条件（对齐规则管理行为）
+      const sf = task.scopeFilters || task.scope_filters
+      this.scopeConditionRows = sf && typeof sf === 'object' ? this.buildScopeRowsFromFilters(sf) : [this.createDefaultScopeConditionRow()]
       const taskAccount = task.accountId || ''
-      // v3 多账户支持：恢复所有目标账户
+      // v3 多账户支持：合并 targetByAccount keys + targetAccountIds 恢复所有目标账户
       const tba = task.targetByAccount ?? task.target_by_account
       const taIds = task.targetAccountIds ?? task.target_account_ids
+      const restoredAccountSet = new Set()
       if (tba && typeof tba === 'object') {
-        this.selectedAccountIds = Object.keys(tba).filter(k => Array.isArray(tba[k]) && tba[k].length > 0)
-        if (this.selectedAccountIds.length === 0 && taskAccount) this.selectedAccountIds = [taskAccount]
-      } else if (Array.isArray(taIds) && taIds.length > 0) {
-        this.selectedAccountIds = taIds.map(a => String(a).trim()).filter(Boolean)
+        for (const k of Object.keys(tba)) {
+          if (Array.isArray(tba[k]) && tba[k].length > 0) restoredAccountSet.add(k)
+        }
+      }
+      if (Array.isArray(taIds) && taIds.length > 0) {
+        for (const a of taIds) { const s = String(a).trim(); if (s) restoredAccountSet.add(s) }
+      }
+      if (restoredAccountSet.size > 0) {
+        this.selectedAccountIds = [...restoredAccountSet]
       } else {
         this.selectedAccountIds = taskAccount ? [taskAccount] : []
       }
 
-      // v3 多账户：从 target_by_account 恢复手动选择的 target_ids（按当前层级提取）
-      let restoredTargetIds = Array.isArray(task.targetIds) ? [...task.targetIds] : (task.targetId ? [task.targetId] : [])
-      if (tba && typeof tba === 'object' && restoredTargetIds.length === 0) {
-        const compositeIds = []
+      // v3 多账户：始终从 target_by_account 重建复合 ID（targetIds 库存为纯ID无账户前缀，无法匹配多账户复选框）
+      let restoredTargetIds = []
+      if (tba && typeof tba === 'object') {
         for (const [acc, objIds] of Object.entries(tba)) {
           if (Array.isArray(objIds)) {
-            for (const oid of objIds) compositeIds.push(`${acc}:${oid}`)
+            for (const oid of objIds) restoredTargetIds.push(`${acc}:${oid}`)
           }
         }
-        if (compositeIds.length > 0) restoredTargetIds = compositeIds
+      }
+      // 兜底：无 targetByAccount 时用 targetIds（单账户/旧数据兼容）
+      if (restoredTargetIds.length === 0) {
+        restoredTargetIds = Array.isArray(task.targetIds) ? [...task.targetIds] : (task.targetId ? [task.targetId] : [])
       }
       this.accountToAdd = ''
       const sa = task.scheduleAt || ''
@@ -1124,29 +1403,77 @@ export default {
       this.formError = ''
       this.saving = true
       try {
-        // v3 多账户支持：构建 target_by_account（复用规则管理逻辑）
+        // v3 多账户支持：构建 target_by_account
+        // 策略：优先用 scopeItems 中的 account_id；如果 scopeItems 为空或缺少 account_id，则重新加载
         const ids = this.form.target_ids || []
-        const byAccount = {}
         const accountSet = new Set(this.selectedAccountIds)
+        const byAccount = {}
+
         if (!this.form.use_dynamic_scope) {
+          // 构建 scopeItems 查找表：objectId → account_id
+          let scopeAccountMap = new Map()
+          for (const it of this.scopeItems) {
+            if (it.account_id && it.id) scopeAccountMap.set(String(it.id), it.account_id)
+          }
+
+          // 如果 scopeItems 为空或多数 item 缺失 account_id，重新从服务端拉取以确保正确
+          const idsNeedResolution = ids.filter(id => {
+            const s = String(id).trim()
+            if (!s) return false
+            const colonIdx = s.indexOf(':')
+            const idPart = colonIdx >= 0 ? s.slice(colonIdx + 1) : s
+            const acc = colonIdx >= 0 ? s.slice(0, colonIdx).trim() : ''
+            return !acc || !scopeAccountMap.has(idPart)
+          })
+          if (idsNeedResolution.length > 0 && accountSet.size > 1) {
+            try {
+              const level = this.form.target_level || 'ad'
+              const result = await api.getStructureObjectsMulti(level, this.selectedAccountIds, { limit: 500 })
+              const freshItems = result?.items || []
+              scopeAccountMap = new Map()
+              for (const it of freshItems) {
+                if (it.account_id && it.id) scopeAccountMap.set(String(it.id), it.account_id)
+              }
+            } catch (e) {
+              // 重载失败时 scopeAccountMap 保持原样，后续逐个 ID 回退到 selectedAccountIds[0]
+            }
+          }
+
           for (const id of ids) {
             const s = String(id).trim()
+            if (!s) continue
+            let acc, idPart
             if (s.includes(':')) {
-              const acc = s.split(':')[0].trim()
-              const idPart = s.slice(s.indexOf(':') + 1)
-              if (acc && idPart) {
-                if (!byAccount[acc]) byAccount[acc] = []
-                byAccount[acc].push(idPart)
-              }
-            } else if (accountSet.size > 0) {
-              const acc = this.selectedAccountIds[0]
+              const colonIdx = s.indexOf(':')
+              acc = s.slice(0, colonIdx).trim()
+              idPart = s.slice(colonIdx + 1)
+            } else {
+              acc = ''
+              idPart = s
+            }
+            if (!idPart) continue
+            // 解析归属账户：复合键直接取，否则从 scopeAccountMap 查，再不行回退到第一个选中账户
+            if (!acc) {
+              acc = scopeAccountMap.get(idPart) || (accountSet.size > 0 ? this.selectedAccountIds[0] : null)
+            }
+            if (acc) {
               if (!byAccount[acc]) byAccount[acc] = []
-              byAccount[acc].push(s)
+              if (!byAccount[acc].includes(idPart)) byAccount[acc].push(idPart)
             }
           }
         }
         // 动态筛选模式：target_by_account 为空对象，执行时按账户逐个调用 previewDynamicScope
         const targetByAccount = Object.keys(byAccount).length > 0 ? byAccount : null
+
+        // v3.4：规范化 target_ids 为复合格式 "act_xxx:id"（对齐规则管理，确保多账户对象归属不丢失）
+        const normalizedTargetIds = []
+        if (!this.form.use_dynamic_scope) {
+          for (const acc of Object.keys(byAccount)) {
+            for (const objId of byAccount[acc]) {
+              normalizedTargetIds.push(`${acc}:${objId}`)
+            }
+          }
+        }
 
         const payload = {
           schedule_type: this.form.schedule_type,
@@ -1154,11 +1481,11 @@ export default {
           schedule_cron: this.form.schedule_type === 'cron' ? this.form.schedule_cron : null,
           schedule_timezone: this.form.schedule_timezone || null,
           account_id: this.selectedAccountIds[0] || '',
-          target_accounts: this.selectedAccountIds.length > 1 ? this.selectedAccountIds : null,
+          target_accounts: this.selectedAccountIds.length > 0 ? this.selectedAccountIds : null,
           target_by_account: targetByAccount,
           target_level: this.form.target_level,
-          target_id: this.form.use_dynamic_scope ? null : (this.form.target_ids[0] || null),
-          target_ids: this.form.use_dynamic_scope ? [] : this.form.target_ids,
+          target_id: this.form.use_dynamic_scope ? null : (normalizedTargetIds[0] || null),
+          target_ids: this.form.use_dynamic_scope ? [] : normalizedTargetIds,
           use_dynamic_scope: this.form.use_dynamic_scope,
           scope_filters: this.form.use_dynamic_scope ? this.buildScopeFiltersFromRows() : null,
           exclude_ids: this.form.excludeTargetIds.length > 0 ? this.buildExcludeIdsForPreview(this.form.excludeTargetIds, this.form.target_level) : null,
@@ -1189,16 +1516,21 @@ export default {
         await api.deleteScheduledTask(task.id)
         this.showToast('已删除', 'info')
         await this.loadTasks()
-      } catch (e) { this.showToast('删除失败: ' + e.message, 'error') }
+      } catch (e) { this.showToast('删除失败: ' + (e.response?.data?.error || e.message), 'error') }
     },
 
     async toggleTask(task, enabled) {
       try {
         const u = await api.toggleScheduledTask(task.id)
+        // 保留 API 未返回的字段：ownerName（仅列表接口补全）
+        if (u && !u.ownerName && task.ownerName) {
+          u.ownerName = task.ownerName
+          u.ownerId = task.ownerId ?? u.ownerId
+        }
         const i = this.tasks.findIndex(t => t.id === task.id)
         if (i >= 0) this.tasks.splice(i, 1, u)
         this.showToast(u.enabled ? '已启用' : '已禁用', 'info')
-      } catch (e) { this.showToast('操作失败: ' + e.message, 'error') }
+      } catch (e) { this.showToast('操作失败: ' + (e.response?.data?.error || e.message), 'error') }
     },
 
     async executeTask(task) {
@@ -1216,6 +1548,45 @@ export default {
       const m = { once: '一次性', daily: '每天', weekly: '每周', interval: '按间隔', cron: 'Cron' }
       return m[t] || t
     },
+    formatActionParams(task) {
+      const at = task.actionType || ''
+      const p = task.actionParams
+      if (!p || typeof p !== 'object') return this.actionLabel(at)
+      const v = p.value
+      if (v == null) return this.actionLabel(at)
+      if (at === 'set_budget') return '设置预算到 $' + v
+      if (at === 'increase_budget') {
+        const unit = (p.value_unit || 'percent') === 'usd' ? '$' : '%'
+        let label = '上调 ' + v + unit
+        if (p.max_daily_budget != null) label += '（上限 $' + (Number(p.max_daily_budget) / 100).toFixed(2) + '）'
+        return label
+      }
+      if (at === 'decrease_budget') {
+        const unit = (p.value_unit || 'percent') === 'usd' ? '$' : '%'
+        let label = '下调 ' + v + unit
+        if (p.min_daily_budget != null) label += '（下限 $' + (Number(p.min_daily_budget) / 100).toFixed(2) + '）'
+        return label
+      }
+      return this.actionLabel(at)
+    },
+
+    dynamicScopeStatusClass(task) {
+      // 简易状态判断：有 scope_filters 且非空 = 正常
+      const sf = task.scopeFilters || task.scope_filters
+      if (!sf || typeof sf !== 'object') return 'dynamic-off'
+      const conds = sf.conditions || []
+      if (!Array.isArray(conds) || conds.length === 0) return 'dynamic-off'
+      return 'dynamic-on'
+    },
+
+    dynamicScopeStatusLabel(task) {
+      const sf = task.scopeFilters || task.scope_filters
+      if (!sf || typeof sf !== 'object') return '未配置'
+      const conds = sf.conditions || []
+      if (!Array.isArray(conds) || conds.length === 0) return '未配置'
+      return '状态正常'
+    },
+
     countExcluded(task) {
       const ex = task.excludeIds || task.exclude_ids
       if (!ex || typeof ex !== 'object') return 0
@@ -1225,6 +1596,7 @@ export default {
       }
       return n
     },
+
     actionLabel(t) {
       const m = { pause_ad: '暂停', activate_ad: '启动', set_budget: '设置预算', increase_budget: '上调预算', decrease_budget: '下调预算' }
       return m[t] || t
@@ -1249,6 +1621,175 @@ export default {
 </script>
 
 <style scoped>
+/* === 顶部操作栏（与 RuleManager 对齐） === */
+.header-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+.header-actions h2 { margin: 0; font-size: 24px; color: var(--text-primary, #111827); }
+.actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.actions .btn.small {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* === 负责人筛选下拉（与 RuleManager 同款） === */
+.owner-filter-wrap {
+  position: relative;
+  min-width: 240px;
+}
+.owner-filter-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 240px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.owner-filter-trigger:hover {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px #2563eb;
+}
+.owner-filter-trigger-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  min-width: 0;
+}
+.owner-filter-label-inline {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: #6b7280;
+}
+.owner-filter-value {
+  font-weight: 500;
+  color: #111827;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.owner-filter-trigger-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.owner-filter-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 4px;
+}
+.owner-filter-clear:hover {
+  color: #dc2626;
+  background: #fef2f2;
+}
+.owner-filter-chevron {
+  font-size: 10px;
+  color: #6b7280;
+  transition: transform 0.2s;
+}
+.owner-filter-chevron.open {
+  transform: rotate(180deg);
+}
+.owner-filter-panel {
+  position: absolute;
+  z-index: 50;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.owner-filter-option {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+  color: #374151;
+  transition: background 0.15s;
+}
+.owner-filter-option:hover {
+  background: #f3f4f6;
+}
+.owner-filter-option.selected {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+.owner-filter-option-clear {
+  color: #6b7280;
+  border-bottom: 1px solid #e5e7eb;
+  margin-bottom: 4px;
+}
+.owner-filter-option-clear:hover {
+  background: #f9fafb;
+  color: #2563eb;
+}
+.owner-filter-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 10px;
+  flex-shrink: 0;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+  transition: border-color 0.2s, background 0.2s;
+}
+.owner-filter-option.selected .owner-filter-checkbox {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+.owner-filter-check {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+.owner-filter-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 负责人下拉展开/收起过渡 */
+.owner-dropdown-enter-active,
+.owner-dropdown-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.owner-dropdown-enter-from,
+.owner-dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.owner-name { color: #374151; font-size: 13px; }
+
 /* Modal overlay + content */
 .modal-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.4); display:flex; align-items:center; justify-content:center; z-index:1000; }
 .modal-content { background:#fff; border-radius:12px; width:90%; max-width:600px; max-height:85vh; overflow-y:auto; box-shadow:0 4px 20px rgba(0,0,0,0.2); }
@@ -1343,6 +1884,9 @@ input:checked + .slider:before { transform:translateX(16px); }
 .scope-more { text-align:center; padding:8px; }
 .scope-dynamic-summary { padding:8px; color:#6b7280; font-size:13px; }
 .scope-row-error { color:#dc2626; font-size:12px; margin-top:2px; }
+.scope-between-group { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex-shrink: 0; }
+.scope-between-group .scope-between-input { width: 80px; min-width: 60px; flex: none; }
+.scope-between-group .scope-between-sep { color: #6b7280; font-size: 13px; user-select: none; }
 
 /* Tags */
 .selected-preview { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:8px; }

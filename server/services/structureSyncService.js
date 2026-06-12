@@ -140,7 +140,7 @@ const EFFECTIVE_STATUS_FILTER = [
  * 分页：基于 structure_ads.id 的稳定游标，返回 paging.after。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureAdsFromDb(accountId, opts = {}) {
@@ -156,6 +156,21 @@ export async function listStructureAdsFromDb(accountId, opts = {}) {
   const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
   const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
   const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  // 新增：创建超过 N 小时 → created_time <= now - N hours
+  const rawBeforeHours = opts.scope_created_before_hours != null ? parseInt(opts.scope_created_before_hours, 10) : NaN
+  const beforeHours = Number.isFinite(rawBeforeHours) && rawBeforeHours > 0 ? rawBeforeHours : null
+  const createdBeforeThreshold = beforeHours != null ? new Date(Date.now() - beforeHours * 3600 * 1000).toISOString() : null
+
+  // 新增：介于 X~Y 小时之间（超过 X、未超过 Y）
+  // fromHours < toHours；例 from=24, to=72 → created_time BETWEEN now-72h AND now-24h
+  const rawBetweenFrom = opts.scope_created_between_from_hours != null ? parseInt(opts.scope_created_between_from_hours, 10) : NaN
+  const rawBetweenTo = opts.scope_created_between_to_hours != null ? parseInt(opts.scope_created_between_to_hours, 10) : NaN
+  const betweenFromHours = Number.isFinite(rawBetweenFrom) && rawBetweenFrom > 0 ? rawBetweenFrom : null
+  const betweenToHours = Number.isFinite(rawBetweenTo) && rawBetweenTo > 0 ? rawBetweenTo : null
+  const betweenValid = betweenFromHours != null && betweenToHours != null && betweenFromHours < betweenToHours
+  const betweenLowerBound = betweenValid ? new Date(Date.now() - betweenToHours * 3600 * 1000).toISOString() : null    // 更早: now - Y
+  const betweenUpperBound = betweenValid ? new Date(Date.now() - betweenFromHours * 3600 * 1000).toISOString() : null  // 更近: now - X
 
   let statusList
   if (scopeStatus === 'active_only') statusList = ['ACTIVE']
@@ -196,6 +211,14 @@ export async function listStructureAdsFromDb(accountId, opts = {}) {
     sql += ` AND created_time IS NOT NULL AND created_time >= ?`
     params.push(createdSinceThreshold)
   }
+  if (createdBeforeThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time <= ?`
+    params.push(createdBeforeThreshold)
+  }
+  if (betweenValid) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ? AND created_time <= ?`
+    params.push(betweenLowerBound, betweenUpperBound)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
@@ -234,7 +257,7 @@ export async function listStructureAdsFromDb(accountId, opts = {}) {
  * 当 scope_status 有值时忽略 include_paused；当 scope_status 为空时按 include_paused + q 决定 statusList。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureCampaignsFromDb(accountId, opts = {}) {
@@ -249,6 +272,20 @@ export async function listStructureCampaignsFromDb(accountId, opts = {}) {
   const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
   const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
   const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  // 新增：创建超过 N 小时 → created_time <= now - N hours
+  const rawBeforeHours = opts.scope_created_before_hours != null ? parseInt(opts.scope_created_before_hours, 10) : NaN
+  const beforeHours = Number.isFinite(rawBeforeHours) && rawBeforeHours > 0 ? rawBeforeHours : null
+  const createdBeforeThreshold = beforeHours != null ? new Date(Date.now() - beforeHours * 3600 * 1000).toISOString() : null
+
+  // 新增：介于 X~Y 小时之间（超过 X、未超过 Y）
+  const rawBetweenFrom = opts.scope_created_between_from_hours != null ? parseInt(opts.scope_created_between_from_hours, 10) : NaN
+  const rawBetweenTo = opts.scope_created_between_to_hours != null ? parseInt(opts.scope_created_between_to_hours, 10) : NaN
+  const betweenFromHours = Number.isFinite(rawBetweenFrom) && rawBetweenFrom > 0 ? rawBetweenFrom : null
+  const betweenToHours = Number.isFinite(rawBetweenTo) && rawBetweenTo > 0 ? rawBetweenTo : null
+  const betweenValid = betweenFromHours != null && betweenToHours != null && betweenFromHours < betweenToHours
+  const betweenLowerBound = betweenValid ? new Date(Date.now() - betweenToHours * 3600 * 1000).toISOString() : null
+  const betweenUpperBound = betweenValid ? new Date(Date.now() - betweenFromHours * 3600 * 1000).toISOString() : null
 
   let statusList
   if (scopeStatus === 'active_only') statusList = ['ACTIVE']
@@ -288,6 +325,14 @@ export async function listStructureCampaignsFromDb(accountId, opts = {}) {
     sql += ` AND created_time IS NOT NULL AND created_time >= ?`
     params.push(createdSinceThreshold)
   }
+  if (createdBeforeThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time <= ?`
+    params.push(createdBeforeThreshold)
+  }
+  if (betweenValid) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ? AND created_time <= ?`
+    params.push(betweenLowerBound, betweenUpperBound)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
@@ -323,7 +368,7 @@ export async function listStructureCampaignsFromDb(accountId, opts = {}) {
  * 当 scope_status 有值时忽略 include_paused；当 scope_status 为空时按 include_paused + q 决定 statusList。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude }
+ * @param {Object} opts - { q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours }
  * @returns {Promise<{ items: Array, paging: { after: string|null } }>}
  */
 export async function listStructureAdsetsFromDb(accountId, opts = {}) {
@@ -338,6 +383,20 @@ export async function listStructureAdsetsFromDb(accountId, opts = {}) {
   const rawHours = opts.scope_created_within_hours != null ? parseInt(opts.scope_created_within_hours, 10) : NaN
   const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : null
   const createdSinceThreshold = hours != null ? new Date(Date.now() - hours * 3600 * 1000).toISOString() : null
+
+  // 新增：创建超过 N 小时 → created_time <= now - N hours
+  const rawBeforeHours = opts.scope_created_before_hours != null ? parseInt(opts.scope_created_before_hours, 10) : NaN
+  const beforeHours = Number.isFinite(rawBeforeHours) && rawBeforeHours > 0 ? rawBeforeHours : null
+  const createdBeforeThreshold = beforeHours != null ? new Date(Date.now() - beforeHours * 3600 * 1000).toISOString() : null
+
+  // 新增：介于 X~Y 小时之间（超过 X、未超过 Y）
+  const rawBetweenFrom = opts.scope_created_between_from_hours != null ? parseInt(opts.scope_created_between_from_hours, 10) : NaN
+  const rawBetweenTo = opts.scope_created_between_to_hours != null ? parseInt(opts.scope_created_between_to_hours, 10) : NaN
+  const betweenFromHours = Number.isFinite(rawBetweenFrom) && rawBetweenFrom > 0 ? rawBetweenFrom : null
+  const betweenToHours = Number.isFinite(rawBetweenTo) && rawBetweenTo > 0 ? rawBetweenTo : null
+  const betweenValid = betweenFromHours != null && betweenToHours != null && betweenFromHours < betweenToHours
+  const betweenLowerBound = betweenValid ? new Date(Date.now() - betweenToHours * 3600 * 1000).toISOString() : null
+  const betweenUpperBound = betweenValid ? new Date(Date.now() - betweenFromHours * 3600 * 1000).toISOString() : null
 
   let statusList
   if (scopeStatus === 'active_only') statusList = ['ACTIVE']
@@ -377,6 +436,14 @@ export async function listStructureAdsetsFromDb(accountId, opts = {}) {
     sql += ` AND created_time IS NOT NULL AND created_time >= ?`
     params.push(createdSinceThreshold)
   }
+  if (createdBeforeThreshold) {
+    sql += ` AND created_time IS NOT NULL AND created_time <= ?`
+    params.push(createdBeforeThreshold)
+  }
+  if (betweenValid) {
+    sql += ` AND created_time IS NOT NULL AND created_time >= ? AND created_time <= ?`
+    params.push(betweenLowerBound, betweenUpperBound)
+  }
   if (after) {
     sql += ` AND id > ?`
     params.push(after)
@@ -412,7 +479,7 @@ export async function listStructureAdsetsFromDb(accountId, opts = {}) {
  * type 只允许 campaign | adset | ad，分发到已有 list 方法，返回统一字段结构。
  *
  * @param {string} accountId - 广告账户 ID
- * @param {Object} opts - { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours }
+ * @param {Object} opts - { type, q, limit, after, include_paused, scope_status, scope_status_exclude, name_exclude, scope_created_within_hours, scope_created_before_hours, scope_created_between_from_hours, scope_created_between_to_hours }
  * @returns {Promise<{ items: Array<{ id, type, name, campaign_id, adset_id, effective_status, account_id }>, paging }>}
  */
 export async function listStructureObjectsFromDb(accountId, opts = {}) {
@@ -429,7 +496,10 @@ export async function listStructureObjectsFromDb(accountId, opts = {}) {
     scope_status: opts.scope_status,
     scope_status_exclude: opts.scope_status_exclude,
     name_exclude: opts.name_exclude,
-    scope_created_within_hours: opts.scope_created_within_hours
+    scope_created_within_hours: opts.scope_created_within_hours,
+    scope_created_before_hours: opts.scope_created_before_hours,
+    scope_created_between_from_hours: opts.scope_created_between_from_hours,
+    scope_created_between_to_hours: opts.scope_created_between_to_hours
   }
   let result
   if (type === 'campaign') {

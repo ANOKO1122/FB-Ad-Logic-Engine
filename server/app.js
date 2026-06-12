@@ -7,8 +7,7 @@ import { requireAuth, requireActive } from './middleware/authJwt.js'
 import authRoutes from './routes/auth.js'
 import adminRoutes from './routes/admin.js'
 import rulesRoutes from './routes/rules.js'
-// [临时禁用] 定时任务模块有语法错误待修复
-// import scheduledTasksRoutes from './routes/scheduledTasks.js'
+import scheduledTasksRoutes from './routes/scheduledTasks.js'
 import systemRoutes from './routes/system.js'
 
 // 导入 Facebook API 客户端类和规则引擎类（暂时从 index.js 导入，后续可以移到单独文件）
@@ -42,8 +41,7 @@ app.use(cookieParser())
 app.use('/api', authRoutes)          // /api/me, /api/owners, /api/auth/*
 app.use('/api/admin', adminRoutes)   // /api/admin/*
 app.use('/api', rulesRoutes)         // /api/rules/* (规则管理，使用 Drizzle ORM)
-// [临时禁用] 定时任务路由
-// app.use('/api/scheduled-tasks', scheduledTasksRoutes) // /api/scheduled-tasks/*
+app.use('/api/scheduled-tasks', scheduledTasksRoutes) // /api/scheduled-tasks/*
 app.use('/api', systemRoutes)        // /api/automation-logs/*, /api/system/*
 
 // 健康检查路由（测试需要）

@@ -26,8 +26,7 @@ import {
   upsertRuleAdExecutionStateBatch
 } from './ruleExecutionStateService.js'
 import { getRuleExecutionAccountIds } from './ruleEnableGateService.js'
-// [临时禁用] 定时任务模块有语法错误待修复
-// import { executeDueScheduledTasks, isScheduledTaskRunning } from './scheduledTaskService.js'
+import { executeDueScheduledTasks, isScheduledTaskRunning } from './scheduledTaskService.js'
 
 // M4 Pre-Flight 刷新：执行前批量拉取 FB effective_status，解决 ad_snapshots 滞后导致误 POST
 const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN
@@ -1960,26 +1959,27 @@ export function startCronJob() {
     }
   })
 
-  // [临时禁用] 8. 定时任务调度 — scheduledTaskService.js 有语法错误待修复
-  // cron.schedule('* * * * *', async () => {
-  //   if (isScheduledTaskRunning()) {
-  //     return
-  //   }
-  //   try {
-  //     const result = await executeDueScheduledTasks()
-  //     if (result.skippedDueToLock) return
-  //     if (result.executed > 0 || result.errors > 0) {
-  //       logger.info(
-  //         `[ScheduledTask Cron] 本次处理 ${result.executed + result.skipped + result.errors} 条，` +
-  //         `执行 ${result.executed}，跳过 ${result.skipped}，失败 ${result.errors}`
-  //       )
-  //     }
-  //   } catch (err) {
-  //     logger.error('[ScheduledTask Cron] 异常:', err.message)
-  //   }
-  // })
+  // 8. 定时任务调度 — scheduled_tasks 表，独立互斥锁
+  cron.schedule('* * * * *', async () => {
+    if (isScheduledTaskRunning()) {
+      logger.warn('[ScheduledTask Cron] 上一轮尚未执行完毕，跳过本轮（防并发重叠）')
+      return
+    }
+    try {
+      const result = await executeDueScheduledTasks()
+      if (result.skippedDueToLock) return
+      if (result.executed > 0 || result.errors > 0) {
+        logger.info(
+          `[ScheduledTask Cron] 本次处理 ${result.executed + result.skipped + result.errors} 条，` +
+          `执行 ${result.executed}，跳过 ${result.skipped}，失败 ${result.errors}`
+        )
+      }
+    } catch (err) {
+      logger.error('[ScheduledTask Cron] 异常:', err.message)
+    }
+  })
 
-  logger.info('✅ 定时任务已启动（定时任务模块临时禁用）')
+  logger.info('✅ 定时任务已启动（定时任务模块已启用）')
 }
 
 /**

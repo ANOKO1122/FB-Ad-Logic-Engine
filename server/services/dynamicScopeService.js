@@ -172,11 +172,35 @@ function buildStructureFilter(scopeFilters, accountId, nowUtc) {
         throw new Error('INVALID_FILTER_OPERATOR_NAME')
       }
     } else if (field === 'created_time') {
-      const hours = Number(val)
-      if (!Number.isFinite(hours) || hours <= 0) continue
-      const threshold = now.minus({ hours }).toUTC().toISO()
-      clauses.push('created_time IS NOT NULL AND created_time >= ?')
-      params.push(threshold)
+      if (op === 'within_hours' || !op) {
+        // 现有：最近 N 小时内 → created_time >= now - N hours
+        const hours = Number(val)
+        if (!Number.isFinite(hours) || hours <= 0) continue
+        const threshold = now.minus({ hours }).toUTC().toISO()
+        clauses.push('created_time IS NOT NULL AND created_time >= ?')
+        params.push(threshold)
+      } else if (op === 'older_than_hours') {
+        // 新增：XX 小时以前 → created_time <= now - N hours
+        const hours = Number(val)
+        if (!Number.isFinite(hours) || hours <= 0) continue
+        const threshold = now.minus({ hours }).toUTC().toISO()
+        clauses.push('created_time IS NOT NULL AND created_time <= ?')
+        params.push(threshold)
+      } else if (op === 'between_hours') {
+        // 新增：X 小时以上（超过 X）、Y 小时以内（未超过 Y）
+        // value 为 [fromHours, toHours]，fromHours < toHours
+        // 例: [24, 72] → created_time BETWEEN now-72h AND now-24h
+        const arr = Array.isArray(val) ? val : []
+        const fromHours = Number(arr[0])
+        const toHours = Number(arr[1])
+        if (!Number.isFinite(fromHours) || !Number.isFinite(toHours) || fromHours <= 0 || toHours <= 0 || fromHours >= toHours) continue
+        const lowerBound = now.minus({ hours: toHours }).toUTC().toISO()    // 更早: now - 72h
+        const upperBound = now.minus({ hours: fromHours }).toUTC().toISO()  // 更近: now - 24h
+        clauses.push('created_time IS NOT NULL AND created_time >= ? AND created_time <= ?')
+        params.push(lowerBound, upperBound)
+      } else {
+        throw new Error('INVALID_FILTER_OPERATOR_CREATED_TIME')
+      }
     } else {
       throw new Error('INVALID_FILTER_FIELD')
     }

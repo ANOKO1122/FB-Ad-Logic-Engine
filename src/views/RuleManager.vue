@@ -412,7 +412,10 @@
                       <option value="48">近 48 小时内</option>
                       <option value="72">近 72 小时内</option>
                       <option value="custom">自定义小时内</option>
+                      <option value="older_than">超过 XX 小时</option>
+                      <option value="between">介于 XX~YY 小时之间</option>
                     </select>
+                    <!-- 现有：自定义小时内 -->
                     <input
                       v-if="row.value === 'custom'"
                       v-model.number="row.customHours"
@@ -424,6 +427,42 @@
                       :disabled="isScopeConditionsDisabled"
                       :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
                     />
+                    <!-- 新增：XX 小时以前 -->
+                    <input
+                      v-if="row.value === 'older_than'"
+                      v-model.number="row.olderThanHours"
+                      type="number"
+                      min="1"
+                      max="720"
+                      class="input-text scope-value-input scope-custom-hours"
+                      placeholder="请输入小时数 (1–720)"
+                      :disabled="isScopeConditionsDisabled"
+                      :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
+                    />
+                    <!-- 新增：介于 XX~YY 小时之间（两个输入框同一行） -->
+                    <span v-if="row.value === 'between'" class="scope-between-group">
+                      <input
+                        v-model.number="row.betweenFromHours"
+                        type="number"
+                        min="1"
+                        max="720"
+                        class="input-text scope-between-input"
+                        placeholder="超过 (小时)"
+                        :disabled="isScopeConditionsDisabled"
+                        :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
+                      />
+                      <span class="scope-between-sep">—</span>
+                      <input
+                        v-model.number="row.betweenToHours"
+                        type="number"
+                        min="1"
+                        max="720"
+                        class="input-text scope-between-input"
+                        placeholder="以内 (小时)"
+                        :disabled="isScopeConditionsDisabled"
+                        :class="{ 'input-error': !isScopeConditionsDisabled && scopeConditionRowError(row) }"
+                      />
+                    </span>
                   </template>
                   <template v-else>
                     <select
@@ -1101,7 +1140,7 @@ export default {
       executionIntervalHoursCustom: null,
       executionTimeWindows: [],
       useDynamicScope: true,
-      maxDynamicMatches: 1000,
+      maxDynamicMatches: 5000,
       matchedCount: null,
       invalidIds: [],
       lastMatchedHistory: null
@@ -1148,7 +1187,10 @@ export default {
       field: 'name',
       operator: 'include',
       value: '',
-      customHours: null  // 创建时间段选「自定义」时的小时数（1–720）
+      customHours: null,          // 现有：自定义小时内
+      olderThanHours: null,       // 新增：XX小时以前
+      betweenFromHours: null,     // 新增：介于 起始小时（超过X小时）
+      betweenToHours: null        // 新增：介于 结束小时（Y小时以内）
     })
     const scopeConditionRows = ref([createDefaultScopeConditionRow()])
     const scopeApplyMessage = ref('') // 应用条件后的提示，如「已勾选 N 个对象」
@@ -1190,6 +1232,9 @@ export default {
     const scopeStatusExcludeFilter = ref('') // 状态「不等于」时传：ACTIVE | PAUSED | ACTIVE,PAUSED
     const scopeNameExclude = ref('')   // 名称不包含关键词
     const scopeCreatedWithinHours = ref(null) // 创建时间段：近 N 小时内（数字或 null），传给后端 scope_created_within_hours
+    const scopeCreatedBeforeHours = ref(null)        // XX小时以前：创建超过 N 小时
+    const scopeCreatedBetweenFromHours = ref(null)   // 介于：超过 X 小时
+    const scopeCreatedBetweenToHours = ref(null)     // 介于：Y 小时以内
     /** 结构列表每页条数上限（首屏与加载更多共用） */
     const SCOPE_PAGE_LIMIT = 500
     /** 搜索模式单页条数（q 非空时 limit=50、after=null，不展示加载更多） */
@@ -1392,19 +1437,44 @@ export default {
             value: mapped
           })
         } else if (row.field === 'created_within') {
-          let hours = null
+          // 现有：预设近N小时
           if (row.value === '24' || row.value === '48' || row.value === '72') {
-            hours = Number(row.value)
-          } else if (row.value === 'custom') {
-            const h = Number(row.customHours)
-            if (Number.isFinite(h) && h >= 1 && h <= 720) hours = h
-          }
-          if (Number.isFinite(hours) && hours > 0) {
             conditions.push({
               field: 'created_time',
               operator: 'within_hours',
-              value: hours
+              value: Number(row.value)
             })
+          } else if (row.value === 'custom') {
+            // 现有：自定义小时内
+            const h = Number(row.customHours)
+            if (Number.isFinite(h) && h >= 1 && h <= 720) {
+              conditions.push({
+                field: 'created_time',
+                operator: 'within_hours',
+                value: h
+              })
+            }
+          } else if (row.value === 'older_than') {
+            // 新增：XX 小时以前
+            const h = Number(row.olderThanHours)
+            if (Number.isFinite(h) && h >= 1 && h <= 720) {
+              conditions.push({
+                field: 'created_time',
+                operator: 'older_than_hours',
+                value: h
+              })
+            }
+          } else if (row.value === 'between') {
+            // 新增：介于 XX~YY 小时之间（超过X小时、Y小时以内）
+            const from = Number(row.betweenFromHours)
+            const to = Number(row.betweenToHours)
+            if (Number.isFinite(from) && Number.isFinite(to) && from >= 1 && to <= 720 && from < to) {
+              conditions.push({
+                field: 'created_time',
+                operator: 'between_hours',
+                value: [from, to]
+              })
+            }
           }
         }
       }
@@ -1439,22 +1509,52 @@ export default {
             value,
             customHours: null
           })
-        } else if (c.field === 'created_time' && c.operator === 'within_hours') {
-          const h = Number(c.value)
-          if (!Number.isFinite(h) || h <= 0) continue
-          let value = 'custom'
-          let customHours = h
-          if (h === 24 || h === 48 || h === 72) {
-            value = String(h)
-            customHours = null
+        } else if (c.field === 'created_time') {
+          if (c.operator === 'within_hours') {
+            // 现有：近N小时（保持不变）
+            const h = Number(c.value)
+            if (!Number.isFinite(h) || h <= 0) continue
+            let value = 'custom'
+            let customHours = h
+            if (h === 24 || h === 48 || h === 72) {
+              value = String(h)
+              customHours = null
+            }
+            rows.push({
+              id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+              field: 'created_within',
+              operator: 'include',
+              value,
+              customHours
+            })
+          } else if (c.operator === 'older_than_hours') {
+            // 新增：XX小时以前
+            const h = Number(c.value)
+            if (!Number.isFinite(h) || h <= 0) continue
+            rows.push({
+              id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+              field: 'created_within',
+              operator: 'include',
+              value: 'older_than',
+              customHours: null,
+              olderThanHours: h
+            })
+          } else if (c.operator === 'between_hours') {
+            // 新增：介于
+            const arr = Array.isArray(c.value) ? c.value : []
+            const from = Number.isFinite(Number(arr[0])) ? Number(arr[0]) : null
+            const to = Number.isFinite(Number(arr[1])) ? Number(arr[1]) : null
+            if (from == null || to == null) continue
+            rows.push({
+              id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+              field: 'created_within',
+              operator: 'include',
+              value: 'between',
+              customHours: null,
+              betweenFromHours: from,
+              betweenToHours: to
+            })
           }
-          rows.push({
-            id: `scope-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-            field: 'created_within',
-            operator: 'include',
-            value,
-            customHours
-          })
         }
       }
       return rows.length ? rows.slice(0, SCOPE_CONDITION_MAX_ROWS) : [createDefaultScopeConditionRow()]
@@ -1889,6 +1989,9 @@ export default {
       scopeStatusExcludeFilter.value = ''
       scopeNameExclude.value = ''
       scopeCreatedWithinHours.value = null
+      scopeCreatedBeforeHours.value = null
+      scopeCreatedBetweenFromHours.value = null
+      scopeCreatedBetweenToHours.value = null
       ruleForm.value = {
         ...createEmptyRule(),
         actions: [{ type: 'pause_ad', value: null }]
@@ -2006,6 +2109,9 @@ export default {
       scopeStatusExcludeFilter.value = ''
       scopeNameExclude.value = ''
       scopeCreatedWithinHours.value = null
+      scopeCreatedBeforeHours.value = null
+      scopeCreatedBetweenFromHours.value = null
+      scopeCreatedBetweenToHours.value = null
 
       ruleForm.value = JSON.parse(JSON.stringify({
         name: r.name || '',
@@ -2430,7 +2536,10 @@ export default {
               scope_status: scopeStatusFilter.value || undefined,
               scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
               name_exclude: scopeNameExclude.value || undefined,
-              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+              scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+              scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+              scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
             })
           ]
           if (isIdSearch) promises.push(facebookApi.resolveObjectsByIds(keyword).catch(() => []))
@@ -2454,7 +2563,10 @@ export default {
             scope_status: scopeStatusFilter.value || undefined,
             scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
             name_exclude: scopeNameExclude.value || undefined,
-            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+            scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+            scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+            scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
           })
           if (requestId !== scopeRequestId.value) return
           scopeItems.value = result.items || []
@@ -2498,7 +2610,10 @@ export default {
               scope_status: scopeStatusFilter.value || undefined,
               scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
               name_exclude: scopeNameExclude.value || undefined,
-              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+              scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+              scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+              scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+              scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
             })
           ]
           if (isIdSearch) promises.push(facebookApi.resolveObjectsByIds(keyword).catch(() => []))
@@ -2525,7 +2640,10 @@ export default {
             scope_status: scopeStatusFilter.value || undefined,
             scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
             name_exclude: scopeNameExclude.value || undefined,
-            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+            scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+            scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+            scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
           })
           if (requestId !== excludeRequestId.value) return
           excludeScopeItems.value = result.items || []
@@ -2555,7 +2673,10 @@ export default {
             scope_status: scopeStatusFilter.value || undefined,
             scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
             name_exclude: scopeNameExclude.value || undefined,
-            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+            scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+            scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+            scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
           })
           if (requestId !== scopeRequestId.value) return false
           scopeItems.value = [...scopeItems.value, ...(resp.items || [])]
@@ -2569,7 +2690,10 @@ export default {
             scope_status: scopeStatusFilter.value || undefined,
             scope_status_exclude: scopeStatusExcludeFilter.value || undefined,
             name_exclude: scopeNameExclude.value || undefined,
-            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined
+            scope_created_within_hours: scopeCreatedWithinHours.value ?? undefined,
+            scope_created_before_hours: scopeCreatedBeforeHours.value ?? undefined,
+            scope_created_between_from_hours: scopeCreatedBetweenFromHours.value ?? undefined,
+            scope_created_between_to_hours: scopeCreatedBetweenToHours.value ?? undefined
           })
           if (requestId !== scopeRequestId.value) return false
           scopeItems.value = [...scopeItems.value, ...(result.items || [])]
@@ -2732,6 +2856,9 @@ export default {
         row.operator = 'include'
         row.value = ''
         row.customHours = null
+        row.olderThanHours = null       // 新增
+        row.betweenFromHours = null     // 新增
+        row.betweenToHours = null       // 新增
       } else {
         row.operator = 'equals'
         row.value = ''
@@ -2745,10 +2872,25 @@ export default {
         if (v === '24' || v === '48' || v === '72') return null
         if (v === 'custom') {
           const h = row.customHours
-          if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请选择时间范围或填写小时数'
+          if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请填写小时数(1-720)'
           return null
         }
-        return '请选择时间范围或填写小时数'
+        // 新增：XX 小时以前
+        if (v === 'older_than') {
+          const h = row.olderThanHours
+          if (h == null || !Number.isFinite(h) || h < 1 || h > 720) return '请填写小时数(1-720)'
+          return null
+        }
+        // 新增：介于 XX~YY 小时之间
+        if (v === 'between') {
+          const from = row.betweenFromHours
+          const to = row.betweenToHours
+          if (from == null || !Number.isFinite(from) || from < 1 || from > 720) return '请填写「超过」小时数(1-720)'
+          if (to == null || !Number.isFinite(to) || to < 1 || to > 720) return '请填写「以内」小时数(1-720)'
+          if (from >= to) return '「超过」小时必须小于「以内」小时'
+          return null
+        }
+        return '请选择时间范围'
       }
       return null
     }
@@ -2787,6 +2929,23 @@ export default {
       const hoursList = createdRows.map(r => resolveHoursFromRow(r)).filter(h => Number.isFinite(h) && h > 0)
       const effectiveCreatedWithinHours = hoursList.length ? Math.min(...hoursList) : null
       scopeCreatedWithinHours.value = effectiveCreatedWithinHours
+
+      // 新增：older_than → scopeCreatedBeforeHours
+      const olderThanRow = completed.find(r => r.field === 'created_within' && r.value === 'older_than')
+      const olderThanHours = olderThanRow ? Number(olderThanRow.olderThanHours) : null
+      scopeCreatedBeforeHours.value = Number.isFinite(olderThanHours) && olderThanHours >= 1 && olderThanHours <= 720 ? olderThanHours : null
+
+      // 新增：between → scopeCreatedBetweenFromHours / scopeCreatedBetweenToHours
+      const betweenRow = completed.find(r => r.field === 'created_within' && r.value === 'between')
+      const betweenFrom = betweenRow ? Number(betweenRow.betweenFromHours) : null
+      const betweenTo = betweenRow ? Number(betweenRow.betweenToHours) : null
+      if (Number.isFinite(betweenFrom) && Number.isFinite(betweenTo) && betweenFrom >= 1 && betweenTo <= 720 && betweenFrom < betweenTo) {
+        scopeCreatedBetweenFromHours.value = betweenFrom
+        scopeCreatedBetweenToHours.value = betweenTo
+      } else {
+        scopeCreatedBetweenFromHours.value = null
+        scopeCreatedBetweenToHours.value = null
+      }
 
       // 状态「等于」传 scope_status；状态「不等于」传 scope_status_exclude（后端枚举 ACTIVE | PAUSED | ACTIVE,PAUSED）
       if (statusRow) {
@@ -3003,6 +3162,9 @@ export default {
       scopeStatusExcludeFilter.value = ''
       scopeNameExclude.value = ''
       scopeCreatedWithinHours.value = null
+      scopeCreatedBeforeHours.value = null
+      scopeCreatedBetweenFromHours.value = null
+      scopeCreatedBetweenToHours.value = null
     }
 
     watch(
@@ -3691,6 +3853,9 @@ input:checked + .slider:before { transform: translateX(16px); }
 .scope-condition-rows .scope-condition-row { flex-wrap: wrap; }
 .scope-condition-row .scope-value-input { min-width: 180px; flex: 1; }
 .scope-condition-row .scope-value-select { min-width: 160px; }
+.scope-between-group { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex-shrink: 0; }
+.scope-between-group .scope-between-input { width: 80px; min-width: 60px; flex: none; }
+.scope-between-group .scope-between-sep { color: #6b7280; font-size: 13px; user-select: none; }
 .scope-row-error { flex: 0 0 100%; width: 100%; margin-top: 4px; margin-left: 68px; font-size: 12px; color: var(--danger-color); }
 .link-add-scope { color: var(--primary-color); font-size: 13px; text-decoration: none; }
 .link-add-scope:hover { text-decoration: underline; }
